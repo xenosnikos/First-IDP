@@ -1,0 +1,19 @@
+apiVersion: argoproj.io/v1alpha1
+kind: EventSource
+metadata:
+  name: github-webhook
+  namespace: argo
+spec:
+  github:
+    twizz-events:
+      repositories:
+        - owner: Twizz
+          names: [Moly-backend, frontend]
+      webhook:
+        endpoint: /github-webhook
+        port: "12000"
+        method: POST
+      events: [push, pull_request]
+      apiToken:
+        name: github-token
+        key: token

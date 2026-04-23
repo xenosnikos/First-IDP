@@ -1,0 +1,69 @@
+replicaCount: 1
+
+image:
+  repository: 848281935985.dkr.ecr.eu-west-1.amazonaws.com/twizz-services
+  tag: latest
+  pullPolicy: IfNotPresent
+
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 8080
+
+ingress:
+  enabled: true
+  className: nginx
+  host: ""
+  tls:
+    enabled: true
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    nginx.ingress.kubernetes.io/proxy-body-size: "100m"
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 256Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 4
+  targetCPUUtilizationPercentage: 80
+
+env: {}
+
+externalSecret:
+  enabled: false
+  secretStore: aws-secrets-manager
+  remoteRef: ""
+  refreshInterval: 1h
+
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 30
+
+ttl: "72h"
+
+namespace:
+  resourceQuota:
+    enabled: true
+    cpu: "2"
+    memory: 4Gi
+  networkPolicy:
+    enabled: true

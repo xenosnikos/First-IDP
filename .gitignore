@@ -1,0 +1,35 @@
+node_modules/
+dist/
+.next/
+.turbo/
+*.tsbuildinfo
+
+# Environment
+.env.*.local
+
+# Pulumi
+infra/Pulumi.*.yaml
+!infra/Pulumi.yaml
+
+# Secrets
+*.pem
+*.key
+credentials*
+deploykey*
+
+# IDE
+.vscode/
+.idea/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+logs/
+*.log
+
+# Build
+out/
+build/
+config.bat

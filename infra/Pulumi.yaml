@@ -1,0 +1,6 @@
+name: twizz-idp
+runtime:
+  name: nodejs
+  options:
+    packagemanager: pnpm
+description: TWIZZ-IDP Infrastructure - EKS, ECS Fargate, RDS, ECR, DNS

@@ -1,0 +1,24 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: provision-database
+  namespace: argo
+spec:
+  entrypoint: provision
+  arguments:
+    parameters:
+      - {name: strategy}
+      - {name: dbName}
+      - {name: atlasProjectId, value: ""}
+  templates:
+    - name: provision
+      container:
+        image: curlimages/curl:latest
+        command: [sh, -c]
+        args:
+          - |
+            case "{{workflow.parameters.strategy}}" in
+              clone) echo "TODO: Atlas Admin API - clone {{workflow.parameters.dbName}}" ;;
+              shared) echo "Using shared cluster" ;;
+              *) echo "No database" ;;
+            esac

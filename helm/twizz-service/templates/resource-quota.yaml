@@ -1,0 +1,12 @@
+{{- if .Values.namespace.resourceQuota.enabled }}
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: {{ include "twizz-service.fullname" . }}-quota
+spec:
+  hard:
+    requests.cpu: {{ .Values.namespace.resourceQuota.cpu | quote }}
+    requests.memory: {{ .Values.namespace.resourceQuota.memory | quote }}
+    limits.cpu: {{ .Values.namespace.resourceQuota.cpu | quote }}
+    limits.memory: {{ .Values.namespace.resourceQuota.memory | quote }}
+{{- end }}

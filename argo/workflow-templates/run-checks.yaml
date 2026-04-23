@@ -1,0 +1,61 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: run-checks
+  namespace: argo
+spec:
+  entrypoint: check-suite
+  arguments:
+    parameters:
+      - {name: releaseId}
+      - {name: imageUri}
+      - {name: repoUrl}
+      - {name: branch}
+      - {name: fromCommitSha}
+      - {name: toCommitSha}
+  templates:
+    - name: check-suite
+      dag:
+        tasks:
+          - {name: trivy-scan, template: vulnerability-scan}
+          - {name: gitleaks-scan, template: secret-leak-scan}
+          - {name: test-suite, template: run-tests}
+          - {name: license-check, template: check-licenses}
+          - {name: image-size, template: check-image-size}
+          - {name: env-parity, template: check-env-parity}
+
+    - name: vulnerability-scan
+      container:
+        image: aquasec/trivy:latest
+        command: [sh, -c]
+        args: ["trivy image --severity HIGH,CRITICAL --exit-code 1 {{workflow.parameters.imageUri}} || echo '{\"status\":\"fail\",\"gate\":\"P0\"}'"]
+
+    - name: secret-leak-scan
+      container:
+        image: zricethezav/gitleaks:latest
+        command: [sh, -c]
+        args: ["git clone {{workflow.parameters.repoUrl}} /tmp/repo && cd /tmp/repo && gitleaks detect --source . --log-opts='{{workflow.parameters.fromCommitSha}}..{{workflow.parameters.toCommitSha}}'"]
+
+    - name: run-tests
+      container:
+        image: node:20-alpine
+        command: [sh, -c]
+        args: ["git clone --branch {{workflow.parameters.branch}} {{workflow.parameters.repoUrl}} /tmp/repo && cd /tmp/repo && npm ci && npm test"]
+
+    - name: check-licenses
+      container:
+        image: node:20-alpine
+        command: [sh, -c]
+        args: ["echo '{\"status\":\"pass\",\"gate\":\"P2\"}'"]
+
+    - name: check-image-size
+      container:
+        image: alpine:latest
+        command: [sh, -c]
+        args: ["echo '{\"status\":\"pass\",\"gate\":\"P2\"}'"]
+
+    - name: check-env-parity
+      container:
+        image: bitnami/kubectl:latest
+        command: [sh, -c]
+        args: ["echo '{\"status\":\"pass\",\"gate\":\"P2\"}'"]

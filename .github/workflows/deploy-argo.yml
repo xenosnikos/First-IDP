@@ -1,0 +1,25 @@
+name: Sync Argo Templates
+on:
+  push:
+    branches: [main]
+    paths: ["argo/**", "helm/**"]
+
+env:
+  AWS_REGION: eu-west-1
+  EKS_CLUSTER: EKS-Twizz-NonProd
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    permissions: { id-token: write, contents: read }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - run: aws eks update-kubeconfig --name $EKS_CLUSTER --region $AWS_REGION
+      - run: kubectl apply -f argo/workflow-templates/ -n argo
+      - run: kubectl apply -f argo/event-sources/ -n argo
+      - run: kubectl apply -f argo/applications/ -n argocd
+      - run: kubectl get workflowtemplates -n argo

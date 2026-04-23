@@ -1,0 +1,5 @@
+apiVersion: v2
+name: twizz-platform
+description: Platform components for EKS-Twizz-NonProd (reference)
+type: application
+version: 0.1.0
