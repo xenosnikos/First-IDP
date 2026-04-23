@@ -1,0 +1,227 @@
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+// ──────────────────────────────────────────────
+// Projects & Environments
+// ──────────────────────────────────────────────
+
+model Project {
+  id            String        @id @default(cuid())
+  githubRepoUrl String        @unique
+  name          String
+  type          ProjectType
+  defaultBranch String        @default("main")
+  detectedDeps  Json?
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+  environments  Environment[]
+  releases      Release[]
+}
+
+enum ProjectType {
+  FRONTEND
+  BACKEND
+  FULLSTACK
+  UNKNOWN
+}
+
+model Environment {
+  id             String            @id @default(cuid())
+  projectId      String
+  project        Project           @relation(fields: [projectId], references: [id], onDelete: Cascade)
+  tier           EnvironmentTier
+  namespace      String            @unique
+  status         EnvironmentStatus @default(PROVISIONING)
+  serviceUrl     String?
+  ttlExpiresAt   DateTime?
+  createdAt      DateTime          @default(now())
+  updatedAt      DateTime          @updatedAt
+  deployConfig   DeployConfig?
+  databaseConfig DatabaseConfig?
+  pipelineRuns   PipelineRun[]
+}
+
+enum EnvironmentTier {
+  DEV
+  QA
+  STAGING
+  PREVIEW
+  PRODUCTION
+}
+
+enum EnvironmentStatus {
+  PROVISIONING
+  RUNNING
+  FAILED
+  DESTROYING
+  DESTROYED
+}
+
+model DeployConfig {
+  id            String      @id @default(cuid())
+  environmentId String      @unique
+  environment   Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  branch        String
+  commitSha     String
+  imageUri      String?
+  replicas      Int         @default(1)
+  cpuLimit      String      @default("500m")
+  memLimit      String      @default("512Mi")
+  secretSetName String?
+  createdAt     DateTime    @default(now())
+  updatedAt     DateTime    @updatedAt
+}
+
+model DatabaseConfig {
+  id                        String      @id @default(cuid())
+  environmentId             String      @unique
+  environment               Environment @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  strategy                  DbStrategy
+  atlasClusterId            String?
+  connectionStringSecretRef String?
+  createdAt                 DateTime    @default(now())
+}
+
+enum DbStrategy {
+  CLONE
+  SHARED
+  NONE
+}
+
+// ──────────────────────────────────────────────
+// Pipelines
+// ──────────────────────────────────────────────
+
+model PipelineRun {
+  id               String         @id @default(cuid())
+  environmentId    String
+  environment      Environment    @relation(fields: [environmentId], references: [id], onDelete: Cascade)
+  argoWorkflowName String         @unique
+  status           PipelineStatus @default(PENDING)
+  startedAt        DateTime?
+  completedAt      DateTime?
+  logsUrl          String?
+  createdAt        DateTime       @default(now())
+  updatedAt        DateTime       @updatedAt
+}
+
+enum PipelineStatus {
+  PENDING
+  RUNNING
+  SUCCEEDED
+  FAILED
+  CANCELLED
+}
+
+// ──────────────────────────────────────────────
+// Releases
+// ──────────────────────────────────────────────
+
+model Release {
+  id          String          @id @default(cuid())
+  projectId   String
+  project     Project         @relation(fields: [projectId], references: [id])
+  version     String
+  sourceEnvId String?
+  targetTier  EnvironmentTier
+  status      ReleaseStatus   @default(DRAFT)
+  promotedBy  String?
+  promotedAt  DateTime?
+  lockedAt    DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+  services    ReleaseService[]
+  document    ReleaseDocument?
+  checks      ReleaseCheck[]
+}
+
+enum ReleaseStatus {
+  DRAFT
+  CHECKS_RUNNING
+  READY
+  PROMOTED
+  ROLLED_BACK
+  CANCELLED
+}
+
+model ReleaseService {
+  id            String  @id @default(cuid())
+  releaseId     String
+  release       Release @relation(fields: [releaseId], references: [id], onDelete: Cascade)
+  projectId     String
+  fromCommitSha String
+  toCommitSha   String
+  imageUri      String?
+}
+
+model ReleaseDocument {
+  id           String              @id @default(cuid())
+  releaseId    String              @unique
+  release      Release             @relation(fields: [releaseId], references: [id], onDelete: Cascade)
+  version      Int                 @default(1)
+  contentJson  Json?
+  generatedAt  DateTime            @default(now())
+  lastEditedBy String?
+  lastEditedAt DateTime?
+  finalizedAt  DateTime?
+  sections     ReleaseDocSection[]
+}
+
+model ReleaseDocSection {
+  id              String          @id @default(cuid())
+  documentId      String
+  document        ReleaseDocument @relation(fields: [documentId], references: [id], onDelete: Cascade)
+  sectionType     SectionType
+  contentMd       String          @default("")
+  isAutoGenerated Boolean         @default(true)
+  isEdited        Boolean         @default(false)
+  sortOrder       Int             @default(0)
+}
+
+enum SectionType {
+  HEADER
+  BREAKING_CHANGES
+  CHANGE_SUMMARY
+  COMMIT_LOG
+  DEPENDENCY_DIFF
+  MODULE_DOCS
+  CHECK_RESULTS
+  RELEASE_NOTES
+  ROLLBACK_PLAN
+  APPROVAL
+}
+
+model ReleaseCheck {
+  id             String      @id @default(cuid())
+  releaseId      String
+  release        Release     @relation(fields: [releaseId], references: [id], onDelete: Cascade)
+  checkId        String
+  status         CheckStatus @default(PENDING)
+  gateLevel      GateLevel
+  startedAt      DateTime?
+  completedAt    DateTime?
+  detailJson     Json?
+  overrideBy     String?
+  overrideReason String?
+  createdAt      DateTime    @default(now())
+}
+
+enum CheckStatus {
+  PENDING
+  RUNNING
+  PASS
+  FAIL
+  WARN
+}
+
+enum GateLevel {
+  P0
+  P1
+  P2
+}

@@ -1,0 +1,38 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: build-and-deploy-frontend
+  namespace: argo
+spec:
+  entrypoint: frontend-deploy
+  arguments:
+    parameters:
+      - {name: repo}
+      - {name: branch}
+      - {name: commitSha}
+      - {name: vercelProjectId}
+      - {name: env, value: dev}
+  templates:
+    - name: frontend-deploy
+      steps:
+        - - {name: trigger-vercel, template: trigger-deploy}
+        - - {name: poll-status, template: poll-deployment}
+        - - {name: output-url, template: return-url}
+
+    - name: trigger-deploy
+      container:
+        image: curlimages/curl:latest
+        command: [sh, -c]
+        args: ["echo 'TODO: POST https://api.vercel.com/v13/deployments with project={{workflow.parameters.vercelProjectId}} ref={{workflow.parameters.branch}}'"]
+
+    - name: poll-deployment
+      container:
+        image: curlimages/curl:latest
+        command: [sh, -c]
+        args: ["echo 'TODO: Poll Vercel deployment status until READY'"]
+
+    - name: return-url
+      container:
+        image: alpine:latest
+        command: [sh, -c]
+        args: ["echo 'Vercel preview URL returned here'"]

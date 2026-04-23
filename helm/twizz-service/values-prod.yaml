@@ -1,0 +1,13 @@
+replicaCount: 4
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+autoscaling:
+  enabled: true
+  minReplicas: 4
+  maxReplicas: 8
+ttl: ""

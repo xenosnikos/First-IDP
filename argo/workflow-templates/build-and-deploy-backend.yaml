@@ -1,0 +1,123 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: build-and-deploy-backend
+  namespace: argo
+spec:
+  entrypoint: deploy-pipeline
+  arguments:
+    parameters:
+      - {name: repo}
+      - {name: branch}
+      - {name: commitSha}
+      - {name: env, value: dev}
+      - {name: namespace}
+      - {name: dbStrategy, value: shared}
+      - {name: secretSetName, value: ""}
+      - {name: replicas, value: "1"}
+      - {name: cpuLimit, value: "500m"}
+      - {name: memLimit, value: "512Mi"}
+      - {name: serviceHost}
+      - {name: ecrRepo, value: "848281935985.dkr.ecr.eu-west-1.amazonaws.com/twizz-services"}
+  templates:
+    - name: deploy-pipeline
+      dag:
+        tasks:
+          - {name: clone-repo, template: git-clone}
+          - {name: kaniko-build, template: build-image, dependencies: [clone-repo]}
+          - {name: pull-secrets, template: sync-secrets}
+          - {name: provision-db, template: setup-database}
+          - {name: helm-deploy, template: deploy-helm, dependencies: [kaniko-build, pull-secrets, provision-db]}
+          - {name: health-check, template: check-health, dependencies: [helm-deploy]}
+          - {name: output-url, template: return-url, dependencies: [health-check]}
+
+    - name: git-clone
+      container:
+        image: alpine/git:latest
+        command: [sh, -c]
+        args: ["git clone --depth 1 --branch {{workflow.parameters.branch}} https://github.com/{{workflow.parameters.repo}}.git /workspace/source"]
+        volumeMounts: [{name: workspace, mountPath: /workspace}]
+
+    - name: build-image
+      container:
+        image: gcr.io/kaniko-project/executor:v1.23.0
+        args:
+          - --dockerfile=/workspace/source/Dockerfile
+          - --context=/workspace/source
+          - "--destination={{workflow.parameters.ecrRepo}}:{{workflow.parameters.commitSha}}"
+          - --cache=true
+          - --cache-repo=848281935985.dkr.ecr.eu-west-1.amazonaws.com/twizz-cache
+        volumeMounts: [{name: workspace, mountPath: /workspace}]
+
+    - name: sync-secrets
+      container:
+        image: bitnami/kubectl:latest
+        command: [sh, -c]
+        args:
+          - |
+            kubectl create namespace {{workflow.parameters.namespace}} --dry-run=client -o yaml | kubectl apply -f -
+            if [ -n "{{workflow.parameters.secretSetName}}" ]; then
+              cat <<EOF | kubectl apply -f -
+            apiVersion: external-secrets.io/v1beta1
+            kind: ExternalSecret
+            metadata:
+              name: app-secrets
+              namespace: {{workflow.parameters.namespace}}
+            spec:
+              refreshInterval: 1h
+              secretStoreRef:
+                name: aws-secrets-manager
+                kind: ClusterSecretStore
+              target:
+                name: app-secrets
+              dataFrom:
+                - extract:
+                    key: {{workflow.parameters.secretSetName}}
+            EOF
+            fi
+
+    - name: setup-database
+      container:
+        image: curlimages/curl:latest
+        command: [sh, -c]
+        args:
+          - |
+            echo "DB Strategy: {{workflow.parameters.dbStrategy}}"
+            case "{{workflow.parameters.dbStrategy}}" in
+              clone) echo "TODO: Atlas Admin API - clone database" ;;
+              shared) echo "Using shared database" ;;
+              *) echo "No database" ;;
+            esac
+
+    - name: deploy-helm
+      container:
+        image: alpine/helm:3.15
+        command: [sh, -c]
+        args:
+          - |
+            helm upgrade --install {{workflow.parameters.namespace}} /helm/twizz-service/ \
+              -f /helm/twizz-service/values-{{workflow.parameters.env}}.yaml \
+              -n {{workflow.parameters.namespace}} --create-namespace \
+              --set image.tag={{workflow.parameters.commitSha}} \
+              --set ingress.host={{workflow.parameters.serviceHost}} \
+              --set replicaCount={{workflow.parameters.replicas}} \
+              --set resources.limits.cpu={{workflow.parameters.cpuLimit}} \
+              --set resources.limits.memory={{workflow.parameters.memLimit}}
+
+    - name: check-health
+      container:
+        image: bitnami/kubectl:latest
+        command: [sh, -c]
+        args: ["kubectl rollout status deployment -n {{workflow.parameters.namespace}} --timeout=300s"]
+
+    - name: return-url
+      container:
+        image: alpine:latest
+        command: [sh, -c]
+        args: ["echo https://{{workflow.parameters.serviceHost}}"]
+
+  volumeClaimTemplates:
+    - metadata: {name: workspace}
+      spec:
+        accessModes: [ReadWriteOnce]
+        resources: {requests: {storage: 5Gi}}

@@ -1,0 +1,16 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: twizz-platform
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/Twizz/twizz-idp.git
+    targetRevision: main
+    path: helm/platform
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    syncOptions: [CreateNamespace=true]

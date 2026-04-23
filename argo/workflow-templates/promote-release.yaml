@@ -1,0 +1,49 @@
+apiVersion: argoproj.io/v1alpha1
+kind: WorkflowTemplate
+metadata:
+  name: promote-release
+  namespace: argo
+spec:
+  entrypoint: promotion-pipeline
+  arguments:
+    parameters:
+      - {name: releaseId}
+      - {name: sourceNamespace}
+      - {name: targetTier}
+      - {name: targetNamespace}
+      - {name: imageUri}
+  templates:
+    - name: promotion-pipeline
+      steps:
+        - - {name: pre-checks, template: verify-checks}
+        - - name: approval-gate
+            template: wait-for-approval
+            when: "{{workflow.parameters.targetTier}} == PRODUCTION"
+        - - {name: deploy, template: helm-deploy}
+        - - {name: health-check, template: verify-health}
+
+    - name: verify-checks
+      container:
+        image: curlimages/curl:latest
+        command: [sh, -c]
+        args: ["echo 'Verifying P0 checks for release {{workflow.parameters.releaseId}}'"]
+
+    - name: wait-for-approval
+      suspend: {}
+
+    - name: helm-deploy
+      container:
+        image: alpine/helm:3.15
+        command: [sh, -c]
+        args:
+          - |
+            helm upgrade --install {{workflow.parameters.targetNamespace}} /helm/twizz-service/ \
+              -f /helm/twizz-service/values-{{workflow.parameters.targetTier}}.yaml \
+              -n {{workflow.parameters.targetNamespace}} --create-namespace \
+              --set image.tag={{workflow.parameters.imageUri}}
+
+    - name: verify-health
+      container:
+        image: bitnami/kubectl:latest
+        command: [sh, -c]
+        args: ["kubectl rollout status deployment -n {{workflow.parameters.targetNamespace}} --timeout=300s"]

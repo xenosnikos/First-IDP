@@ -1,0 +1,9 @@
+# Platform components (installed via Pulumi, documented here)
+components:
+  ingressNginx: "4.11.x"
+  argoWorkflows: "3.6.x"
+  argoCD: "2.12.x"
+  externalSecrets: "0.10.x"
+  certManager: "1.16.x"
+  kubePrometheusStack: "65.x"
+  karpenter: "1.x"

@@ -1,0 +1,19 @@
+{
+  "name": "twizz-idp",
+  "private": true,
+  "packageManager": "pnpm@9.15.4",
+  "scripts": {
+    "build": "turbo build",
+    "dev": "turbo dev",
+    "lint": "turbo lint",
+    "typecheck": "turbo typecheck",
+    "db:generate": "pnpm --filter @twizz-idp/db generate",
+    "db:migrate": "pnpm --filter @twizz-idp/db migrate",
+    "db:push": "pnpm --filter @twizz-idp/db push",
+    "clean": "turbo clean"
+  },
+  "devDependencies": {
+    "turbo": "^2.4.0",
+    "typescript": "^5.7.0"
+  }
+}
