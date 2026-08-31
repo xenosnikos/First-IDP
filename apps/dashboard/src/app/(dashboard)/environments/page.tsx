@@ -1,6 +1,6 @@
 import { auth } from "@/lib/auth";
 import { redirect } from "next/navigation";
-import { introspectAllEnvironments } from "@/server/services/introspect";
+import { introspectAllEnvironments } from "@twizz-idp/core";
 import { EnvironmentMap } from "@/components/environments/environment-map";
 
 export default async function EnvironmentsPage() {

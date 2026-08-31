@@ -13,8 +13,9 @@ export function createEcrRepos(tags: Record<string, string>) {
       repository: repo.name,
       policy: JSON.stringify({
         rules: [
-          { rulePriority: 1, description: "Keep last 20", selection: { tagStatus: "any", countType: "imageCountMoreThan", countNumber: 20 }, action: { type: "expire" } },
-          { rulePriority: 2, description: "Expire untagged 7d", selection: { tagStatus: "untagged", countType: "sinceImagePushed", countUnit: "days", countNumber: 7 }, action: { type: "expire" } },
+          { rulePriority: 1, description: "Expire untagged 7d", selection: { tagStatus: "untagged", countType: "sinceImagePushed", countUnit: "days", countNumber: 7 }, action: { type: "expire" } },
+          // tagStatus=any must be the lowest-priority (highest number) rule
+          { rulePriority: 2, description: "Keep last 20", selection: { tagStatus: "any", countType: "imageCountMoreThan", countNumber: 20 }, action: { type: "expire" } },
         ],
       }),
     });

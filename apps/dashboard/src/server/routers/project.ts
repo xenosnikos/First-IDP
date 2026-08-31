@@ -1,9 +1,9 @@
 import { z } from "zod";
 import { router, protectedProcedure } from "../trpc";
 import { createProjectSchema, detectProjectSchema } from "@twizz-idp/shared";
-import { GitHubService } from "../services/github";
+import { GitHubService } from "@twizz-idp/core";
 
-const GITHUB_ORG = process.env.GITHUB_ORG ?? "Twizz";
+const GITHUB_ORG = process.env.GITHUB_ORG ?? "twizz-app";
 
 export const projectRouter = router({
   list: protectedProcedure.query(async ({ ctx }) => {
@@ -48,6 +48,16 @@ export const projectRouter = router({
   create: protectedProcedure
     .input(createProjectSchema)
     .mutation(async ({ ctx, input }) => {
-      return ctx.prisma.project.create({ data: input });
+      const project = await ctx.prisma.project.create({ data: input });
+      const actor = ((ctx.session as any).login as string | undefined) ?? "unknown";
+      await ctx.prisma.auditLog.create({
+        data: {
+          actor,
+          action: "project.create",
+          resource: project.githubRepoUrl,
+          detail: { projectId: project.id },
+        },
+      });
+      return project;
     }),
 });

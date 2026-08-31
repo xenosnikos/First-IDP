@@ -1,4 +1,4 @@
-import type { DbConnection } from "@/server/services/introspect";
+import type { DbConnection } from "@twizz-idp/core";
 
 export function DatabasesSection({ connections }: { connections: DbConnection[] }) {
   if (connections.length === 0) return null;

@@ -20,13 +20,17 @@ const statusText: Record<string, string> = {
 };
 
 export default function PipelinesPage() {
-  const runs = trpc.pipeline.listAll.useQuery();
+  const runs = trpc.pipeline.listGithubRuns.useQuery(undefined, {
+    refetchInterval: 15000,
+  });
 
   return (
     <div className="p-8 max-w-6xl mx-auto">
       <div className="mb-8">
         <h1 className="text-2xl font-bold">Pipelines</h1>
-        <p className="text-muted-foreground mt-1">Recent pipeline runs across all projects</p>
+        <p className="text-muted-foreground mt-1">
+          GitHub Actions runs across registered projects
+        </p>
       </div>
 
       {runs.isLoading && (
@@ -49,8 +53,8 @@ export default function PipelinesPage() {
               <tr className="bg-card border-b border-border">
                 <th className="text-left px-4 py-3 text-muted-foreground font-medium">Status</th>
                 <th className="text-left px-4 py-3 text-muted-foreground font-medium">Workflow</th>
-                <th className="text-left px-4 py-3 text-muted-foreground font-medium">Project</th>
-                <th className="text-left px-4 py-3 text-muted-foreground font-medium">Environment</th>
+                <th className="text-left px-4 py-3 text-muted-foreground font-medium">Repo</th>
+                <th className="text-left px-4 py-3 text-muted-foreground font-medium">Branch</th>
                 <th className="text-left px-4 py-3 text-muted-foreground font-medium">Started</th>
                 <th className="text-left px-4 py-3 text-muted-foreground font-medium">Duration</th>
               </tr>
@@ -58,12 +62,14 @@ export default function PipelinesPage() {
             <tbody>
               {runs.data.map((run) => {
                 const startMs = run.startedAt ? new Date(run.startedAt).getTime() : 0;
-                const endMs = run.completedAt ? new Date(run.completedAt).getTime() : (run.status === "RUNNING" ? Date.now() : startMs);
+                const endMs = run.completedAt
+                  ? new Date(run.completedAt).getTime()
+                  : run.status === "RUNNING" ? Date.now() : startMs;
                 const durSec = startMs ? Math.round((endMs - startMs) / 1000) : 0;
                 const duration = durSec >= 60 ? `${Math.floor(durSec / 60)}m ${durSec % 60}s` : `${durSec}s`;
 
                 return (
-                  <tr key={run.id} className="border-b border-border/50 hover:bg-accent/20">
+                  <tr key={`${run.owner}/${run.repo}/${run.id}`} className="border-b border-border/50 hover:bg-accent/20">
                     <td className="px-4 py-3">
                       <div className="flex items-center gap-2">
                         <span className={`w-2 h-2 rounded-full ${statusColor[run.status] ?? "bg-zinc-500"}`} />
@@ -74,17 +80,15 @@ export default function PipelinesPage() {
                     </td>
                     <td className="px-4 py-3">
                       <Link
-                        href={`/pipelines/${run.id}`}
+                        href={`/pipelines/${run.owner}--${run.repo}--${run.id}`}
                         className="font-mono text-xs text-primary hover:underline"
                       >
-                        {run.argoWorkflowName}
+                        {run.workflowName} #{run.runNumber}
                       </Link>
                     </td>
-                    <td className="px-4 py-3 text-sm">
-                      {run.environment?.project?.name ?? "--"}
-                    </td>
+                    <td className="px-4 py-3 text-sm">{run.owner}/{run.repo}</td>
                     <td className="px-4 py-3">
-                      <span className="text-xs">{run.environment?.tier ?? "--"}</span>
+                      <span className="text-xs font-mono">{run.branch ?? run.event}</span>
                     </td>
                     <td className="px-4 py-3 text-xs text-muted-foreground">
                       {run.startedAt ? new Date(run.startedAt).toLocaleString() : "--"}
@@ -98,7 +102,7 @@ export default function PipelinesPage() {
               {runs.data.length === 0 && (
                 <tr>
                   <td colSpan={6} className="px-4 py-12 text-center text-muted-foreground">
-                    No pipeline runs yet
+                    No runs yet — register projects on the Projects page to see their GitHub Actions here
                   </td>
                 </tr>
               )}

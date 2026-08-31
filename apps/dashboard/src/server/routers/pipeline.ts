@@ -1,114 +1,15 @@
 import { z } from "zod";
 import { router, protectedProcedure } from "../trpc";
-import { triggerPipelineSchema, pipelineStatusSchema } from "@twizz-idp/shared";
-import { argoService } from "../services/argo";
+import { GitHubService, type ActionsRun } from "@twizz-idp/core";
 
+function parseRepoUrl(url: string): { owner: string; repo: string } | null {
+  const m = url.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/);
+  return m ? { owner: m[1], repo: m[2] } : null;
+}
+
+// Read-only over PipelineRun rows. The Argo Workflows engine is gone;
+// Phase 3 points this router at GitHub Actions runs (steps/logs come back then).
 export const pipelineRouter = router({
-  trigger: protectedProcedure
-    .input(triggerPipelineSchema)
-    .mutation(async ({ ctx, input }) => {
-      const workflowName = await argoService.submitWorkflow(
-        input.templateName,
-        "argo",
-        input.params ?? {},
-      );
-
-      return ctx.prisma.pipelineRun.create({
-        data: {
-          environmentId: input.environmentId,
-          argoWorkflowName: workflowName,
-          status: "RUNNING",
-          startedAt: new Date(),
-        },
-      });
-    }),
-
-  getStatus: protectedProcedure
-    .input(pipelineStatusSchema)
-    .query(async ({ ctx, input }) => {
-      const run = await ctx.prisma.pipelineRun.findUniqueOrThrow({
-        where: { id: input.pipelineRunId },
-        include: {
-          environment: {
-            include: { project: true, deployConfig: true },
-          },
-        },
-      });
-
-      // Poll live status from Argo
-      let workflow;
-      try {
-        workflow = await argoService.getWorkflow(run.argoWorkflowName);
-      } catch {
-        // Argo unreachable -- return DB state
-        return {
-          ...run,
-          steps: [],
-          outputs: undefined,
-        };
-      }
-
-      // Sync status back to DB
-      const dbStatus = workflow.phase === "Succeeded" ? "SUCCEEDED"
-        : workflow.phase === "Failed" || workflow.phase === "Error" ? "FAILED"
-        : workflow.phase === "Running" ? "RUNNING"
-        : "PENDING";
-
-      if (run.status !== dbStatus) {
-        await ctx.prisma.pipelineRun.update({
-          where: { id: run.id },
-          data: {
-            status: dbStatus as any,
-            completedAt: workflow.finishedAt ? new Date(workflow.finishedAt) : undefined,
-          },
-        });
-      }
-
-      return {
-        ...run,
-        status: dbStatus,
-        steps: workflow.steps,
-        outputs: workflow.outputs,
-      };
-    }),
-
-  getStepLogs: protectedProcedure
-    .input(z.object({
-      pipelineRunId: z.string().cuid(),
-      stepId: z.string(),
-    }))
-    .query(async ({ ctx, input }) => {
-      const run = await ctx.prisma.pipelineRun.findUniqueOrThrow({
-        where: { id: input.pipelineRunId },
-      });
-
-      // Get workflow to resolve stepId -> podName
-      const workflow = await argoService.getWorkflow(run.argoWorkflowName);
-      const step = workflow.steps.find((s) => s.id === input.stepId);
-
-      if (!step?.podName) {
-        return { logs: "Step not found or not yet started." };
-      }
-
-      const logs = await argoService.getStepLogs(run.argoWorkflowName, step.podName);
-      return { logs };
-    }),
-
-  getLogs: protectedProcedure
-    .input(z.object({ pipelineRunId: z.string().cuid(), stepName: z.string().optional() }))
-    .query(async ({ ctx, input }) => {
-      const run = await ctx.prisma.pipelineRun.findUniqueOrThrow({
-        where: { id: input.pipelineRunId },
-      });
-
-      const logs = await argoService.getWorkflowLogs(
-        run.argoWorkflowName,
-        input.stepName,
-      );
-
-      return { logs };
-    }),
-
   list: protectedProcedure
     .input(z.object({ environmentId: z.string().cuid() }))
     .query(async ({ ctx, input }) => {
@@ -116,6 +17,45 @@ export const pipelineRouter = router({
         where: { environmentId: input.environmentId },
         orderBy: { createdAt: "desc" },
       });
+    }),
+
+  // ── GitHub Actions (the CI engine) ────────────────────────────────
+  listGithubRuns: protectedProcedure
+    .input(z.object({ limit: z.number().int().min(1).max(50).default(30) }).optional())
+    .query(async ({ ctx, input }) => {
+      const token = (ctx.session as any).accessToken as string;
+      const github = new GitHubService(token);
+
+      const projects = await ctx.prisma.project.findMany({ select: { githubRepoUrl: true } });
+      const repos = projects
+        .map((p) => parseRepoUrl(p.githubRepoUrl))
+        .filter((r): r is { owner: string; repo: string } => r !== null);
+
+      const settled = await Promise.allSettled(
+        repos.map((r) => github.listWorkflowRuns(r.owner, r.repo, 15)),
+      );
+      const runs: ActionsRun[] = settled
+        .filter((s): s is PromiseFulfilledResult<ActionsRun[]> => s.status === "fulfilled")
+        .flatMap((s) => s.value);
+
+      runs.sort((a, b) => (b.startedAt ?? "").localeCompare(a.startedAt ?? ""));
+      return runs.slice(0, input?.limit ?? 30);
+    }),
+
+  getGithubRun: protectedProcedure
+    .input(z.object({ owner: z.string(), repo: z.string(), runId: z.number().int() }))
+    .query(async ({ ctx, input }) => {
+      const token = (ctx.session as any).accessToken as string;
+      const github = new GitHubService(token);
+      return github.getWorkflowRun(input.owner, input.repo, input.runId);
+    }),
+
+  getGithubJobLogs: protectedProcedure
+    .input(z.object({ owner: z.string(), repo: z.string(), jobId: z.number().int() }))
+    .query(async ({ ctx, input }) => {
+      const token = (ctx.session as any).accessToken as string;
+      const github = new GitHubService(token);
+      return { logs: await github.getJobLogs(input.owner, input.repo, input.jobId) };
     }),
 
   listAll: protectedProcedure

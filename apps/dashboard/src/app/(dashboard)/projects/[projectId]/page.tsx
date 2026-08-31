@@ -1,7 +1,7 @@
 import { auth } from "@/lib/auth";
 import { redirect } from "next/navigation";
 import Link from "next/link";
-import { introspectProject, type ProjectIntrospection } from "@/server/services/introspect";
+import { introspectProject, type ProjectIntrospection } from "@twizz-idp/core";
 import { Section, ProjectHeader } from "@/components/projects/project-layout";
 import { StackDetection } from "@/components/projects/stack-detection";
 import { EnvironmentTabs } from "@/components/projects/environment-tabs";

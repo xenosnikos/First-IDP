@@ -21,7 +21,7 @@ pnpm db:generate
 You need the following credentials before anything works:
 
 ### GitHub OAuth App
-1. Go to https://github.com/organizations/Twizz/settings/applications/new
+1. Go to https://github.com/organizations/twizz-app/settings/applications/new
 2. App name: `TWIZZ-IDP`
 3. Homepage URL: `http://localhost:3000` (update to `https://idp.twizz.app` for prod)
 4. Callback URL: `http://localhost:3000/api/auth/callback/github`
@@ -30,7 +30,7 @@ You need the following credentials before anything works:
 ### Vercel Token
 1. Go to https://vercel.com/account/tokens
 2. Create token with scope for your team
-3. Team ID is already known: `team_eZiKDLZPnCBSKY38QPwbje5G`
+3. Team ID is already known: `team_ocn3vwvvs3VDxcjxNcY7l8Mu` (the "Loly" team — owns the `frontend` project `prj_3Op05Dm743j4qscD37c6hpfHRnfD`; the old `team_eZiKDLZ...` ID found in `frontend/.vercel/project.json` is stale)
 
 ### MongoDB Atlas API Key
 1. Atlas -> Organization -> Access Manager -> Create API Key
@@ -120,7 +120,7 @@ kubectl apply -f argo/applications/ -n argocd
 
 | Service | Where to Get | Env Var | Prod Location |
 |---------|-------------|---------|---------------|
-| GitHub OAuth | github.com/organizations/Twizz/settings/applications | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | AWS Secrets Manager |
+| GitHub OAuth | github.com/organizations/twizz-app/settings/applications | `GITHUB_CLIENT_ID`, `GITHUB_CLIENT_SECRET` | AWS Secrets Manager |
 | Vercel | vercel.com/account/tokens | `VERCEL_TOKEN` | AWS Secrets Manager |
 | Atlas | cloud.mongodb.com -> API Keys | `ATLAS_PUBLIC_KEY`, `ATLAS_PRIVATE_KEY`, `ATLAS_PROJECT_ID` | AWS Secrets Manager |
 | Anthropic | console.anthropic.com/settings/keys | `ANTHROPIC_API_KEY` | AWS Secrets Manager |

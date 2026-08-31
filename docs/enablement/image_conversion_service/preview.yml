@@ -1,0 +1,66 @@
+# Drop into twizz-app/image_conversion_service as .github/workflows/preview.yml
+#
+# Label a PR `preview-lambda` to get an isolated SAM stack
+# twizz-image-conversion-pr-<n>; the stack is deleted when the PR closes.
+# Backend previews can consume its ARN from the PR comment / SSM parameter.
+# Auth: GitHub OIDC -> twizz-gha-ecr-push has no CFN rights, so this uses a
+# dedicated role; see NOTES.md for the sam-deploy role to add if missing.
+name: preview
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, closed]
+
+permissions:
+  id-token: write
+  contents: read
+  pull-requests: write
+
+env:
+  AWS_REGION: eu-west-1
+  STACK: twizz-image-conversion-pr-${{ github.event.number }}
+
+jobs:
+  deploy:
+    if: github.event.action != 'closed' && contains(github.event.pull_request.labels.*.name, 'preview-lambda')
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/setup-sam@v2
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::848281935985:role/twizz-gha-sam-deploy
+          aws-region: ${{ env.AWS_REGION }}
+      - run: sam build
+      - name: Deploy PR stack
+        run: |
+          sam deploy --stack-name "$STACK" --resolve-image-repos --no-confirm-changeset \
+            --no-fail-on-empty-changeset --capabilities CAPABILITY_IAM \
+            --parameter-overrides \
+              SourceBucketName="${{ vars.PREVIEW_SOURCE_BUCKET }}" \
+              InvokerPrincipalArn="arn:aws:iam::848281935985:role/twizz-nonprod-preview-pods"
+      - name: Publish ARN
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          ARN=$(aws cloudformation describe-stacks --stack-name "$STACK" \
+            --query "Stacks[0].Outputs[?OutputKey=='ConverterFunctionArn'].OutputValue" --output text)
+          aws ssm put-parameter --name "/preview/pr-${{ github.event.number }}/image-conversion-arn" \
+            --value "$ARN" --type String --overwrite
+          gh pr comment ${{ github.event.number }} --repo ${{ github.repository }} \
+            --body "🧪 Preview Lambda stack \`$STACK\` deployed: \`$ARN\`" --edit-last --create-if-none
+
+  teardown:
+    if: github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::848281935985:role/twizz-gha-sam-deploy
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Delete PR stack (if it exists)
+        run: |
+          aws cloudformation describe-stacks --stack-name "$STACK" >/dev/null 2>&1 || exit 0
+          sam delete --stack-name "$STACK" --no-prompts || \
+            aws cloudformation delete-stack --stack-name "$STACK"
+          aws ssm delete-parameter --name "/preview/pr-${{ github.event.number }}/image-conversion-arn" || true

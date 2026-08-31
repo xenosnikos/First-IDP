@@ -1,7 +1,7 @@
 import { z } from "zod";
 import { router, protectedProcedure } from "../trpc";
 import { environmentTierSchema } from "@twizz-idp/shared";
-import { awsService } from "../services/aws";
+import { awsService } from "@twizz-idp/core";
 
 export const secretRouter = router({
   list: protectedProcedure

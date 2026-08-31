@@ -1,0 +1,28 @@
+# Write-tool authorization policy. Evaluated BEFORE any AWS/GitHub call.
+# Field values are glob-matched (* wildcard). A tool call is allowed only if
+# every constrained field matches an allow pattern and no deny pattern.
+# Anything matching global_deny is rejected regardless of tool rules.
+
+global_deny:
+  - "*prod*"
+  - "*Prod*"
+  - "*PROD*"
+  - "*Moly-Prod*"
+
+write_tools:
+  delete_preview:
+    allow:
+      repo: ["MymTwo/Moly-backend", "MymTwo/frontend", "twizz-app/*"]
+
+  trigger_preview_refresh:
+    allow:
+      repo: ["MymTwo/Moly-backend", "MymTwo/frontend", "twizz-app/*"]
+
+  rotate_preview_secret:
+    allow:
+      secretName: ["preview/*"]
+
+  scale_shared_service:
+    allow:
+      service: ["ffmpeg-service", "lolygram-discovery", "alertservice"]
+      # replicas constrained in code to 0..3

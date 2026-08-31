@@ -38,6 +38,18 @@ autoscaling:
 
 env: {}
 
+# ServiceAccount for the workload; set roleArn to bind an IRSA role
+# (e.g. twizz-nonprod-preview-pods) for AWS access from the pod.
+serviceAccount:
+  create: true
+  roleArn: ""
+
+# ExternalName services resolving short sibling-service names to another
+# namespace, e.g.:
+#   externalServices:
+#     - { name: ffmpeg-service, target: ffmpeg-service.shared.svc.cluster.local, port: 8888 }
+externalServices: []
+
 externalSecret:
   enabled: false
   secretStore: aws-secrets-manager
@@ -67,3 +79,7 @@ namespace:
     memory: 4Gi
   networkPolicy:
     enabled: true
+    # extra ingress source, matched on namespace labels (set on preview
+    # namespaces via the ApplicationSet's managedNamespaceMetadata):
+    #   allowFromNamespaceLabels: { twizz-idp/preview: "true" }
+    allowFromNamespaceLabels: {}

@@ -15,6 +15,14 @@ spec:
               kubernetes.io/metadata.name: ingress-nginx
     - from:
         - podSelector: {}
+    {{- with .Values.namespace.networkPolicy.allowFromNamespaceLabels }}
+    # e.g. shared services admit traffic from preview namespaces (labelled by the
+    # ApplicationSet's managedNamespaceMetadata)
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              {{- toYaml . | nindent 14 }}
+    {{- end }}
   egress:
     - {}
 {{- end }}

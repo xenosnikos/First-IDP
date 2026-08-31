@@ -10,7 +10,7 @@ export const URL_PATTERNS = {
     `${service}-${branch}.dev.twizz.app`,
   QA: (name: string) => `${name}.qa.twizz.app`,
   STAGING: (service: string) => `${service}.staging.twizz.app`,
-  PREVIEW: (prNumber: number) => `pr-${prNumber}.preview.twizz.app`,
+  PREVIEW: (prNumber: number) => `pr-${prNumber}.prv.twizz.com`,
   PRODUCTION: (service: string) => `${service}.twizz.app`,
 } as const;
 

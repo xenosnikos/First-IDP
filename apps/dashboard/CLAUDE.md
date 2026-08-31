@@ -1,24 +1,29 @@
 # @twizz-idp/dashboard
 
-Next.js 15 App Router dashboard for TWIZZ-IDP. Hosted on ECS Fargate (standalone output mode).
+Next.js 15 App Router dashboard. **Read-only surface** — no write mutations except
+project registration; environments/deploys are driven by GitOps. Hosted on Vercel
+(Phase 2; Dockerfile/ECS path retired).
 
 ## Auth
-GitHub OAuth via Auth.js v5. Session checked via `auth()` in server context.
+Auth.js v5. Split config: `src/lib/auth.config.ts` is edge-safe (middleware imports it,
+no Prisma); `src/lib/auth.ts` adds the org-membership RBAC `signIn` callback + User
+upsert + AuditLog. Session checked via `auth()` in server context.
 
 ## API
-tRPC 11 with routers in `src/server/routers/`. Exposed at `/api/trpc`.
-- `project` - CRUD + GitHub repo detection
-- `environment` - create/teardown environments
-- `pipeline` - trigger/poll Argo workflows
-- `secret` - list secret key names (no values)
-- `release` - create/promote/rollback releases
+tRPC 11, routers in `src/server/routers/` (`project`, `environment`, `pipeline`,
+`secret`, `logs`) — all `protectedProcedure`, all reads.
 
 ## Services
-External API wrappers in `src/server/services/`. Each has a singleton export + class.
-Many methods are stubbed with TODO -- implement against real APIs.
+`src/server/services/`: `github.ts`, `aws.ts`, `vercel.ts`, `atlas.ts`, `introspect.ts`.
+All real implementations (no stubs).
 
 ## UI
-shadcn/ui + Tailwind 4. Components in `src/components/`.
+Tailwind 4, inline styles (no shadcn/ui). Components in `src/components/`
+(`environments/`, `pipeline/`, `projects/`, `layout/`).
 
 ## Workspace deps
 `@twizz-idp/db` (Prisma client), `@twizz-idp/shared` (types + validators)
+
+## Gotchas
+- tsconfig sets `declaration: false` — re-enabling resurrects TS2742 errors from next-auth/trpc
+- Middleware must never import anything that pulls in Prisma

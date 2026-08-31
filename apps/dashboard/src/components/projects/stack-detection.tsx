@@ -1,4 +1,4 @@
-import type { ProjectIntrospection } from "@/server/services/introspect";
+import type { ProjectIntrospection } from "@twizz-idp/core";
 
 export function StackDetection({ detection, repo }: {
   detection: ProjectIntrospection["detection"];

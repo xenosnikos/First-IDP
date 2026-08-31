@@ -1,8 +1,8 @@
 "use client";
 
 import { useState } from "react";
-import type { LiveEnvironment, DbConnection } from "@/server/services/introspect";
-import type { SecretEntry, EksClusterInfo } from "@/server/services/aws";
+import type { LiveEnvironment, DbConnection } from "@twizz-idp/core";
+import type { SecretEntry, EksClusterInfo } from "@twizz-idp/core";
 
 const tierOrder = { production: 0, staging: 1, dev: 2, unknown: 3 };
 const tierBadge: Record<string, string> = {

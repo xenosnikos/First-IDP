@@ -1,0 +1,18 @@
+{{- range .Values.externalServices }}
+---
+# Resolves the short in-cluster name "{{ .name }}" to a service in another
+# namespace (typically the shared singletons on NonProd), so application code
+# that calls http://{{ .name }}:{{ .port }} works unchanged inside previews.
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .name }}
+  labels:
+    {{- include "twizz-service.labels" $ | nindent 4 }}
+spec:
+  type: ExternalName
+  externalName: {{ .target }}
+  ports:
+    - port: {{ .port }}
+      targetPort: {{ .targetPort | default .port }}
+{{- end }}

@@ -1,17 +1,22 @@
 import { z } from "zod";
 
-export const triggerPipelineSchema = z.object({
-  environmentId: z.string().cuid(),
-  templateName: z.string().min(1),
-  params: z.record(z.string()).optional(),
-});
-
 export const pipelineStatusSchema = z.object({
   pipelineRunId: z.string().cuid(),
 });
 
-export type TriggerPipelineInput = z.infer<typeof triggerPipelineSchema>;
 export type PipelineStatusInput = z.infer<typeof pipelineStatusSchema>;
+
+/** A single step in a pipeline run (Argo historically; GitHub Actions jobs going forward). */
+export type WorkflowStep = {
+  id: string;
+  name: string;
+  phase: "Pending" | "Running" | "Succeeded" | "Failed" | "Skipped" | "Error";
+  startedAt?: string;
+  finishedAt?: string;
+  message?: string;
+  templateName?: string;
+  podName?: string;
+};
 
 export type PipelineStep = {
   name: string;

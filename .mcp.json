@@ -1,0 +1,12 @@
+{
+  "mcpServers": {
+    "twizz-platform": {
+      "command": "npx",
+      "args": ["tsx", "apps/mcp/src/index.ts"],
+      "env": {
+        "AWS_PROFILE": "twizz",
+        "AWS_REGION": "eu-west-1"
+      }
+    }
+  }
+}

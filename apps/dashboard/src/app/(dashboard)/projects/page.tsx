@@ -1,5 +1,5 @@
 import { auth } from "@/lib/auth";
-import { GitHubService } from "@/server/services/github";
+import { GitHubService } from "@twizz-idp/core";
 import Link from "next/link";
 import { redirect } from "next/navigation";
 

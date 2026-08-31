@@ -1,11 +1,12 @@
-import * as pulumi from "@pulumi/pulumi";
 import { createNetworking } from "./networking";
 import { createEksCluster } from "./eks";
-import { createEcsService } from "./ecs";
-import { createDatabase } from "./rds";
 import { createEcrRepos } from "./ecr";
 import { createIamRoles } from "./iam";
 import { createDnsRecords } from "./dns";
+import { bootstrapCluster } from "./bootstrap";
+import { createNetbirdRouter } from "./netbird";
+import { createAdminGate } from "./admin-gate";
+import * as pulumi from "@pulumi/pulumi";
 
 const tags = { Project: "twizz-idp" };
 
@@ -21,26 +22,42 @@ const eks = createEksCluster(
 
 const iam = createIamRoles(eks.oidcProviderArn, eks.oidcProviderUrl, tags);
 
-const rds = createDatabase(networking.vpcId, networking.privateSubnetIds, tags);
+const cfg = new pulumi.Config();
 
-const ecs = createEcsService(
-  networking.vpcId,
-  networking.publicSubnetIds,
-  networking.privateSubnetIds,
-  ecr.idpRepoUrl,
-  rds.endpoint,
-  rds.dbName,
-  tags,
+const bootstrap = bootstrapCluster(
+  eks.kubeconfig,
+  { esoRoleArn: iam.esoRoleArn, certManagerRoleArn: iam.certManagerRoleArn },
+  {
+    privateSubnetIds: networking.privateSubnetIds,
+    googleDomain: cfg.get("googleDomain") ?? "twizz.com",
+    argocdAdmins: cfg.getObject<string[]>("argocdAdmins") ?? [],
+  },
 );
 
-const dns = createDnsRecords(ecs.albDnsName, eks.ingressNlbDnsName);
+// Vercel admin apps proxied behind the VPN + an SSO email allowlist.
+const adminGate = createAdminGate(
+  bootstrap.provider,
+  cfg.getObject<string[]>("adminAllowlist") ?? [],
+);
+
+// VPN-only access: internal NLB + NetBird routing peer advertising the VPC CIDR.
+const netbird = createNetbirdRouter(networking.vpcId, networking.privateSubnetIds[0], networking.vpcCidr, tags);
+
+const dns = createDnsRecords(bootstrap.ingressNlbDnsName, tags);
 
 export const vpcId = networking.vpcId;
 export const eksClusterName = eks.clusterName;
-export const eksKubeconfig = eks.kubeconfig;
-export const ecsClusterArn = ecs.clusterArn;
-export const idpUrl = pulumi.interpolate`https://idp.twizz.app`;
-export const rdsEndpoint = rds.endpoint;
 export const ecrRepoUrls = ecr;
-export const iamRoles = iam;
-export const dnsRecords = dns;
+export const ingressNlbDnsName = bootstrap.ingressNlbDnsName;
+export const previewZoneNameservers = dns.nameservers; // NS records for "prv" in the twizz.com zone at Cloudflare (one-time)
+export const wildcardDomain = dns.wildcardDomain;
+export const argocdUrl = "https://argocd.prv.twizz.com";
+export const previewPodsRoleArn = iam.previewPodsRoleArn;
+export const ghaEcrPushRoleArn = iam.ghaEcrPushRoleArn;
+export const dashboardRoleArn = iam.dashboardRoleArn;
+export const mcpReadonlyRoleArn = iam.mcpReadonlyRoleArn;
+export const mcpOperatorRoleArn = iam.mcpOperatorRoleArn;
+export const netbirdRouterInstanceId = netbird.instanceId;
+export const netbirdAdvertisedCidr = netbird.advertisedCidr; // add as a NetBird network route via group "routers"
+export const ssoLoginUrl = "https://auth.prv.twizz.com/oauth2/start";
+export const adminAppUrls = adminGate.adminHosts;

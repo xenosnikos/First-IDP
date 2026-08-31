@@ -6,6 +6,8 @@
     "moduleResolution": "bundler",
     "allowJs": true,
     "incremental": true,
+    "declaration": false,
+    "declarationMap": false,
     "plugins": [
       {
         "name": "next"

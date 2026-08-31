@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { router, protectedProcedure } from "../trpc";
-import { awsService } from "../services/aws";
+import { awsService } from "@twizz-idp/core";
 
 export const logsRouter = router({
   getPodLogs: protectedProcedure

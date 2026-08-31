@@ -1,0 +1,54 @@
+# Drop into MymTwo/frontend as .github/workflows/backend-link.yml
+#
+# Opt-in wiring of a frontend PR to a backend preview: add a line
+#   Backend-PR: #123
+# to the PR body. Sets branch-scoped Vercel env vars, then triggers a redeploy
+# so the preview build bakes the right REACT_APP_* endpoints.
+name: backend-link
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+permissions:
+  contents: read
+
+env:
+  VERCEL_TEAM_ID: team_ocn3vwvvs3VDxcjxNcY7l8Mu
+  VERCEL_PROJECT_ID: prj_3Op05Dm743j4qscD37c6hpfHRnfD
+
+jobs:
+  link:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Parse Backend-PR tag
+        id: parse
+        env:
+          BODY: ${{ github.event.pull_request.body }}
+        run: |
+          N=$(echo "$BODY" | grep -oiP 'Backend-PR:\s*#\K[0-9]+' | head -1 || true)
+          echo "backend_pr=$N" >> "$GITHUB_OUTPUT"
+
+      - name: Set branch-scoped env vars on Vercel
+        if: steps.parse.outputs.backend_pr != ''
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+          N: ${{ steps.parse.outputs.backend_pr }}
+        run: |
+          set -euo pipefail
+          API="https://pr-${N}-moly-backend.prv.twizz.com"
+          for KV in "REACT_APP_API_ENDPOINT=${API}" "REACT_APP_SOCKET_ENDPOINT=${API}"; do
+            KEY="${KV%%=*}"; VALUE="${KV#*=}"
+            # delete existing branch-scoped var of same key (ignore 404)
+            IDS=$(curl -s "https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}/env?teamId=${VERCEL_TEAM_ID}&gitBranch=${BRANCH}" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" | jq -r ".envs[] | select(.key==\"${KEY}\" and .gitBranch==\"${BRANCH}\") | .id")
+            for ID in $IDS; do
+              curl -s -X DELETE "https://api.vercel.com/v9/projects/${VERCEL_PROJECT_ID}/env/${ID}?teamId=${VERCEL_TEAM_ID}" \
+                -H "Authorization: Bearer ${VERCEL_TOKEN}" > /dev/null
+            done
+            curl -s -X POST "https://api.vercel.com/v10/projects/${VERCEL_PROJECT_ID}/env?teamId=${VERCEL_TEAM_ID}" \
+              -H "Authorization: Bearer ${VERCEL_TOKEN}" -H "Content-Type: application/json" \
+              -d "{\"key\":\"${KEY}\",\"value\":\"${VALUE}\",\"type\":\"encrypted\",\"target\":[\"preview\"],\"gitBranch\":\"${BRANCH}\"}" > /dev/null
+            echo "set ${KEY} for branch ${BRANCH}"
+          done

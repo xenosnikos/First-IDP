@@ -1,4 +1,4 @@
-import type { EksClusterInfo } from "@/server/services/aws";
+import type { EksClusterInfo } from "@twizz-idp/core";
 import { InfoCard } from "./stack-detection";
 
 export function EksClusterOverview({ cluster, nodes }: {

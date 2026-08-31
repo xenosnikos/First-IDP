@@ -1,0 +1,19 @@
+{
+  "name": "@twizz-idp/onboard",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/onboard.ts",
+  "scripts": {
+    "onboard": "tsx src/onboard.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@octokit/rest": "^21.0.0",
+    "@twizz-idp/core": "workspace:*",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0"
+  }
+}

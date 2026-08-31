@@ -2,116 +2,116 @@
 
 ## Project Overview
 
-TWIZZ-IDP is an Internal Developer Platform for the Twizz organization. It provides a self-service UI for developers to browse repos, configure builds, provision environments, manage secrets, handle databases, and plan releases.
+TWIZZ-IDP is an Internal Developer Platform for the Twizz organization. It provides
+preview environments for org repos (backends → namespace-per-PR pods on
+EKS-Twizz-NonProd, frontends → Vercel previews, Lambdas → per-PR SAM stacks),
+GitOps promotion, AI-assisted PR review, and a read-only dashboard.
+
+**Architecture stance (2026-08): GitOps-first.** GitHub Actions = CI. Argo CD
+(ApplicationSets, PR generator) = CD. Git + PRs are the source of truth. The
+dashboard only reads (introspection, pipelines, logs); writes flow through PRs
+and the strictly-authorized MCP toolset. See STATE.md for phase status.
 
 ## Architecture
 
 - **Monorepo**: pnpm workspaces + Turborepo
-- **Dashboard**: Next.js 15 (App Router) + tRPC 11 + Prisma 6 + Tailwind 4
-- **Hosting**: ECS Fargate (standalone, NOT on EKS)
-- **Database**: PostgreSQL 16 on RDS (IDP metadata)
-- **Pipeline**: Argo Workflows 3.6 + Argo CD 2.12 (running on EKS-Twizz-NonProd)
-- **IaC**: Pulumi (TypeScript)
-- **Auth**: GitHub OAuth via Auth.js v5 (next-auth 5.0.0-beta.30)
+- **Dashboard**: Next.js 15 (App Router) + tRPC 11 + Prisma 6 + Tailwind 4 — read-only
+- **Hosting**: Vercel + Neon Postgres (planned Phase 2; ECS/RDS modules deleted)
+- **CI**: GitHub Actions in each service repo (immutable `pr-<n>-<sha>` image tags)
+- **CD**: Argo CD on EKS-Twizz-NonProd, fed from the `TwizzyNicky/twizz-gitops` repo
+- **IaC**: Pulumi (TypeScript) in `infra/`
+- **Auth**: GitHub OAuth via Auth.js v5; sign-in restricted to org members (RBAC below)
 
-## Dashboard Layout
+## Dashboard Routes (all read-only)
 
-- Collapsible sidebar navigation with: Projects, Environments, Pipelines, Release Board
-- App shell wraps all authenticated pages via `(dashboard)` route group
-- Root `/` is login page; authenticated users redirect to `/projects`
-- tRPC React Query provider wraps all dashboard routes for client-side data fetching
+| Route | Description |
+|-------|-------------|
+| `/projects` | GitHub org repo list |
+| `/projects/[id]` | Project introspection (stack, environments, deployments) |
+| `/projects/[id]/environments/[envId]` | Environment detail, pipeline history, service logs |
+| `/environments` | Cross-project environment overview (diagram + table) |
+| `/pipelines` | Recent pipeline runs |
+| `/pipelines/[runId]` | Step timeline + log viewer (points at GitHub Actions from Phase 3) |
 
-## Key Routes
-
-| Route | Status | Description |
-|-------|--------|-------------|
-| `/projects` | Done | GitHub org repo list |
-| `/projects/[id]` | Done | Full project introspection (stack, environments, deployments) |
-| `/projects/[id]/deploy` | Done | 4-step deploy wizard (branch -> tier -> resources -> review) |
-| `/projects/[id]/environments/[envId]` | Done | Environment detail with config, pipeline history, service logs |
-| `/environments` | Done | Cross-project environment overview (diagram + table views) |
-| `/pipelines` | Done | Recent pipeline runs across all projects |
-| `/pipelines/[runId]` | Done | DAG step timeline + per-step log viewer with polling |
-| `/releases` | Stub | Kanban release board (TODO) |
-| `/releases/[id]` | Stub | Release detail (TODO) |
+The deploy wizard and release board were removed (GitOps replaces both).
 
 ## Service Layer
 
 Services in `apps/dashboard/src/server/services/`:
 - `github.ts` - Octokit wrapper (listOrgRepos, listBranches, detectProjectType, getFileContent)
-- `argo.ts` - Argo Workflows API (submitWorkflow, getWorkflow, getStepLogs, listWorkflows)
-- `argocd.ts` - Argo CD API (createApplication, syncApplication, getAppStatus)
-- `aws.ts` - AWS SDK (Secrets Manager, CloudWatch Container Insights, EKS describe, **getPodLogs** for application logs)
-- `vercel.ts` - Vercel API (listProjects, getProjectDetail with environments, listDeployments)
-- `atlas.ts` - MongoDB Atlas Admin API (listClusters, createDatabaseUser)
-- `claude.ts` - Anthropic API for release doc generation
-- `introspect.ts` - Multi-source project introspection (EKS pods + secrets + Vercel + Atlas) and cross-project environment overview
+- `aws.ts` - AWS SDK (Secrets Manager keys, CloudWatch Container Insights, EKS describe, getPodLogs)
+- `vercel.ts` - Vercel API (listProjects, getProjectDetail, listDeployments) — used by introspection
+- `atlas.ts` - MongoDB Atlas Admin API (listClusters, …) — used by introspection
+- `introspect.ts` - Multi-source project/environment introspection (the core asset)
 
-## tRPC Routers
+Deleted (git history has them): `argo.ts`, `argocd.ts`, `claude.ts`.
 
-Routers in `apps/dashboard/src/server/routers/`:
-- `project` - list, listGithubRepos, listBranches, get, detectType, create
-- `environment` - list, get, create (submits Argo workflow + returns pipelineRunId), delete (stub)
-- `pipeline` - trigger, getStatus (with polling), getStepLogs, getLogs, list, listAll
-- `logs` - getPodLogs (CloudWatch application logs with pod/time/search filters)
-- `secret` - list, listKeys
-- `release` - list, get, create, promote, rollback
+## tRPC Routers (all behind protectedProcedure)
+
+- `project` - list, listGithubRepos, listBranches, get, detectType, create (registration only)
+- `environment` - list, get (read-only; envs are created/destroyed by GitOps)
+- `pipeline` - getStatus, getStepLogs, list, listAll (DB reads; GitHub Actions wiring lands in Phase 3)
+- `secret` - list, listKeys (names only, never values)
+- `logs` - getPodLogs (CloudWatch application logs)
+
+## Auth / RBAC
+
+- `lib/auth.config.ts` — edge-safe config (providers + `authorized`); imported by middleware. NO Prisma here.
+- `lib/auth.ts` — full config: `signIn` callback verifies **active GitHub org membership**
+  (`ALLOWED_GITHUB_ORGS`, default `twizz-app,MymTwo`) with the user's own token, or an
+  `ALLOWED_GITHUB_LOGINS` allowlist. Upserts `User`, writes an `AuditLog` row per attempt.
+- Middleware matcher covers `/projects`, `/environments`, `/pipelines`.
+- Every write anywhere (dashboard or MCP) must create an `AuditLog` row.
+
+## Prisma (packages/db)
+
+Models: `User`, `AuditLog`, `Project`, `Environment`, `DeployConfig`, `DatabaseConfig`,
+`PipelineRun`. Migrations live in `packages/db/prisma/migrations/` (started 0001_init);
+use `pnpm db:migrate`, not `db push`, from now on.
 
 ## Introspection System
 
-The `introspect.ts` service queries multiple sources in parallel to build a complete picture:
-1. **GitHub API** - repo metadata, package.json, project type detection
-2. **EKS clusters** (both prod + staging) - live pods via CloudWatch Container Insights
-3. **AWS Secrets Manager** - all secrets, parsed for MongoDB URIs
-4. **Vercel API** - project environments (production/staging/preview)
-5. **MongoDB Atlas** - cluster list for DB connection matching
-
-Key details:
-- Two EKS clusters: `EKS-Moly-Prod` (production), `EKS-Moly-staging` (staging + dev namespaces)
-- `inferTierFromNamespaceAndCluster()` uses cluster context for tier assignment
-- `matchPodToProject()` handles moly/loly naming alias (historical rename)
-- `introspectAllEnvironments()` provides cross-project environment overview
+`introspect.ts` queries in parallel: GitHub API, EKS clusters via CloudWatch Container
+Insights, AWS Secrets Manager (keys), Vercel API, MongoDB Atlas. Helpers:
+`inferTierFromNamespaceAndCluster()`, `matchPodToProject()` (handles the moly/loly
+naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app health.
 
 ## Conventions
 
-- TypeScript strict mode everywhere
-- Zod for runtime validation (shared between client and server via packages/shared)
-- tRPC routers in `apps/dashboard/src/server/routers/`
-- Service layer (external API wrappers) in `apps/dashboard/src/server/services/`
-- All shared types in `packages/shared/src/types/`
+- TypeScript strict mode everywhere; Zod for runtime validation via `@twizz-idp/shared`
+- Routers in `apps/dashboard/src/server/routers/`, services in `.../server/services/`
 - Prisma schema in `packages/db/prisma/schema.prisma`
-- Helm values: `values.yaml` (defaults), `values-{dev,staging,prod}.yaml` (overrides)
-- Argo templates use DAG structure for parallelism
-- Pulumi modules are per-resource-group: networking.ts, eks.ts, ecs.ts, rds.ts, etc.
+- Helm chart: `helm/twizz-service` (generic; `values.yaml` defaults + tier overrides)
+- Dashboard tsconfig sets `declaration: false` — do not re-enable (declaration emit
+  from tsconfig.base.json was the cause of the historical TS2742 "next-auth type bug")
+- ESLint: `apps/dashboard/.eslintrc.json` extends next/core-web-vitals + next/typescript
 
 ## Package Names
 
 - `@twizz-idp/db` - Prisma client and schema
 - `@twizz-idp/shared` - Types, validators, constants
-- `@twizz-idp/config` - Shared ESLint, TS, Tailwind configs
+- `@twizz-idp/config` - Shared configs
 - `@twizz-idp/dashboard` - Next.js dashboard app
 
 ## Key External Services
 
-- **AWS Account**: 848281935985, region eu-west-1
+- **AWS Account**: 848281935985, region eu-west-1 (profile `twizz`)
 - **ECR**: 848281935985.dkr.ecr.eu-west-1.amazonaws.com
-- **EKS Prod**: EKS-Moly-Prod (DO NOT MODIFY until Phase 6)
-- **EKS Staging**: EKS-Moly-staging (staging in default ns, dev in dev ns)
-- **EKS Non-Prod**: EKS-Twizz-NonProd (new, managed by this platform -- not yet provisioned)
-- **Secrets Manager**: AWS SM in eu-west-1
-- **GitHub Org**: twizz-app (OAuth client: Ov23lirMDHUPPYwRkz5A)
-- **Vercel Team**: Loly (team_ocn3vwvvs3VDxcjxNcY7l8Mu)
-- **MongoDB Atlas**: Project 684296275fe8cc27d7b99d9b (public key: iydvdumt)
-- **CloudWatch Logs**: `/aws/containerinsights/{cluster}/application` for pod logs, `/performance` for metrics
-
-## Known Issues
-
-- `next-auth 5.0.0-beta.30` has a type inference issue that fails `next build` typecheck but works fine in dev mode
-- The `databases-section.tsx` component was refactored (databases now shown inside environment tabs, not as standalone section)
+- **EKS Prod**: EKS-Moly-Prod — **DO NOT MODIFY, EVER** (private API, SOCKS tunnel via bastion)
+- **EKS Staging**: EKS-Moly-staging (staging in default ns, dev in dev ns) — leave as-is
+- **EKS Non-Prod**: EKS-Twizz-NonProd — owned by this platform (Pulumi, Phase 2)
+- **GitHub orgs**: `twizz-app` (canonical, new repos), `MymTwo` (Moly-backend, frontend)
+- **GitHub OAuth client**: Ov23lirMDHUPPYwRkz5A
+- **Vercel Team**: Loly (`team_ocn3vwvvs3VDxcjxNcY7l8Mu`) — owns `frontend` project `prj_3Op05Dm743j4qscD37c6hpfHRnfD`
+- **MongoDB Atlas**: Project 684296275fe8cc27d7b99d9b (public key iydvdumt); nonprod cluster `nonprod-twizz`
+- **CloudWatch Logs**: `/aws/containerinsights/{cluster}/application` (pod logs), `/performance` (metrics)
+- **Kubeconfigs**: per-cluster files `~/.kube/twizz-*.yaml` (aliases `ktw-staging`, `ktw-prod`);
+  never merge Twizz contexts into the default kubeconfig
 
 ## Do NOT
 
 - Modify EKS-Moly-Prod cluster or its workloads
-- Store secrets in code or env files
+- Store secrets in code, env files, ConfigMaps, or Notion (see docs/SECURITY-ROTATIONS.md)
 - Add dependencies without checking if they exist in workspace first
 - Run git commands unless explicitly asked
+- Add write mutations to the dashboard — writes go through PRs or the MCP toolset with audit logging

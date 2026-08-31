@@ -1,6 +1,6 @@
 "use client";
 
-import type { WorkflowStep } from "@/server/services/argo";
+import type { WorkflowStep } from "@twizz-idp/shared";
 
 const phaseIcon: Record<string, { color: string; icon: React.ReactNode }> = {
   Pending: {

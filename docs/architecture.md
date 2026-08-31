@@ -14,5 +14,5 @@
 | dev | *.dev.twizz.app | 72h TTL |
 | qa | *.qa.twizz.app | manual |
 | staging | *.staging.twizz.app | persistent |
-| preview | *.preview.twizz.app | auto on PR merge |
+| preview | *.prv.twizz.com | auto on PR merge |
 | prod | *.twizz.app | approval required |

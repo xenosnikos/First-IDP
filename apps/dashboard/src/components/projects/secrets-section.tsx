@@ -1,4 +1,4 @@
-import type { SecretEntry } from "@/server/services/aws";
+import type { SecretEntry } from "@twizz-idp/core";
 
 export function SecretsSection({ secrets }: { secrets: SecretEntry[] }) {
   if (secrets.length === 0) return null;

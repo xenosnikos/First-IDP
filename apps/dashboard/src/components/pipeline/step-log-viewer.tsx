@@ -3,14 +3,14 @@
 import { useEffect, useRef, useState } from "react";
 import { trpc } from "@/lib/trpc-client";
 
-export function StepLogViewer({ runId, stepId }: { runId: string; stepId: string }) {
+export function StepLogViewer({ owner, repo, jobId }: { owner: string; repo: string; jobId: number }) {
   const [search, setSearch] = useState("");
   const [autoScroll, setAutoScroll] = useState(true);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  const logs = trpc.pipeline.getStepLogs.useQuery(
-    { pipelineRunId: runId, stepId },
-    { refetchInterval: 5000 },
+  const logs = trpc.pipeline.getGithubJobLogs.useQuery(
+    { owner, repo, jobId },
+    { refetchInterval: 10000 },
   );
 
   useEffect(() => {
@@ -89,12 +89,8 @@ function LogLine({ line, search }: { line: string; search: string }) {
   const isWarn = /warn|warning/i.test(line);
   const color = isError ? "text-red-400" : isWarn ? "text-yellow-400" : "text-foreground/70";
 
-  // Parse NDJSON from Argo if present
-  let text = line;
-  try {
-    const parsed = JSON.parse(line);
-    if (parsed.result?.content) text = parsed.result.content;
-  } catch { /* not JSON, use raw line */ }
+  // Strip the ISO timestamp prefix GitHub Actions puts on every line
+  const text = line.replace(/^\d{4}-\d{2}-\d{2}T[\d:.]+Z\s?/, "");
 
   return (
     <div className={`py-0.5 whitespace-pre-wrap break-all ${color}`}>

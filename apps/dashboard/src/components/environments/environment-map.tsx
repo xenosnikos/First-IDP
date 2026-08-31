@@ -2,7 +2,7 @@
 
 import { useState } from "react";
 import Link from "next/link";
-import type { AllEnvironmentsData, EnvironmentOverview, ServiceInstance } from "@/server/services/introspect";
+import type { AllEnvironmentsData, EnvironmentOverview, ServiceInstance } from "@twizz-idp/core";
 
 const tierColor: Record<string, { bg: string; border: string; badge: string; dot: string }> = {
   production: {

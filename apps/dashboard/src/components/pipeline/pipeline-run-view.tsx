@@ -4,38 +4,50 @@ import { useState } from "react";
 import { trpc } from "@/lib/trpc-client";
 import { DagTimeline } from "./dag-timeline";
 import { StepLogViewer } from "./step-log-viewer";
-import { PipelineOutput } from "./pipeline-output";
 
 const phaseColor: Record<string, string> = {
-  Pending: "text-muted-foreground",
-  Running: "text-blue-400",
-  Succeeded: "text-green-400",
-  Failed: "text-red-400",
-  Error: "text-red-400",
+  PENDING: "text-muted-foreground",
+  RUNNING: "text-blue-400",
+  SUCCEEDED: "text-green-400",
+  FAILED: "text-red-400",
+  CANCELLED: "text-zinc-400",
 };
 
 const phaseBg: Record<string, string> = {
-  Pending: "bg-muted-foreground",
-  Running: "bg-blue-500",
-  Succeeded: "bg-green-500",
-  Failed: "bg-red-500",
-  Error: "bg-red-500",
+  PENDING: "bg-muted-foreground",
+  RUNNING: "bg-blue-500",
+  SUCCEEDED: "bg-green-500",
+  FAILED: "bg-red-500",
+  CANCELLED: "bg-zinc-500",
 };
 
+// runId route param format: "<owner>--<repo>--<githubRunId>"
 export function PipelineRunView({ runId }: { runId: string }) {
   const [selectedStepId, setSelectedStepId] = useState<string | null>(null);
 
-  const status = trpc.pipeline.getStatus.useQuery(
-    { pipelineRunId: runId },
+  const [owner, repo, ghRunIdStr] = runId.split("--");
+  const ghRunId = Number(ghRunIdStr);
+  const valid = Boolean(owner && repo && Number.isFinite(ghRunId));
+
+  const status = trpc.pipeline.getGithubRun.useQuery(
+    { owner, repo, runId: ghRunId },
     {
+      enabled: valid,
       refetchInterval: (query) => {
         const data = query.state.data;
-        if (!data) return 3000;
-        const s = data.status;
-        return s === "RUNNING" || s === "PENDING" ? 3000 : false;
+        if (!data) return 5000;
+        return data.status === "RUNNING" || data.status === "PENDING" ? 5000 : false;
       },
     },
   );
+
+  if (!valid) {
+    return (
+      <div className="rounded-lg bg-destructive/10 border border-destructive/20 p-4">
+        <p className="text-destructive text-sm">Unrecognized run id: {runId}</p>
+      </div>
+    );
+  }
 
   if (status.isLoading) {
     return (
@@ -56,10 +68,8 @@ export function PipelineRunView({ runId }: { runId: string }) {
 
   const data = status.data!;
   const isRunning = data.status === "RUNNING" || data.status === "PENDING";
-  const succeeded = data.status === "SUCCEEDED";
   const failed = data.status === "FAILED";
 
-  // Duration
   const startTime = data.startedAt ? new Date(data.startedAt).getTime() : Date.now();
   const endTime = data.completedAt ? new Date(data.completedAt).getTime() : Date.now();
   const durationSec = Math.round((endTime - startTime) / 1000);
@@ -73,25 +83,19 @@ export function PipelineRunView({ runId }: { runId: string }) {
       <div className="rounded-lg border border-border bg-card p-5">
         <div className="flex items-center justify-between">
           <div className="flex items-center gap-4">
-            <span className={`w-3 h-3 rounded-full ${phaseBg[data.status === "RUNNING" ? "Running" : data.status === "SUCCEEDED" ? "Succeeded" : data.status === "FAILED" ? "Failed" : "Pending"]} ${isRunning ? "animate-pulse" : ""}`} />
+            <span className={`w-3 h-3 rounded-full ${phaseBg[data.status] ?? "bg-muted-foreground"} ${isRunning ? "animate-pulse" : ""}`} />
             <div>
               <h2 className="font-semibold">
                 <span className="font-mono text-sm text-muted-foreground mr-2">
-                  {data.argoWorkflowName}
+                  {data.workflowName} #{data.runNumber}
                 </span>
               </h2>
               <div className="flex items-center gap-3 mt-1 text-sm">
-                {data.environment && (
-                  <>
-                    <span className="text-muted-foreground">
-                      {data.environment.project?.name}
-                    </span>
-                    <span className="text-muted-foreground/50">/</span>
-                    <span className={phaseColor[data.status === "SUCCEEDED" ? "Succeeded" : data.status === "FAILED" ? "Failed" : data.status === "RUNNING" ? "Running" : "Pending"]}>
-                      {data.status}
-                    </span>
-                  </>
-                )}
+                <span className="text-muted-foreground">{owner}/{repo}</span>
+                <span className="text-muted-foreground/50">/</span>
+                <span className="font-mono text-xs text-muted-foreground">{data.branch}</span>
+                <span className="text-muted-foreground/50">/</span>
+                <span className={phaseColor[data.status] ?? ""}>{data.status}</span>
               </div>
             </div>
           </div>
@@ -102,14 +106,17 @@ export function PipelineRunView({ runId }: { runId: string }) {
                 Started {new Date(data.startedAt).toLocaleTimeString()}
               </p>
             )}
+            <a
+              href={data.htmlUrl}
+              target="_blank"
+              rel="noreferrer"
+              className="text-xs text-primary hover:underline"
+            >
+              Open in GitHub ↗
+            </a>
           </div>
         </div>
       </div>
-
-      {/* Output URL on success */}
-      {succeeded && data.outputs && (
-        <PipelineOutput outputs={data.outputs} />
-      )}
 
       {/* Failed banner */}
       {failed && (
@@ -120,13 +127,13 @@ export function PipelineRunView({ runId }: { runId: string }) {
           <div>
             <p className="text-sm font-medium text-red-400">Pipeline Failed</p>
             <p className="text-xs text-red-400/70 mt-1">
-              Check the failed step logs below for details.
+              Check the failed job logs below for details.
             </p>
           </div>
         </div>
       )}
 
-      {/* DAG Timeline + Log Viewer */}
+      {/* Jobs timeline + Log viewer */}
       <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
         <div className="lg:col-span-2">
           <DagTimeline
@@ -137,10 +144,10 @@ export function PipelineRunView({ runId }: { runId: string }) {
         </div>
         <div className="lg:col-span-3">
           {selectedStepId ? (
-            <StepLogViewer runId={runId} stepId={selectedStepId} />
+            <StepLogViewer owner={owner} repo={repo} jobId={Number(selectedStepId)} />
           ) : (
             <div className="rounded-lg border border-border bg-card p-8 text-center text-muted-foreground text-sm">
-              Select a step to view its logs
+              Select a job to view its logs
             </div>
           )}
         </div>

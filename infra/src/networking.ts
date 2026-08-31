@@ -69,6 +69,7 @@ export function createNetworking(tags: Record<string, string>) {
 
   return {
     vpcId: vpc.id,
+    vpcCidr: "10.0.0.0/16",
     publicSubnetIds: publicSubnets.map(s => s.id),
     privateSubnetIds: privateSubnets.map(s => s.id),
   };

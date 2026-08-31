@@ -1,0 +1,38 @@
+# Daily sweep: which repos in twizz-app + MymTwo are NOT onboarded onto the IDP
+# (no twizz.yaml at root)? Maintains a single tracking issue with the list.
+name: org-watch
+
+on:
+  schedule:
+    - cron: "0 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  issues: write
+  contents: read
+
+jobs:
+  sweep:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Find un-onboarded repos
+        env:
+          GH_TOKEN: ${{ secrets.ORG_WATCH_TOKEN }} # PAT with repo read on both orgs
+        run: |
+          set -euo pipefail
+          MISSING=""
+          for ORG in twizz-app MymTwo; do
+            for R in $(gh repo list "$ORG" --no-archived --limit 200 --json nameWithOwner -q '.[].nameWithOwner'); do
+              if ! gh api "repos/$R/contents/twizz.yaml" --silent 2>/dev/null; then
+                MISSING="$MISSING\n- [ ] \`$R\`"
+              fi
+            done
+          done
+          BODY="Repos without \`twizz.yaml\` (not onboarded onto the IDP). Run \`pnpm --filter @twizz-idp/onboard onboard pr <owner>/<repo>\` for each.\n$MISSING\n\n_Updated $(date -u +%F) by org-watch._"
+          echo -e "$BODY" > body.md
+          N=$(gh issue list --repo "$GITHUB_REPOSITORY" --label org-watch --state open --json number -q '.[0].number' || true)
+          if [ -n "$N" ]; then
+            gh issue edit "$N" --repo "$GITHUB_REPOSITORY" --body-file body.md
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "Un-onboarded repos" --label org-watch --body-file body.md
+          fi
