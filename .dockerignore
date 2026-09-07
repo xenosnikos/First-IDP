@@ -1,0 +1,18 @@
+# Build context for the root Dockerfile. Sources + manifests only.
+**/node_modules
+**/.next
+**/dist
+**/.turbo
+.git
+.github
+infra/node_modules
+infra/.pulumi
+**/.env
+**/.env.*
+!**/.env.example
+!**/.env.local.example
+docs
+*.md
+!packages/db/prisma/**
+.claude
+.mcp.json

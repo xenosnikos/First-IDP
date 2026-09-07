@@ -1,0 +1,3 @@
+# Nebula is an internal surface behind VPN + SSO.
+User-agent: *
+Disallow: /

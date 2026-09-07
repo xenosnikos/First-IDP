@@ -1,0 +1,42 @@
+import { auth } from "@/lib/auth";
+import { redirect } from "next/navigation";
+import { introspectAllEnvironments } from "@twizz-idp/core";
+import { EnvironmentMap } from "@/components/environments/environment-map";
+
+// The pre-Nebula cross-project introspection map (all tiers, read-only).
+// Kept as-is under /environments/topology; /environments is the Nebula grid.
+export default async function TopologyPage() {
+  const session = await auth();
+  if (!session?.user) redirect("/");
+
+  const token = (session as any).accessToken as string;
+  const org = process.env.GITHUB_ORG ?? "twizz-app";
+
+  let data: Awaited<ReturnType<typeof introspectAllEnvironments>> | null = null;
+  let error: string | null = null;
+
+  try {
+    data = await introspectAllEnvironments(token, org);
+  } catch (e: any) {
+    error = e.message ?? "Failed to load environments";
+  }
+
+  return (
+    <div className="p-8">
+      <div className="mb-8">
+        <h1 className="n-display" style={{ fontSize: 30 }}>Topology</h1>
+        <p className="text-muted-foreground mt-1">
+          All services across all environment tiers
+        </p>
+      </div>
+
+      {error && (
+        <div className="rounded-lg bg-destructive/10 border border-destructive/20 p-4 mb-6">
+          <p className="text-destructive text-sm">{error}</p>
+        </div>
+      )}
+
+      {data && <EnvironmentMap data={data} />}
+    </div>
+  );
+}

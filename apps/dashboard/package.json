@@ -7,18 +7,22 @@
     "build": "next build",
     "start": "next start",
     "lint": "next lint",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
   },
   "dependencies": {
     "@auth/core": "^0.37.0",
     "@aws-sdk/client-cloudwatch-logs": "^3.1026.0",
+    "@aws-sdk/client-ecr": "^3.700.0",
     "@aws-sdk/client-eks": "^3.1026.0",
     "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "@kubernetes/client-node": "^0.22.0",
     "@octokit/rest": "^21.0.0",
     "@tanstack/react-query": "^5.62.0",
     "@trpc/client": "^11.0.0",
     "@trpc/react-query": "^11.0.0",
     "@trpc/server": "^11.0.0",
+    "@twizz-idp/actions": "workspace:*",
     "@twizz-idp/core": "workspace:^",
     "@twizz-idp/db": "workspace:*",
     "@twizz-idp/shared": "workspace:*",
@@ -38,6 +42,7 @@
     "eslint-config-next": "^15",
     "postcss": "^8.4.0",
     "tailwindcss": "^4.0.0",
-    "typescript": "^5.7.0"
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
   }
 }

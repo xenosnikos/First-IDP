@@ -1,40 +1,18 @@
+import type { Metadata } from "next";
 import { auth } from "@/lib/auth";
 import { redirect } from "next/navigation";
-import { introspectAllEnvironments } from "@twizz-idp/core";
-import { EnvironmentMap } from "@/components/environments/environment-map";
+import { isOperator } from "@/lib/nebula/operators";
+import { EnvironmentsGrid } from "@/components/environments/environments-grid";
 
+export const metadata: Metadata = { title: "Environments" };
+export const dynamic = "force-dynamic";
+
+// Nebula's Environments surface: one preview card per named env in
+// twizz-gitops/named-envs, with live Argo health read in-cluster. Reads via
+// tRPC actions.listEnvs; writes via the gated actions router.
 export default async function EnvironmentsPage() {
   const session = await auth();
   if (!session?.user) redirect("/");
-
-  const token = (session as any).accessToken as string;
-  const org = process.env.GITHUB_ORG ?? "twizz-app";
-
-  let data: Awaited<ReturnType<typeof introspectAllEnvironments>> | null = null;
-  let error: string | null = null;
-
-  try {
-    data = await introspectAllEnvironments(token, org);
-  } catch (e: any) {
-    error = e.message ?? "Failed to load environments";
-  }
-
-  return (
-    <div className="p-8">
-      <div className="mb-8">
-        <h1 className="text-2xl font-bold">Environments</h1>
-        <p className="text-muted-foreground mt-1">
-          All services across all environment tiers
-        </p>
-      </div>
-
-      {error && (
-        <div className="rounded-lg bg-destructive/10 border border-destructive/20 p-4 mb-6">
-          <p className="text-destructive text-sm">{error}</p>
-        </div>
-      )}
-
-      {data && <EnvironmentMap data={data} />}
-    </div>
-  );
+  const login = (session as { login?: string }).login ?? "";
+  return <EnvironmentsGrid operator={isOperator(login)} login={login} />;
 }

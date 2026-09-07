@@ -174,6 +174,33 @@ export function createIamRoles(
       .apply(([id, secret]) => JSON.stringify({ AWS_ACCES_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret })),
   });
 
+  // ── Nebula reaper: hourly CronJob (namespace nebula, SA reaper) ──
+  // Tears down expired named envs (twizz-gitops commit + per-env secret
+  // delete) and orphaned preview namespaces. Kubernetes access is plain RBAC
+  // in the gitops repo; this role is only for the Secrets Manager side.
+  const nebulaReaperRole = new aws.iam.Role("twizz-nebula-reaper", {
+    name: "twizz-nebula-reaper",
+    assumeRolePolicy: irsaTrust("system:serviceaccount:nebula:reaper", false),
+    tags,
+  });
+
+  new aws.iam.RolePolicy("twizz-nebula-reaper-policy", {
+    role: nebulaReaperRole.name,
+    policy: accountId.apply((acct) =>
+      JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Sid: "PreviewSecretsReadDelete",
+            Effect: "Allow",
+            Action: ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret"],
+            Resource: `arn:aws:secretsmanager:${region}:${acct}:secret:preview/*`,
+          },
+        ],
+      }),
+    ),
+  });
+
   // ── cert-manager: Route53 DNS-01 for *.prv.twizz.com ─────────
   const certManagerRole = new aws.iam.Role("twizz-cert-manager", {
     name: "twizz-cert-manager",
@@ -298,6 +325,7 @@ export function createIamRoles(
               StringLike: {
                 "token.actions.githubusercontent.com:sub": [
                   "repo:twizz-app/*",
+                  "repo:xenosnikos/First-IDP:*", // twizz-idp itself (reaper + dashboard images)
                 ],
               },
             },
@@ -517,5 +545,6 @@ export function createIamRoles(
     dashboardRoleArn: dashboardRole?.arn,
     mcpReadonlyRoleArn: mcpReadonly.arn,
     mcpOperatorRoleArn: mcpOperator.arn,
+    nebulaReaperRoleArn: nebulaReaperRole.arn,
   };
 }

@@ -10,6 +10,9 @@ export const authConfig = {
       authorization: { params: { scope: "read:org repo read:user" } },
     }),
   ],
+  // In-cluster the app sits behind ingress-nginx (nebula.prv.twizz.com), so the
+  // Host header is the ingress's; NEXTAUTH_URL is the public origin.
+  trustHost: true,
   pages: {
     signIn: "/",
   },

@@ -1,0 +1,24 @@
+{
+  "name": "@twizz-idp/reaper",
+  "version": "0.1.0",
+  "private": true,
+  "main": "src/index.ts",
+  "scripts": {
+    "start": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.700.0",
+    "@kubernetes/client-node": "^0.22.0",
+    "@octokit/rest": "^21.0.0",
+    "@twizz-idp/actions": "workspace:*",
+    "@twizz-idp/db": "workspace:*",
+    "tsx": "^4.19.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.7.0",
+    "vitest": "^3.0.0"
+  }
+}

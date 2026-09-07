@@ -1,23 +1,190 @@
 @import "tailwindcss";
 
-@theme {
-  --color-background: #09090b;
-  --color-foreground: #fafafa;
-  --color-card: #09090b;
-  --color-card-foreground: #fafafa;
-  --color-primary: #5c7cfa;
-  --color-primary-foreground: #fafafa;
-  --color-secondary: #27272a;
-  --color-secondary-foreground: #fafafa;
-  --color-muted: #27272a;
-  --color-muted-foreground: #a1a1aa;
-  --color-accent: #27272a;
-  --color-accent-foreground: #fafafa;
-  --color-destructive: #ef4444;
-  --color-border: #27272a;
-  --color-input: #27272a;
-  --color-ring: #5c7cfa;
-  --radius-sm: 0.25rem;
-  --radius-md: 0.375rem;
-  --radius-lg: 0.5rem;
+/* ──────────────────────────────────────────────────────────────────────
+   Nebula brand tokens (docs/NEBULA.md §2). Dark-first "catalogue plate";
+   the light theme is the paper print of the same plate.
+
+   Rules the tokens encode:
+   - Ion is the primary. Ember is THE HUMAN GATE ONLY — never a general accent.
+   - Pass / Fail / Pending are status colours and a colour never appears
+     without its word (see <Pill>).
+   - Type: Gloock for display, Azeret Mono for everything else. No sans-serif.
+   ────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* plate (dark) */
+  --n-plate: #0b0a10;
+  --n-surface: #131119;
+  --n-raised: #1a1723;
+  --n-hairline: #2a2636;
+  --n-hairline-strong: #3a3449;
+  --n-ink: #edeaf6;
+  --n-ink-muted: #9a94ac;
+  --n-ink-faint: #5e5870;
+
+  /* Ion — primary */
+  --n-ion: #7c6cff;
+  --n-ion-soft: #c9b8ff;
+  --n-ion-ink: #0b0a10;
+
+  /* Ember — the human gate ONLY */
+  --n-ember: #ff8a5c;
+  --n-ember-deep: #ad421a;
+  --n-ember-ink: #0b0a10;
+
+  /* status */
+  --n-pass: #4ade9a;
+  --n-fail: #ff5c7a;
+  --n-pending: #e7c86a;
+
+  --n-radius: 4px;
+  --n-radius-lg: 8px;
+
+  color-scheme: dark;
+}
+
+/* Paper print — system preference, unless the toggle pinned dark */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --n-plate: #f4f1ea;
+    --n-surface: #fbf9f4;
+    --n-raised: #ffffff;
+    --n-hairline: #d9d3c6;
+    --n-hairline-strong: #bfb8a8;
+    --n-ink: #17141f;
+    --n-ink-muted: #5c5669;
+    --n-ink-faint: #8f89a0;
+    --n-ion: #5b4be0;
+    --n-ion-soft: #7c6cff;
+    --n-ion-ink: #ffffff;
+    --n-ember: #ad421a;
+    --n-ember-deep: #ff8a5c;
+    --n-ember-ink: #ffffff;
+    --n-pass: #168a55;
+    --n-fail: #c7264a;
+    --n-pending: #8a6d0b;
+    color-scheme: light;
+  }
+}
+
+/* Explicit toggle wins in both directions */
+:root[data-theme="light"] {
+  --n-plate: #f4f1ea;
+  --n-surface: #fbf9f4;
+  --n-raised: #ffffff;
+  --n-hairline: #d9d3c6;
+  --n-hairline-strong: #bfb8a8;
+  --n-ink: #17141f;
+  --n-ink-muted: #5c5669;
+  --n-ink-faint: #8f89a0;
+  --n-ion: #5b4be0;
+  --n-ion-soft: #7c6cff;
+  --n-ion-ink: #ffffff;
+  --n-ember: #ad421a;
+  --n-ember-deep: #ff8a5c;
+  --n-ember-ink: #ffffff;
+  --n-pass: #168a55;
+  --n-fail: #c7264a;
+  --n-pending: #8a6d0b;
+  color-scheme: light;
+}
+
+/* Tailwind theme mapped onto the Nebula tokens (inline = utilities reference
+   the CSS vars at runtime, so the theme toggle works). The legacy names
+   (background/card/primary/...) keep the pre-Nebula routes rendering. */
+@theme inline {
+  --color-background: var(--n-plate);
+  --color-foreground: var(--n-ink);
+  --color-card: var(--n-surface);
+  --color-card-foreground: var(--n-ink);
+  --color-primary: var(--n-ion);
+  --color-primary-foreground: var(--n-ion-ink);
+  --color-secondary: var(--n-raised);
+  --color-secondary-foreground: var(--n-ink);
+  --color-muted: var(--n-raised);
+  --color-muted-foreground: var(--n-ink-muted);
+  --color-accent: var(--n-raised);
+  --color-accent-foreground: var(--n-ink);
+  --color-destructive: var(--n-fail);
+  --color-border: var(--n-hairline);
+  --color-input: var(--n-hairline);
+  --color-ring: var(--n-ion);
+
+  --color-plate: var(--n-plate);
+  --color-surface: var(--n-surface);
+  --color-raised: var(--n-raised);
+  --color-hairline: var(--n-hairline);
+  --color-ink: var(--n-ink);
+  --color-ink-muted: var(--n-ink-muted);
+  --color-ink-faint: var(--n-ink-faint);
+  --color-ion: var(--n-ion);
+  --color-ion-soft: var(--n-ion-soft);
+  --color-ember: var(--n-ember);
+  --color-ember-deep: var(--n-ember-deep);
+  --color-pass: var(--n-pass);
+  --color-fail: var(--n-fail);
+  --color-pending: var(--n-pending);
+
+  --radius-sm: 2px;
+  --radius-md: var(--n-radius);
+  --radius-lg: var(--n-radius-lg);
+
+  --font-sans: var(--font-azeret), ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-mono: var(--font-azeret), ui-monospace, "SFMono-Regular", Menlo, monospace;
+  --font-display: var(--font-gloock), Georgia, "Times New Roman", serif;
+}
+
+html,
+body {
+  background: var(--n-plate);
+  color: var(--n-ink);
+  font-family: var(--font-azeret), ui-monospace, "SFMono-Regular", Menlo, monospace;
+  font-size: 13px;
+  line-height: 1.5;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* Display type: Gloock, only for headlines and the wordmark. */
+.n-display {
+  font-family: var(--font-gloock), Georgia, "Times New Roman", serif;
+  font-weight: 400;
+  letter-spacing: -0.01em;
+}
+
+/* Plate rule: hairline separators everywhere, no shadows. */
+.n-plate {
+  background: var(--n-surface);
+  border: 1px solid var(--n-hairline);
+  border-radius: var(--n-radius-lg);
+}
+
+/* Field labels on the catalogue plate: small caps mono. */
+.n-label {
+  font-size: 10px;
+  letter-spacing: 0.14em;
+  text-transform: uppercase;
+  color: var(--n-ink-muted);
+}
+
+/* Reduce motion respect for the drawer */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition-duration: 0.01ms !important;
+    animation-duration: 0.01ms !important;
+  }
+}
+
+/* Native form controls on the plate */
+input,
+select,
+textarea {
+  font: inherit;
+  color: inherit;
+}
+input::placeholder,
+textarea::placeholder {
+  color: var(--n-ink-faint);
+}
+::selection {
+  background: color-mix(in oklab, var(--n-ion) 35%, transparent);
 }
