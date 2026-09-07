@@ -12,11 +12,11 @@ global_deny:
 write_tools:
   delete_preview:
     allow:
-      repo: ["MymTwo/Moly-backend", "MymTwo/frontend", "twizz-app/*"]
+      repo: ["twizz-app/*"]
 
   trigger_preview_refresh:
     allow:
-      repo: ["MymTwo/Moly-backend", "MymTwo/frontend", "twizz-app/*"]
+      repo: ["twizz-app/*"]
 
   rotate_preview_secret:
     allow:
@@ -26,3 +26,28 @@ write_tools:
     allow:
       service: ["ffmpeg-service", "lolygram-discovery", "alertservice"]
       # replicas constrained in code to 0..3
+
+  # ── Nebula named envs (manual model; twizz-gitops/named-envs/README.md) ──
+  # Secret names and ECR repos are derived from `service` in code — never inputs.
+  create_named_env:
+    allow:
+      service: ["moly-backend"]
+      imageTag: ["build-*"]              # immutable tags only; aliases refused in code
+      name: ["*"]
+    deny:
+      name: ["*prod*", "*staging*", "shared", "dev"]
+      # ttlHours 1..336 and the live-env cap (NEBULA_MAX_NAMED_ENVS, default 6) enforced in code
+
+  teardown_named_env:
+    allow:
+      name: ["*"]
+
+  clone_staging_db:
+    allow:
+      name: ["*"]
+      source: ["preview/moly-backend"]   # pinned in code; prod also caught by global_deny
+
+  extend_named_env:
+    allow:
+      name: ["*"]
+      # ttlHours 1..336 enforced in code

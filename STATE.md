@@ -1,6 +1,6 @@
 # TWIZZ-IDP - Project State
 
-Last updated: 2026-08-31
+Last updated: 2026-09-07
 
 ## Architecture stance (decided 2026-08-11)
 
@@ -123,6 +123,144 @@ Workflows/Events were deleted — never wired, 3 of 5 templates were fakes.
   (see note in `infra/src/netbird.ts`).
 - Still blocked on the GitHub org token (SM `preview/github`, root-app apply, enablement PR,
   org-watch). NetBird setup key rotation still pending.
+
+## Security incident 2026-08-31: poisoned remote
+
+- `xenosnikos/First-IDP` remote had a **force-pushed poisoned initial commit** (`d7d7406`,
+  back-dated 2026-04-23; actually pushed 2026-06-07 by an unknown actor with repo write access).
+  Two files tampered: `apps/dashboard/postcss.config.mjs` had obfuscated Node malware appended
+  (runs on every `next build`/`dev`), and `.gitignore` had the `.env*` ignore rules stripped +
+  `config.bat` added (to make secrets committable).
+- **Local was never poisoned** — working tree + all local git objects scanned clean. The bad
+  tree lived only on the remote; a `git pull`/merge would have imported it (that was the trap).
+- Cleaned by force-pushing clean local `2fb1a84` over `d7d7406`
+  (`--force-with-lease` pinned to the poisoned SHA). Remote verified clean afterward.
+- FOLLOW-UPS (on user): audit who has push access + deploy keys/PATs on the repo; precautionary
+  rotation of creds in `apps/dashboard/.env.local` (AWS static keys highest priority).
+
+## 2026-09-06 session — Nebula Phase 0 + org token + org rename
+
+- **Nebula** is the brand the dashboard grows into (product vision recovered from 3
+  design artifacts, 2026-08-30 — see memory `nebula-product-vision`). The team's
+  self-service ask (choose repo/branch → spin up pod+URL → attach frontend →
+  clone-staging Mongo, never prod) IS Nebula's #1 designed moat. Full design:
+  **`docs/NEBULA.md`** (Phase 0 = internal dogfood; both write paths PR + named-env;
+  Mongo clone via db-rewrite on the shared staging server; agents stay STUB).
+- **GitHub org token unblocked (N0):** SM `preview/github` holds a long-lived OAuth
+  token (`gho_`) for user **TwizzyNicky**, scopes `repo, workflow, read:org, gist`.
+  Sufficient for the Argo PR generator + onboard + MCP tools as a plain bearer — no
+  app-auth code changes needed. (It's a *user* OAuth token, not an org-owned GitHub
+  App; works, but durability is tied to that account.)
+- **ORG RENAME: `MymTwo` → `twizz-app`.** Old `MymTwo/*` paths 301-redirect; the
+  token sees only `twizz-app`; all repos (Moly-backend, frontend, moly_admin,
+  twizz-admin, service repos) now live under `twizz-app`. Reconciled in code:
+  gitops appset `owner: twizz-app`; dropped dead `MymTwo` entries from `policy.yaml`,
+  `iam.ts` OIDC subjects (twizz-app/* already covered both), `read.ts` default owner,
+  `auth.ts` ALLOWED_ORGS default. **Still stale (doc sweep pending):** CLAUDE.md,
+  docs/enablement/*, docs/SECURITY-ROTATIONS.md, .github/workflows/org-watch.yml,
+  .env.local.example, twizz-gitops/README.md.
+- **Remaining to light up the loop (user-run):** push twizz-gitops; apply the gitops
+  root-app; (optional) `pulumi up` to drop the dead OIDC subjects; open a PR on
+  `twizz-app/Moly-backend` with label `preview` to prove PR→pod. GITHUB_TOKEN env must
+  be wired for the MCP server + onboard from SM `preview/github`.
+
+## 2026-09-06 — Fable landscape review corrections
+
+- **Platform is more live than docs said:** root-app is **Synced/Healthy** (the
+  "apply root-app" TODO was stale), and the **PR→pod loop is PROVEN** —
+  `twizz-admin-pr-139` runs at `pr-139-twizz-admin.prv.twizz.com` with a per-PR ESO
+  secret. Chart + PR generator + ESO + wildcard cert + SSO gate all work end-to-end.
+  Only Moly-backend specifically is unproven.
+- **Local `/root/twizz-gitops` is STALE vs remote** (remote has twizz-admin/sentinel
+  appsets not in local; my `owner: twizz-app` edit is unpushed). MUST sync before any
+  gitops commit or it clobbers remote. `shared-*` apps are broken (probe merge:
+  `httpGet` vs `tcpSocket` — fix `httpGet: null` in `apps/shared/*.yaml`).
+- **Nebula Phase 0 model resolved** (`docs/NEBULA.md` updated): manual named-envs
+  from existing `build-*` release images; isolation via **one SM secret per env**
+  named by `AWS_SECRET_NAME` (URI→`nebula_<name>`, fresh `TOKEN_SECRET`); boot creds
+  = scoped `twizz-nebula-boot` IAM user **and** IRSA patch on DeployStaging; DB clone
+  runs **in-cluster** as an Argo PreSync `mongo:8.0` hook (Atlas allowlists the NAT,
+  not the workstation); CORS at the **ingress**; frontend under `.prv.twizz.com`
+  (Vercel proxy or EKS static); Nebula UI **hosted in-cluster** at
+  `nebula.prv.twizz.com`; gate extracted to `packages/actions` (nonces in Prisma).
+- **Honesty:** Phase 0 is DB-isolated, NOT side-effect-isolated (Redis/SQS/S3/3rd-party
+  shared with staging). Named-envs appset lives in **`bootstrap/`** (root-app syncs
+  `bootstrap` only). Decisions closed: TTL 7d extendable; operators nick+igor; Moly only.
+- **Step 1 APPLIED (2026-09-06, `pulumi up`: +5/~3/95 unchanged):** IAM user
+  `twizz-nebula-boot` (ONLY `secretsmanager:GetSecretValue` on `preview/moly-backend*`),
+  its access key → SM **`preview/moly-backend-boot`** (keys `AWS_ACCES_KEY_ID` [app's typo,
+  deliberate] + `AWS_SECRET_ACCESS_KEY`); preview-pods IRSA trust now includes `env-*`;
+  mcp-operator gained `DeleteSecret` on `preview/*`; dead MymTwo OIDC subjects dropped.
+  **Trap fixed for good:** `netbird.ts` instance now has `ignoreChanges: ["ami"]` — the
+  "latest AL2023" SSM lookup was forcing a router REPLACE (= the 08-31 VPN outage) on any
+  unrelated apply. Router stayed `i-030236bb83d3e0fc9`. To refresh the AMI deliberately,
+  drop that option for one apply and re-point NetBird afterwards.
+- **Caveat:** boot keys sit in local Pulumi state encrypted with the stack's EMPTY passphrase
+  (= readable by anyone with the state file). Blast radius = read of `preview/moly-backend*`
+  only. Rotate via `aws iam create-access-key`; consider a real passphrase / S3+KMS backend.
+
+## 2026-09-07 — SMOKE ENV LIVE: Nebula Phase 0 thesis PROVEN
+
+`env-smoke` (Application `env-smoke`, ns `env-smoke`, `smoke.prv.twizz.com`) runs the
+STOCK release image `molybackend:build-75b95f51-a1de-432d-8132-33a2802f622c` (= what
+`:prod` runs) with **zero code changes**: `/health` → `{"status":"ok"}`, pod 1/1 Ready.
+Proven end to end: static boot keys → `AWS_SECRET_NAME=preview/moly-backend/smoke` →
+in-cluster staging-db clone (PreSync hook, **3,150,050 docs → `nebula_smoke`**, 0 failed;
+re-syncs no-op via the generation marker) → per-env Redis → BullMQ queues all `smoke_*`.
+gitops commits: `6202480` (appset+chart+smoke) `459d9f4` `8660dc5` `a5b18e4` `a3fb84e`.
+
+**Three findings a stock image needs (all now in the chart/appset/README):**
+1. **Two config layers, not one.** Besides the SM blob, staging injects ~45 non-secret
+   env keys via ConfigMap `moly-cm` (`molyb-staging-cm.yml`). `TEMPLATE_DIR` is read at
+   *module load* (`mailer.service.ts:15`) → crash before bootstrap. Mirrored into
+   `apps/moly-backend/values.yaml` (39 keys); `BASE_URL`/`USER_URL` per-env via appset.
+   `ADMIN_PASSWORD` sits in that upstream ConfigMap in plaintext (a secret in a CM —
+   flag to fix upstream); we put it in the SM blobs instead, never a ConfigMap.
+2. **Redis cannot be shared with staging** — the blob's `REDIS_HOST` is a public IP
+   security-grouped to staging's network (ETIMEDOUT from this VPC), and sharing it would
+   cross-talk BullMQ queues anyway. Chart `redis.enabled` → per-env no-auth,
+   no-persistence, **noeviction** Redis; blob sets `REDIS_HOST=redis`,
+   `REDIS_PASSWORD=""` (ioredis skips AUTH on falsy). Tooling must set these per env.
+3. `tracing.ts` exports to staging's `cloudwatch-agent.amazon-cloudwatch` (ENOTFOUND
+   here, non-fatal) → `OTEL_SDK_DISABLED=true` in the ConfigMap.
+Also fixed on the way: PreSync hook Jobs must NOT use the app ServiceAccount (it does
+not exist yet at PreSync) → hooks run on the ns default SA.
+
+**Gotchas hit:** git push to `twizz-gitops` needs auth — no credential helper on this
+box and the `gh` credential lapses; Basic auth with the SM `preview/github` token as a
+transient `http.extraHeader` works (user-run when the classifier blocks). The EKS API
+intermittently throws `TLS handshake timeout` — just retry.
+
+**Verify from a NetBird-connected device:** `https://smoke.prv.twizz.com/health` →
+Google SSO → JSON. Teardown = delete `named-envs/smoke.yaml` (PostDelete drops
+`nebula_smoke`; the `env-smoke` namespace must be deleted by hand/reaper).
+
+## 2026-09-07 — N1 DONE: `packages/actions` + named-env tools, proven live
+
+- **`packages/actions`** (`@twizz-idp/actions`): the write gate extracted from the MCP
+  server — `loadPolicyFile/evaluatePolicy`, `NonceStore` (`MemoryNonceStore` for stdio,
+  `PrismaNonceStore` + `ActionNonce` model, migration `0002_action_nonce`, not yet
+  `db:migrate`d), `createAudit`, `createGate` (policy → nonce → action → audit) — and the
+  named-env actions over injected ports (`GitopsRepo`/`SecretStore`/`ImageRegistry`; real
+  adapters: GitHub Contents API, Secrets Manager, ECR). No kube API anywhere. Same code
+  will back the in-cluster Nebula UI. 36 unit tests (vitest), `pnpm typecheck` 9/9.
+- **MCP tools** (16 total now): write `create_named_env` / `teardown_named_env` /
+  `clone_staging_db` / `extend_named_env`; read `list_named_envs` / `list_release_images`
+  (runs on the operator role — `ViewOnlyAccess` lacks `ecr:DescribeImages`). `policy.yaml`
+  entries added; secret names/ECR repos derived from `service` in code, never from input.
+- **Proven against the live cluster via stdio JSON-RPC** (driver:
+  scratchpad `mcp-call.mjs`, env `GITHUB_TOKEN` from SM `preview/github` + `AWS_PROFILE=twizz`
+  + `TWIZZ_MCP_ACTOR`): reads returned `smoke` + the ECR release list; `extend_named_env
+  smoke` (2-step nonce) → commit `638e0a6` + AuditLog row; **full lifecycle**
+  `create_named_env n1test` (isolated, 2h) → derived secret exactly right (60 keys,
+  `nebula_n1test`, `REDIS_HOST=redis`, fresh `TOKEN_SECRET`) → commit `b3fae22` → Argo
+  Synced/Healthy in **45 s** → `teardown_named_env` → secret deleted, commit `74a0f3e`,
+  Argo pruned in ~105 s. A mid-teardown DNS outage proved the gate **fails closed**
+  (nothing deleted until the retry). Every action = one readable gitops commit `(actor)`.
+- Leftovers by design: `env-<name>` namespaces linger after prune (deleted `env-n1test` by
+  hand) → the **reaper** (N4) must delete them + expired manifests.
+- **twizz-idp working tree is UNCOMMITTED** (packages/actions, mcp rewire, iam.ts,
+  netbird.ts, prisma, docs/NEBULA.md, STATE.md) — needs a commit/push to the idp repo.
 
 ## Verification
 

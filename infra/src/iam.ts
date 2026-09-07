@@ -60,7 +60,7 @@ export function createIamRoles(
     ),
   });
 
-  // ── Preview pods: any SA in a pr-* or shared namespace ───────────
+  // ── Preview pods: any SA in a pr-* / env-* (Nebula named env) / shared namespace ──
   const previewPodsRole = new aws.iam.Role("twizz-nonprod-preview-pods", {
     name: "twizz-nonprod-preview-pods",
     assumeRolePolicy: pulumi.all([oidcProviderArn, oidcProviderUrl]).apply(([arn, url]) => {
@@ -76,6 +76,7 @@ export function createIamRoles(
               StringLike: {
                 [`${host}:sub`]: [
                   "system:serviceaccount:pr-*:*",
+                  "system:serviceaccount:env-*:*",
                   "system:serviceaccount:shared:*",
                   "system:serviceaccount:dev:*",
                 ],
@@ -124,6 +125,53 @@ export function createIamRoles(
         ],
       }),
     ),
+  });
+
+  // ── Nebula boot keys: static creds for STOCK release images ──────
+  // Moly-backend's AwsSecretsManager.ts passes `credentials: { accessKeyId:
+  // process.env.AWS_ACCES_KEY_ID, ... }` (sic) explicitly, so without static
+  // keys the SDK never falls back to IRSA and the pod cannot boot. This IAM
+  // user can do exactly one thing: read the preview/moly-backend* secrets
+  // (the shared blob, the per-env copies, and this boot secret itself). ESO
+  // syncs `preview/moly-backend-boot` into each named env -> envFrom.
+  const nebulaBootUser = new aws.iam.User("twizz-nebula-boot", {
+    name: "twizz-nebula-boot",
+    tags,
+  });
+
+  new aws.iam.UserPolicy("twizz-nebula-boot-policy", {
+    user: nebulaBootUser.name,
+    policy: accountId.apply((acct) =>
+      JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Sid: "MolyBackendPreviewSecretsReadOnly",
+            Effect: "Allow",
+            Action: ["secretsmanager:GetSecretValue"],
+            Resource: `arn:aws:secretsmanager:${region}:${acct}:secret:preview/moly-backend*`,
+          },
+        ],
+      }),
+    ),
+  });
+
+  const nebulaBootKey = new aws.iam.AccessKey("twizz-nebula-boot-key", {
+    user: nebulaBootUser.name,
+  });
+
+  const nebulaBootSecret = new aws.secretsmanager.Secret("preview-moly-backend-boot", {
+    name: "preview/moly-backend-boot",
+    description: "Static boot keys for stock Moly-backend images in Nebula named envs (ESO -> envFrom)",
+    tags,
+  });
+
+  // Key name deliberately matches the app's typo (AWS_ACCES_KEY_ID, one S).
+  new aws.secretsmanager.SecretVersion("preview-moly-backend-boot-v", {
+    secretId: nebulaBootSecret.id,
+    secretString: pulumi
+      .all([nebulaBootKey.id, nebulaBootKey.secret])
+      .apply(([id, secret]) => JSON.stringify({ AWS_ACCES_KEY_ID: id, AWS_SECRET_ACCESS_KEY: secret })),
   });
 
   // ── cert-manager: Route53 DNS-01 for *.prv.twizz.com ─────────
@@ -250,8 +298,6 @@ export function createIamRoles(
               StringLike: {
                 "token.actions.githubusercontent.com:sub": [
                   "repo:twizz-app/*",
-                  "repo:MymTwo/Moly-backend:*",
-                  "repo:MymTwo/frontend:*",
                 ],
               },
             },
@@ -442,6 +488,7 @@ export function createIamRoles(
               "secretsmanager:PutSecretValue",
               "secretsmanager:CreateSecret",
               "secretsmanager:TagResource",
+              "secretsmanager:DeleteSecret", // teardown_named_env removes preview/<svc>/<env>
             ],
             Resource: `arn:aws:secretsmanager:${region}:${acct}:secret:preview/*`,
           },

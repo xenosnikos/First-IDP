@@ -5,10 +5,23 @@ import {
   GetSecretValueCommand,
   PutSecretValueCommand,
 } from "@aws-sdk/client-secrets-manager";
+import { ECRClient } from "@aws-sdk/client-ecr";
 import { Octokit } from "@octokit/rest";
-import { evaluatePolicy } from "../policy.js";
-import { issueNonce, consumeNonce } from "../confirm.js";
-import { audit, actor } from "../audit.js";
+import {
+  EcrRegistry,
+  GithubGitops,
+  SecretsManagerStore,
+  SERVICES,
+  SERVICE_NAMES,
+  TTL_HOURS,
+  cloneStagingDb,
+  createNamedEnv,
+  extendNamedEnv,
+  teardownNamedEnv,
+  type GateResult,
+  type ServiceName,
+} from "@twizz-idp/actions";
+import { gate, actor } from "../gate.js";
 import { operatorCreds, region } from "../auth.js";
 
 function text(payload: unknown) {
@@ -16,7 +29,8 @@ function text(payload: unknown) {
 }
 
 /** The four gates, in order: policy → confirm nonce → session-tagged operator
- * creds → audit row (success, failure, and denial alike). */
+ * creds (inside `action`) → audit row (success, failure, and denial alike).
+ * Implemented in @twizz-idp/actions; this just shapes the MCP response. */
 async function gated(
   tool: string,
   fields: Record<string, string>,
@@ -24,36 +38,8 @@ async function gated(
   summary: string,
   action: () => Promise<unknown>,
 ) {
-  const decision = evaluatePolicy(tool, fields);
-  if (!decision.allowed) {
-    await audit({ action: `mcp.${tool}`, resource: JSON.stringify(fields), allowed: false, detail: { reason: decision.reason } });
-    return text({ denied: true, reason: decision.reason });
-  }
-
-  if (!confirm) {
-    const nonce = issueNonce(tool, fields);
-    return text({
-      confirmationRequired: true,
-      summary,
-      instruction: `Re-run ${tool} with the same arguments plus confirm: "${nonce}" within 5 minutes.`,
-      confirm: nonce,
-    });
-  }
-
-  const consumed = consumeNonce(confirm, tool, fields);
-  if (!consumed.ok) {
-    await audit({ action: `mcp.${tool}`, resource: JSON.stringify(fields), allowed: false, detail: { reason: consumed.reason } });
-    return text({ denied: true, reason: consumed.reason });
-  }
-
-  try {
-    const result = await action();
-    await audit({ action: `mcp.${tool}`, resource: JSON.stringify(fields), allowed: true, detail: { result: String(result).slice(0, 500) } });
-    return text({ done: true, result });
-  } catch (e) {
-    await audit({ action: `mcp.${tool}`, resource: JSON.stringify(fields), allowed: true, detail: { error: String(e) } });
-    return text({ error: String(e) });
-  }
+  const result: GateResult = await gate(tool, fields, confirm, summary, action);
+  return text(result);
 }
 
 function octokit(): Octokit {
@@ -62,10 +48,31 @@ function octokit(): Octokit {
   return new Octokit({ auth: token });
 }
 
+/** Named-env ports on session-tagged operator credentials (CloudTrail records
+ * tool/resource/actor). GitHub commits use the platform token. */
+async function namedEnvDeps(tool: string, resource: string) {
+  const creds = await operatorCreds(tool, resource, actor);
+  return {
+    gitops: new GithubGitops(octokit()),
+    secrets: new SecretsManagerStore(new SecretsManagerClient({ region, credentials: creds })),
+    images: new EcrRegistry(new ECRClient({ region, credentials: creds })),
+    maxNamedEnvs: Number(process.env.NEBULA_MAX_NAMED_ENVS) || undefined,
+  };
+}
+
 const confirmSchema = z
   .string()
   .optional()
   .describe("Confirmation token from the previous call (two-step confirm)");
+
+const envName = z
+  .string()
+  .regex(/^[a-z][a-z0-9-]{2,23}$/, "DNS label: ^[a-z][a-z0-9-]{2,23}$")
+  .describe("Named-env name; becomes namespace env-<name> and host <name>.prv.twizz.com");
+
+const serviceSchema = z.enum(SERVICE_NAMES as [ServiceName, ...ServiceName[]]);
+
+const ttlSchema = z.number().int().min(TTL_HOURS.min).max(TTL_HOURS.max).default(TTL_HOURS.default);
 
 export function registerWriteTools(server: McpServer) {
   server.tool(
@@ -153,6 +160,69 @@ export function registerWriteTools(server: McpServer) {
         );
         return `shared/${service} scaled to ${replicas}`;
       });
+    },
+  );
+
+  // ── Nebula named environments ──────────────────────────────────────
+  // Manual model: an EXISTING release image, a per-env Secrets Manager blob,
+  // a manifest committed to twizz-gitops named-envs/<name>.yaml. No builds,
+  // no kube API — Argo CD reconciles. See twizz-gitops/named-envs/README.md.
+
+  server.tool(
+    "create_named_env",
+    "Provision a Nebula named environment from an EXISTING release image (ECR build-* tag): creates the per-env Secrets Manager blob (isolated Mongo db nebula_<name>, own Redis, fresh TOKEN_SECRET) and commits named-envs/<name>.yaml to twizz-gitops; Argo CD brings up https://<name>.prv.twizz.com (VPN+SSO). Two-step confirm.",
+    {
+      name: envName,
+      service: serviceSchema,
+      imageTag: z.string().regex(/^build-[0-9a-f-]{36}$/, "immutable ECR build-* tag (never latest/prod/dev)"),
+      db: z.enum(["isolated", "clone"]).describe("isolated = empty db; clone = copy of the staging db via the chart's PreSync hook"),
+      ttlHours: ttlSchema,
+      frontendOrigin: z.string().url().optional().describe("Browser origin allowed by ingress CORS; default https://<name>-frontend.prv.twizz.com"),
+      confirm: confirmSchema,
+    },
+    async ({ name, service, imageTag, db, ttlHours, frontendOrigin, confirm }) => {
+      const fields = { name, service, imageTag, db, ttlHours: String(ttlHours), frontendOrigin: frontendOrigin ?? "" };
+      const summary = `Create named env '${name}' (${service}:${imageTag}, db=${db}, ttl=${ttlHours}h) -> https://${name}.prv.twizz.com; writes secret ${SERVICES[service].sourceSecret}/${name} + named-envs/${name}.yaml`;
+      return gated("create_named_env", fields, confirm, summary, async () =>
+        createNamedEnv(await namedEnvDeps("create_named_env", name), { name, service, imageTag, db, ttlHours, frontendOrigin, actor }),
+      );
+    },
+  );
+
+  server.tool(
+    "teardown_named_env",
+    "Tear down a Nebula named environment: deletes named-envs/<name>.yaml (Argo CD prunes the app; the PostDelete hook drops its db) and force-deletes the per-env secret. The env-<name> namespace is reaped separately. Two-step confirm.",
+    { name: envName, confirm: confirmSchema },
+    async ({ name, confirm }) => {
+      const fields = { name };
+      return gated("teardown_named_env", fields, confirm, `Tear down named env '${name}' (manifest + secret; app pruned, db dropped)`, async () =>
+        teardownNamedEnv(await namedEnvDeps("teardown_named_env", name), { name, actor }),
+      );
+    },
+  );
+
+  server.tool(
+    "clone_staging_db",
+    "Re-clone the staging Mongo db into a named env's nebula_<name> db by bumping db.generation in its manifest (the chart's PreSync hook does the copy in-cluster; source pinned to the preview/* staging blob). Two-step confirm.",
+    { name: envName, confirm: confirmSchema },
+    async ({ name, confirm }) => {
+      // `source` is derived server-side and policy-pinned; it is never an input.
+      const fields = { name, source: SERVICES["moly-backend"].sourceSecret };
+      return gated("clone_staging_db", fields, confirm, `Re-clone staging db (${fields.source}) into nebula_${name} (bumps db.generation)`, async () =>
+        cloneStagingDb(await namedEnvDeps("clone_staging_db", name), { name, actor }),
+      );
+    },
+  );
+
+  server.tool(
+    "extend_named_env",
+    "Extend a named env's TTL: rewrites expiresAt in named-envs/<name>.yaml to now + ttlHours. Two-step confirm.",
+    { name: envName, ttlHours: ttlSchema, confirm: confirmSchema },
+    async ({ name, ttlHours, confirm }) => {
+      const fields = { name, ttlHours: String(ttlHours) };
+      return gated("extend_named_env", fields, confirm, `Extend named env '${name}' by ${ttlHours}h from now`, async () =>
+        extendNamedEnv(await namedEnvDeps("extend_named_env", name), { name, ttlHours, actor }),
+      );
     },
   );
 }

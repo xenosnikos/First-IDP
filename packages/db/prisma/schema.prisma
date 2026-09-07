@@ -40,6 +40,18 @@ model AuditLog {
   @@index([actor, createdAt])
 }
 
+// Two-step confirm nonces for gated write actions (@twizz-idp/actions
+// PrismaNonceStore). Single-use, 5-minute TTL; expired rows are swept
+// opportunistically on issue.
+model ActionNonce {
+  nonce       String   @id
+  fingerprint String
+  expiresAt   DateTime
+  createdAt   DateTime @default(now())
+
+  @@index([expiresAt])
+}
+
 // ──────────────────────────────────────────────
 // Projects & Environments
 // ──────────────────────────────────────────────

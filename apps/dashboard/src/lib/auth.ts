@@ -4,7 +4,7 @@ import { authConfig } from "./auth.config";
 
 // Orgs whose active members may sign in. Emergency/per-user fallback:
 // ALLOWED_GITHUB_LOGINS="alice,bob" for collaborators outside both orgs.
-const ALLOWED_ORGS = (process.env.ALLOWED_GITHUB_ORGS ?? "twizz-app,MymTwo")
+const ALLOWED_ORGS = (process.env.ALLOWED_GITHUB_ORGS ?? "twizz-app")
   .split(",")
   .map((s) => s.trim())
   .filter(Boolean);

@@ -1,25 +1,27 @@
 import { readFileSync } from "node:fs";
-import { join, dirname } from "node:path";
-import { fileURLToPath } from "node:url";
 import { parse } from "yaml";
 
-type Policy = {
+export type Policy = {
   global_deny?: string[];
   write_tools?: Record<string, { allow?: Record<string, string[]>; deny?: Record<string, string[]> }>;
 };
 
-const policyPath = join(dirname(fileURLToPath(import.meta.url)), "..", "policy.yaml");
-const policy: Policy = parse(readFileSync(policyPath, "utf8"));
+export type PolicyDecision = { allowed: true } | { allowed: false; reason: string };
+
+/** Load a policy.yaml (the MCP server's lives at apps/mcp/policy.yaml). */
+export function loadPolicyFile(path: string): Policy {
+  return parse(readFileSync(path, "utf8")) as Policy;
+}
 
 function globToRegExp(glob: string): RegExp {
   const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`);
 }
 
-export type PolicyDecision = { allowed: true } | { allowed: false; reason: string };
-
-/** Evaluate a write-tool call against policy.yaml. Runs BEFORE any external call. */
-export function evaluatePolicy(tool: string, fields: Record<string, string>): PolicyDecision {
+/** Evaluate a write-tool call against a policy. Runs BEFORE any external call.
+ * Order: global_deny over every field value → tool must have an entry (default
+ * deny) → per-tool deny patterns → every allow-constrained field must match. */
+export function evaluatePolicy(policy: Policy, tool: string, fields: Record<string, string>): PolicyDecision {
   for (const value of Object.values(fields)) {
     for (const pattern of policy.global_deny ?? []) {
       if (globToRegExp(pattern).test(value)) {

@@ -101,6 +101,12 @@ netbird up --setup-key "$KEY" --management-url "$MGMT" --hostname twizz-nonprod-
     metadataOptions: { httpTokens: "required" },
     rootBlockDevice: { volumeSize: 8, volumeType: "gp3", encrypted: true },
     tags: { ...tags, Name: "twizz-netbird-router" },
+  }, {
+    // The "latest AL2023" SSM lookup above changes whenever AWS publishes a new
+    // AMI, which would force a REPLACE of this instance on an unrelated `pulumi up`
+    // — i.e. a new NetBird peer and a VPN outage (the 2026-08-31 incident). Pin the
+    // running AMI; refresh it deliberately by removing this option for one apply.
+    ignoreChanges: ["ami"],
   });
 
   return { instanceId: instance.id, privateIp: instance.privateIp, advertisedCidr: vpcCidr };

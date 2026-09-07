@@ -2,7 +2,17 @@ import { z } from "zod";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { CostExplorerClient, GetCostAndUsageCommand } from "@aws-sdk/client-cost-explorer";
 import { Octokit } from "@octokit/rest";
-import { ensureReadonlyCreds, region } from "../auth.js";
+import { ECRClient } from "@aws-sdk/client-ecr";
+import {
+  EcrRegistry,
+  GithubGitops,
+  SERVICE_NAMES,
+  listNamedEnvs,
+  listReleaseImages,
+  type ServiceName,
+} from "@twizz-idp/actions";
+import { ensureReadonlyCreds, operatorCreds, region } from "../auth.js";
+import { actor } from "../gate.js";
 
 const NONPROD = "EKS-Twizz-NonProd";
 const CLUSTERS = [NONPROD, "EKS-Moly-staging", "EKS-Moly-Prod"];
@@ -91,7 +101,7 @@ export function registerReadTools(server: McpServer) {
     "pipeline_status",
     "Recent GitHub Actions runs for a repo (the platform's CI engine).",
     {
-      owner: z.string().default("MymTwo"),
+      owner: z.string().default("twizz-app"),
       repo: z.string(),
       limit: z.number().int().min(1).max(30).default(10),
     },
@@ -149,6 +159,39 @@ export function registerReadTools(server: McpServer) {
         .map(([service, usd]) => ({ service, usd: Math.round(usd * 100) / 100 }));
       const total = Math.round(Object.values(totals).reduce((a, b) => a + b, 0) * 100) / 100;
       return text({ days, totalUsd: total, byService: sorted });
+    },
+  );
+
+  // ── Nebula named environments (read side) ──────────────────────────
+  server.tool(
+    "list_named_envs",
+    "Nebula named environments as declared in twizz-gitops named-envs/*.yaml (name, service, imageTag, owner, expiresAt, db mode/generation, url).",
+    {},
+    async () => {
+      const token = process.env.GITHUB_TOKEN;
+      if (!token) return text({ error: "GITHUB_TOKEN not set for the MCP server" });
+      const envs = await listNamedEnvs({ gitops: new GithubGitops(new Octokit({ auth: token })) });
+      return text({
+        count: envs.length,
+        envs: envs.map((m) => ({ ...m, url: `https://${m.name}.prv.twizz.com`, namespace: `env-${m.name}`, argoApp: `env-${m.name}` })),
+      });
+    },
+  );
+
+  server.tool(
+    "list_release_images",
+    "Existing release images for a service: immutable ECR build-* tags (newest first) with the floating aliases (prod/latest/dev) that currently point at them. Pick one of these for create_named_env.",
+    {
+      service: z.enum(SERVICE_NAMES as [ServiceName, ...ServiceName[]]).default("moly-backend"),
+      limit: z.number().int().min(1).max(50).default(20),
+    },
+    async ({ service, limit }) => {
+      // Read-only call, but twizz-mcp-readonly (ViewOnlyAccess) lacks
+      // ecr:DescribeImages, which is the only API that returns push dates and
+      // co-tags. The operator role has it, so this runs there, session-tagged.
+      const creds = await operatorCreds("list_release_images", service, actor);
+      const images = await listReleaseImages({ images: new EcrRegistry(new ECRClient({ region, credentials: creds })) }, service, limit);
+      return text({ service, count: images.length, images });
     },
   );
 }
