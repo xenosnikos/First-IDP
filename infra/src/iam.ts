@@ -201,6 +201,51 @@ export function createIamRoles(
     ),
   });
 
+  // ── Nebula dashboard: in-cluster UI (namespace nebula, SA nebula) ──
+  // The write gate's actions need: read any preview/* blob (introspection,
+  // secret keys), create/rotate/delete ONLY the per-env moly-backend blobs,
+  // and look up release images in ECR molybackend. Nothing else — Argo CD
+  // reads are Kubernetes RBAC in the gitops repo.
+  const nebulaDashboardRole = new aws.iam.Role("twizz-nebula-dashboard", {
+    name: "twizz-nebula-dashboard",
+    assumeRolePolicy: irsaTrust("system:serviceaccount:nebula:nebula", false),
+    tags,
+  });
+
+  new aws.iam.RolePolicy("twizz-nebula-dashboard-policy", {
+    role: nebulaDashboardRole.name,
+    policy: accountId.apply((acct) =>
+      JSON.stringify({
+        Version: "2012-10-17",
+        Statement: [
+          {
+            Sid: "PreviewSecretsRead",
+            Effect: "Allow",
+            Action: ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"],
+            Resource: `arn:aws:secretsmanager:${region}:${acct}:secret:preview/*`,
+          },
+          {
+            Sid: "NamedEnvSecretsWrite",
+            Effect: "Allow",
+            Action: [
+              "secretsmanager:CreateSecret",
+              "secretsmanager:PutSecretValue",
+              "secretsmanager:TagResource",
+              "secretsmanager:DeleteSecret",
+            ],
+            Resource: `arn:aws:secretsmanager:${region}:${acct}:secret:preview/moly-backend*`,
+          },
+          {
+            Sid: "ReleaseImages",
+            Effect: "Allow",
+            Action: ["ecr:DescribeImages"],
+            Resource: `arn:aws:ecr:${region}:${acct}:repository/molybackend`,
+          },
+        ],
+      }),
+    ),
+  });
+
   // ── cert-manager: Route53 DNS-01 for *.prv.twizz.com ─────────
   const certManagerRole = new aws.iam.Role("twizz-cert-manager", {
     name: "twizz-cert-manager",
@@ -546,5 +591,6 @@ export function createIamRoles(
     mcpReadonlyRoleArn: mcpReadonly.arn,
     mcpOperatorRoleArn: mcpOperator.arn,
     nebulaReaperRoleArn: nebulaReaperRole.arn,
+    nebulaDashboardRoleArn: nebulaDashboardRole.arn,
   };
 }

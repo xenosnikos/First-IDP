@@ -58,6 +58,7 @@ export const dashboardRoleArn = iam.dashboardRoleArn;
 export const mcpReadonlyRoleArn = iam.mcpReadonlyRoleArn;
 export const mcpOperatorRoleArn = iam.mcpOperatorRoleArn;
 export const nebulaReaperRoleArn = iam.nebulaReaperRoleArn;
+export const nebulaDashboardRoleArn = iam.nebulaDashboardRoleArn;
 export const netbirdRouterInstanceId = netbird.instanceId;
 export const netbirdAdvertisedCidr = netbird.advertisedCidr; // add as a NetBird network route via group "routers"
 export const ssoLoginUrl = "https://auth.prv.twizz.com/oauth2/start";

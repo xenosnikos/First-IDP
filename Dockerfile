@@ -59,6 +59,24 @@ ENV NODE_ENV=production NEXT_TELEMETRY_DISABLED=1 PORT=3000 HOSTNAME=0.0.0.0
 COPY --from=dashboard-build --chown=node:node /app/apps/dashboard/.next/standalone ./
 COPY --from=dashboard-build --chown=node:node /app/apps/dashboard/.next/static ./apps/dashboard/.next/static
 COPY --from=dashboard-build --chown=node:node /app/apps/dashboard/public ./apps/dashboard/public
+# The write gate's policy (next.config traces it too; explicit copy is belt and braces).
+COPY --chown=node:node apps/mcp/policy.yaml ./apps/mcp/policy.yaml
 USER node
 EXPOSE 3000
 CMD ["node", "apps/dashboard/server.js"]
+
+# ═══════════════════════════════════════════════════════════════════════
+# migrate — `prisma migrate deploy` against Nebula's in-cluster Postgres,
+# run as an Argo CD Sync hook Job before the dashboard rolls. Ships
+# packages/db (schema + migrations) with the lockfile-pinned prisma CLI, so
+# the CLI, engine and the app's generated client are always the same version.
+# ═══════════════════════════════════════════════════════════════════════
+FROM workspace AS migrate-prune
+RUN pnpm --filter @twizz-idp/db deploy /out/db
+
+FROM base AS migrate
+ENV NODE_ENV=production
+COPY --from=migrate-prune --chown=node:node /out/db /app
+USER node
+# DATABASE_URL at runtime (ESO-synced Secret nebula-env).
+CMD ["npx", "prisma", "migrate", "deploy"]
