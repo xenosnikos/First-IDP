@@ -7,6 +7,11 @@ export const authConfig = {
     GitHub({
       clientId: process.env.GITHUB_CLIENT_ID!,
       clientSecret: process.env.GITHUB_CLIENT_SECRET!,
+      // Sign-in is a GitHub App (twizz-nebula, Iv23li…), and GitHub App callbacks
+      // carry `iss=https://github.com/login/oauth`. Without this, @auth/core 0.37
+      // compares that against its placeholder issuer and rejects the callback
+      // ("unexpected iss response parameter value").
+      issuer: "https://github.com/login/oauth",
       authorization: { params: { scope: "read:org repo read:user" } },
     }),
   ],

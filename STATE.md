@@ -1,6 +1,6 @@
 # TWIZZ-IDP - Project State
 
-Last updated: 2026-09-07
+Last updated: 2026-09-08
 
 ## Architecture stance (decided 2026-08-11)
 
@@ -261,6 +261,31 @@ Google SSO → JSON. Teardown = delete `named-envs/smoke.yaml` (PostDelete drops
   hand) → the **reaper** (N4) must delete them + expired manifests.
 - **twizz-idp working tree is UNCOMMITTED** (packages/actions, mcp rewire, iam.ts,
   netbird.ts, prisma, docs/NEBULA.md, STATE.md) — needs a commit/push to the idp repo.
+
+## 2026-09-08 — NEBULA IS LIVE IN-CLUSTER: https://nebula.prv.twizz.com
+
+Argo Application `nebula` (project `nebula`, ns `nebula`) **Synced/Healthy**. Stack:
+`gp3` StorageClass (`ebs.csi.eks.amazonaws.com` — legacy `gp2` in-tree does NOT provision
+on EKS Auto Mode) → ExternalSecret `nebula-env` ← SM **`preview/nebula`** (14 keys: Postgres
+creds, `DATABASE_URL`, Auth.js secrets, GitHub OAuth client `Ov23lirMDHUPPYwRkz5A`,
+`NEBULA_OPERATORS`, `ALLOWED_GITHUB_LOGINS`; made by `scripts/create-nebula-secret.sh`) →
+Postgres 16 StatefulSet (10Gi gp3, uid 70) → `nebula-migrate` Sync-hook Job (`prisma migrate
+deploy`; both migrations applied) → **dashboard** Deployment 1/1 (`/api/health` ok, IRSA
+`twizz-nebula-dashboard`, reads Argo Applications via Role in `argocd`) + Ingress
+`nebula.prv.twizz.com` (global VPN+SSO gate) → **reaper** CronJob hourly (`REAPER_DRY_RUN=true`,
+audits to Postgres). Images from GHA `build-images.yml` (OIDC → ECR `twizz-idp`, targets
+reaper/dashboard/migrate, pinned `-10364894…`). twizz-idp pushed: `d2e4be4`, `b0709f8`,
+`1036489`; gitops `af64c8a`..`8774b69`.
+
+Gotchas: migrate's `pg_isready` needs `-U` (pod runs as uid 1000 → no passwd entry → libpq
+"no attempt"); Argo `nebula` sync had to be un-stuck after the fix. Reaper decisions verified
+(keep smoke / env-smoke / pr-twizz-admin-139). GHA `CI` + `org-watch` workflows FAIL on
+First-IDP (pre-existing, unrelated to images) — triage.
+
+**Open:** flip `REAPER_DRY_RUN` → `"false"` after reviewing a few hourly logs; add igor's
+GitHub login to `NEBULA_OPERATORS`/`ALLOWED_GITHUB_LOGINS` in `preview/nebula`; Postgres PVC
+has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not in the blob
+(introspection rows degrade gracefully); external check from a NetBird device pending.
 
 ## Verification
 
