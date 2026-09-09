@@ -103,18 +103,18 @@ export const actionsRouter = router({
         imageTag: z.string().regex(IMAGE_TAG_RE, "immutable ECR build-* tag (never latest/prod/dev)"),
         db: z.enum(["isolated", "clone"]),
         ttlHours: ttlSchema.default(TTL_HOURS.default),
-        frontendOrigin: z.string().url().optional(),
+        frontendOrigins: z.array(z.string().url()).max(10).optional(),
         confirm: confirmSchema,
       }),
     )
     .mutation(async ({ ctx, input }) => {
-      const { name, service, imageTag, db, ttlHours, frontendOrigin, confirm } = input;
-      const fields = { name, service, imageTag, db, ttlHours: String(ttlHours), frontendOrigin: frontendOrigin ?? "" };
+      const { name, service, imageTag, db, ttlHours, frontendOrigins, confirm } = input;
+      const fields = { name, service, imageTag, db, ttlHours: String(ttlHours), frontendOrigins: (frontendOrigins ?? []).join(" ") };
       const summary = `Create named env '${name}' (${service}:${imageTag}, db=${db}, ttl=${ttlHours}h) -> https://${name}.prv.twizz.com; writes secret ${SERVICES[service].sourceSecret}/${name} + named-envs/${name}.yaml`;
       const gate = gateFor(ctx.prisma, ctx.login);
       return shape(
         await gate("create_named_env", fields, confirm, summary, () =>
-          createNamedEnv(namedEnvDeps(), { name, service, imageTag, db, ttlHours, frontendOrigin, actor: ctx.login }),
+          createNamedEnv(namedEnvDeps(), { name, service, imageTag, db, ttlHours, frontendOrigins, actor: ctx.login }),
         ),
       );
     }),

@@ -9,7 +9,8 @@ export const dynamic = "force-dynamic";
 
 // Nebula's Environments surface: one preview card per named env in
 // twizz-gitops/named-envs, with live Argo health read in-cluster. Reads via
-// tRPC actions.listEnvs; writes via the gated actions router.
+// tRPC nebula.listEnvironments (every Argo app on non-prod, NAMED ones with
+// the manifest); writes via the gated actions router, NAMED envs only.
 export default async function EnvironmentsPage() {
   const session = await auth();
   if (!session?.user) redirect("/");

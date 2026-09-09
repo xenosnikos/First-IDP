@@ -16,6 +16,16 @@ export const STATUS_WORDS = [
   "EXPIRING",
   "READ-ONLY",
   "DENIED",
+  // N3: cluster roles (structural), environment origins, project facts
+  "DEPLOYABLE",
+  "OBSERVE ONLY",
+  "NAMED",
+  "PR PREVIEW",
+  "GITOPS APP",
+  "DEPLOYED",
+  "PREVIEWABLE",
+  "REGISTERED",
+  "UNONBOARDED",
 ] as const;
 
 export type StatusWord = (typeof STATUS_WORDS)[number];
@@ -26,7 +36,19 @@ export type Tone = "ion" | "pass" | "fail" | "pending" | "ember" | "muted";
 export function toneOf(word: StatusWord): Tone {
   switch (word) {
     case "SHIPPED":
+    case "DEPLOYABLE":
+    case "NAMED":
+    case "PREVIEWABLE":
       return "ion";
+    case "DEPLOYED":
+      return "pass";
+    case "UNONBOARDED":
+      return "pending";
+    case "OBSERVE ONLY":
+    case "PR PREVIEW":
+    case "GITOPS APP":
+    case "REGISTERED":
+      return "muted";
     case "PASS":
       return "pass";
     case "FAIL":
@@ -106,4 +128,18 @@ export function fmtDuration(ms: number): string {
   if (d > 0) return `${d}d ${h}h`;
   if (h > 0) return `${h}h ${m}m`;
   return `${m}m`;
+}
+
+// ── Pod (Container Insights pod_status) → word ────────────────────────
+
+/** Clusters page pod rows. Running/Succeeded → PASS, Pending → PENDING,
+ * Failed → FAIL, anything else → UNKNOWN. A restart count ≥ 5 on a Running
+ * pod is a crash loop in all but name → FAIL with the count in the detail. */
+export function podWord(status: string | undefined, restarts = 0): ArgoVerdict {
+  const s = (status ?? "").toLowerCase();
+  if (s === "running" && restarts >= 5) return { word: "FAIL", detail: `Running, ${restarts} restarts` };
+  if (s === "running" || s === "succeeded") return { word: "PASS", detail: status! };
+  if (s === "pending") return { word: "PENDING", detail: "Pending" };
+  if (s === "failed") return { word: "FAIL", detail: "Failed" };
+  return { word: "UNKNOWN", detail: status || "no status" };
 }

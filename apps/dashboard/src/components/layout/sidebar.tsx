@@ -8,10 +8,12 @@ import type { StatusWord } from "@/lib/nebula/status";
 // Nebula nav. Honest status per surface: the Environments grid + gate are
 // SHIPPED (Phase 0); introspection routes are SHIPPED read-only; the six
 // agents stay STUB and are shown as such rather than hidden.
-const NAV: { href: string; label: string; word: StatusWord }[] = [
-  { href: "/environments", label: "Environments", word: "SHIPPED" },
-  { href: "/projects", label: "Projects", word: "SHIPPED" },
-  { href: "/pipelines", label: "Pipelines", word: "SHIPPED" },
+// One line each (docs/NEBULA.md §N3.4) — shown as the title tooltip.
+const NAV: { href: string; label: string; word: StatusWord; blurb: string }[] = [
+  { href: "/environments", label: "Environments", word: "SHIPPED", blurb: "what is running on non-prod" },
+  { href: "/projects", label: "Projects", word: "SHIPPED", blurb: "repos & what the platform knows about them" },
+  { href: "/pipelines", label: "Pipelines", word: "SHIPPED", blurb: "CI runs" },
+  { href: "/clusters", label: "Clusters", word: "SHIPPED", blurb: "pods + logs across all three clusters (observe-only for staging/prod)" },
 ];
 
 const NORTH_STAR: { label: string; word: StatusWord }[] = [
@@ -38,6 +40,7 @@ export function Sidebar() {
             <Link
               key={item.href}
               href={item.href}
+              title={item.blurb}
               style={{
                 display: "flex",
                 alignItems: "center",

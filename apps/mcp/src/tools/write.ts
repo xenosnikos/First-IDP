@@ -177,14 +177,18 @@ export function registerWriteTools(server: McpServer) {
       imageTag: z.string().regex(/^build-[0-9a-f-]{36}$/, "immutable ECR build-* tag (never latest/prod/dev)"),
       db: z.enum(["isolated", "clone"]).describe("isolated = empty db; clone = copy of the staging db via the chart's PreSync hook"),
       ttlHours: ttlSchema,
-      frontendOrigin: z.string().url().optional().describe("Browser origin allowed by ingress CORS; default https://<name>-frontend.prv.twizz.com"),
+      frontendOrigins: z
+        .array(z.string().url())
+        .max(10)
+        .optional()
+        .describe("Browser origins allowed by the backend's ingress CORS (several frontends may call one backend); default [https://<name>-frontend.prv.twizz.com]"),
       confirm: confirmSchema,
     },
-    async ({ name, service, imageTag, db, ttlHours, frontendOrigin, confirm }) => {
-      const fields = { name, service, imageTag, db, ttlHours: String(ttlHours), frontendOrigin: frontendOrigin ?? "" };
+    async ({ name, service, imageTag, db, ttlHours, frontendOrigins, confirm }) => {
+      const fields = { name, service, imageTag, db, ttlHours: String(ttlHours), frontendOrigins: (frontendOrigins ?? []).join(" ") };
       const summary = `Create named env '${name}' (${service}:${imageTag}, db=${db}, ttl=${ttlHours}h) -> https://${name}.prv.twizz.com; writes secret ${SERVICES[service].sourceSecret}/${name} + named-envs/${name}.yaml`;
       return gated("create_named_env", fields, confirm, summary, async () =>
-        createNamedEnv(await namedEnvDeps("create_named_env", name), { name, service, imageTag, db, ttlHours, frontendOrigin, actor }),
+        createNamedEnv(await namedEnvDeps("create_named_env", name), { name, service, imageTag, db, ttlHours, frontendOrigins, actor }),
       );
     },
   );

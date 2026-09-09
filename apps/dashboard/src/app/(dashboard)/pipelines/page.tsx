@@ -28,6 +28,7 @@ export default function PipelinesPage() {
     <div className="p-8 max-w-6xl mx-auto">
       <div className="mb-8">
         <h1 className="text-2xl font-bold">Pipelines</h1>
+        <p style={{ color: "var(--n-ink-muted)", fontSize: 11, margin: "4px 0 0", letterSpacing: "0.04em" }}>CI runs · GitHub Actions across the org — builds and checks, not deployments (Argo CD does those; see Environments)</p>
         <p className="text-muted-foreground mt-1">
           GitHub Actions runs across registered projects
         </p>

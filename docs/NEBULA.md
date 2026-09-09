@@ -276,3 +276,153 @@ auto-reap (N4) and a per-env db-count cap matter for hygiene.
 4. **Loly as well as Moly** for DB clone in Phase 0, or Moly first?
 5. **The N0 blocker** — the GitHub org token is still on hold; nothing spins real
    pods until it lands.
+
+---
+
+## N3 — frontends, service registry, multi-origin CORS, clusters (design, 2026-09-09)
+
+_User review of the live Phase 0: "only moly-backend is offered; frontends must be
+environments too; a backend has several browser clients; I want to see non-prod,
+staging/QA and prod, with logs in one place; support/sentinel are invisible; what
+are projects vs environments vs pipelines?" Decisions with the user: frontends
+**build on provision**; backends stay **no-build**; staging/QA + prod are
+**observe-only, structurally** (read-only IAM, no kube-API path from Nebula)._
+
+### N3.1 Manifest schema v2 (`named-envs/<name>.yaml`)
+
+```yaml
+name: smoke                     # unchanged
+kind: backend                   # NEW: backend | frontend   (absent ⇒ backend, for v1 files)
+service: moly-backend           # registry key (N3.2)
+owner: nick
+imageTag: build-75b95f51-…      # backend: existing ECR build-*; frontend: fe-<repo>-<sha>, written by the build
+expiresAt: "2026-09-17T09:22:54.836Z"
+db: { mode: clone, generation: 1 }          # backend only (frontend: { mode: none, generation: 0 })
+frontendOrigins:                # NEW (replaces frontendOrigin): every browser origin the backend must accept
+  - https://smoke-fe.prv.twizz.com
+  - https://smoke-business.prv.twizz.com
+# frontend-only keys:
+attachTo: smoke                 # the backend named env this frontend calls (its API endpoint is baked in at build)
+source: { repo: twizz-app/frontend, ref: feature/x }   # what was built
+build: { runId: 1234567, status: PASS|RUNNING|FAIL, sha: 1a2b3c… }   # status honesty on the card
+```
+
+Backward compat: readers accept `frontendOrigin` (string) and map it to a
+one-element list; the ApplicationSet template uses `hasKey` so v1 and v2 files
+coexist under `missingkey=error`. All writers emit v2. `attachTo` is validated
+against existing backend manifests at provision time; tearing down a backend
+that still has attached frontends is refused (`teardown_named_env` lists them).
+
+Host convention: **one host per env, `<name>.prv.twizz.com`**, for both kinds.
+A frontend attached to backend `smoke` is its own env with its own name — by
+convention `<backend>-<fe>` (`smoke-fe`, `smoke-business`), which is what the
+wizard proposes — and its origin is appended to the backend's `frontendOrigins`
+(one commit on the backend manifest, wave-safe: Argo re-renders only the
+ingress annotation). No `<backend>-fe.` magic hostnames: names stay
+first-class and the reaper/appset need no special cases.
+
+### N3.2 Service registry — `packages/actions/src/registry.ts` (TypeScript, not a gitops YAML)
+
+Why TS: the registry is consumed at **build time** by things that must be
+static — the Zod/`policy.yaml` enums, the MCP tool schemas, the wizard — and
+every entry ships with a unit test; a `services.yaml` in twizz-gitops would
+have to be fetched over the GitHub API on every request, could not type-check
+the tool inputs, and would put a *provisioning* decision (what is deployable)
+in the repo that Argo *executes* from. Chart values (`apps/<service>/values.yaml`)
+stay in gitops — the registry only points at them.
+
+```ts
+type ServiceEntry = {
+  name: "moly-backend" | …;      kind: "backend" | "frontend";
+  repo: "twizz-app/Moly-backend"; // GitHub source (Projects page links, PR appset match)
+  ecrRepo: "molybackend";         // where images live (backend: build-*; frontend: fe-<repo>-<sha>)
+  sourceSecret?: "preview/moly-backend"; // backend: blob copied per env (kept out of frontends)
+  valuesFile: "apps/moly-backend/values.yaml"; // in twizz-gitops
+  status: "SHIPPED" | "PLANNED"; // PLANNED entries are shown, never offered
+  build?: { workflow: "nebula-build.yml"; framework: "cra" | "vite" | "next"; apiEnvVar: string; socketEnvVar?: string; serve: "static" | "next-standalone" };
+  detect: { labels: { "twizz-idp/service"?: string; "twizz-idp/repo"?: string } }; // how live Argo apps map back to this entry
+};
+```
+
+Adding a backend = one entry **plus** three things outside the registry:
+an ECR repo with `build-*` tags, a `preview/<service>` blob (and the boot user
+policy widened to `preview/<service>*` in `infra/src/iam.ts`), and
+`apps/<service>/values.yaml` in twizz-gitops (+ `policy.yaml` allow-list). The
+registry test asserts every SHIPPED entry names all of them. Today's SHIPPED
+backend: `moly-backend`. The four frontends are PLANNED entries with their
+verified framework facts (below) so the wizard can list them honestly as
+`PLANNED` until chunk 3 lands.
+
+### N3.3 Frontend build-on-provision (chunk 3)
+
+Verified via the GitHub API (2026-09-09), default branches:
+
+| repo | framework | API endpoint var | notes |
+|---|---|---|---|
+| `twizz-app/frontend` | CRA 5 + craco | `REACT_APP_API_ENDPOINT` (+ `REACT_APP_SOCKET_ENDPOINT` per `docs/enablement/frontend`) | static build → nginx |
+| `twizz-app/business` | Vite 6 + React 19 | `VITE_BACKEND_URL` | static build → nginx |
+| `twizz-app/moly_admin` | Next **9.4.4** + custom Node server | `NEXT_PUBLIC_API_ENDPOINT` (browser) + `API_ENDPOINT` (server) | oldest; standalone output unsupported on Next 9 → `next build` + `node server` image |
+| `twizz-app/twizz-admin` | Next 15 | `NEXT_PUBLIC_API_URL` (+ `NEXT_PUBLIC_APP_URL`, `NEXTAUTH_URL`) | already previewed by the joint PR appset; standalone |
+
+None of the four has a `nebula-build.yml` yet; each has only `deploy.yml`
+(Vercel). The endpoint is a **build-time** value in all four, which is exactly
+why frontends must build on provision.
+
+Flow (all through the gate, one tool `create_named_env kind=frontend`):
+1. `trigger_build` — `workflow_dispatch` `nebula-build.yml` in the frontend
+   repo with inputs `{ref, envName, apiEndpoint, socketEndpoint?}`; the
+   workflow builds with the env var(s) set, pushes `ECR <ecrRepo>:fe-<repo>-<sha>`
+   via OIDC (`repo:twizz-app/*` is already in the `twizz-gha-ecr-push` trust),
+   and writes the tag to the job summary. Nebula records `build.runId` in the
+   manifest immediately (card shows `RUNNING`).
+2. The reaper's sibling **build-watcher** (or the dashboard on refresh) polls
+   the run; on success it writes `imageTag` + `build.status: PASS` (one commit)
+   → Argo deploys. On failure the card shows `FAIL` with the run link; nothing
+   is deployed. No polling loop inside a request handler.
+3. Chart frontend mode (`kind: frontend` in `apps/<service>/values.yaml`):
+   `serve: static` = nginx image serving `/usr/share/nginx/html` with SPA
+   fallback; `serve: next-standalone` = the app's own server on :3000. Both
+   behind the same ingress/SSO gate; `cors` unset (the *backend* carries CORS).
+4. Attach = `attachTo` in the frontend manifest + the origin appended to the
+   backend's `frontendOrigins` in the same gated action (two commits, one
+   nonce). A frontend with no `attachTo` targets the staging API (today's Vercel
+   default) — allowed, observe-only staging is a valid *upstream to read from*,
+   never a deploy target.
+
+Contradictions with §4: §4.1a's "no build step" now holds for **backends only**;
+§4.5's Vercel option (a) is dropped (SameSite cookie, N-review §1); §4.3's
+`create_preview` `mode: pr` stays dropped; `trigger_build` returns, but only as
+a frontend `workflow_dispatch`, never for backends.
+
+### N3.4 Clusters + observability
+
+Three clusters, one page (`/clusters`): **EKS-Twizz-NonProd `DEPLOYABLE`**,
+**EKS-Moly-staging `OBSERVE ONLY`**, **EKS-Moly-Prod `OBSERVE ONLY`**. Pods per
+namespace with status words (Container Insights `/performance`), and one logs
+panel (cluster → namespace → pod? → window → filter) over
+`/aws/containerinsights/<cluster>/application` — both via `@twizz-idp/core`
+`awsService`, which already spans all three. Structural guarantees: the
+`twizz-nebula-dashboard` role gets only `logs:*Query/Get/Describe/Filter`,
+`cloudwatch:GetMetricData/ListMetrics`, `eks:DescribeCluster/ListClusters`
+(no `eks:AccessKubernetesApi`, no kubeconfig for staging/prod exists in the
+image); the `clusters` tRPC router has only queries; every non-prod deploy
+action stays in `actions` with the gate. A cluster that cannot be read shows
+`UNKNOWN`, never an empty panel.
+
+Three pages, one line each: **Projects** = repos & what the platform knows about
+them; **Environments** = what is running on non-prod; **Pipelines** = CI runs;
+**Clusters** = pods + logs across all three clusters (observe-only for
+staging/prod). Environments lists every Argo Application on non-prod (not only
+named envs) with an origin word — `NAMED` (Nebula actions), `PR PREVIEW`
+(read-only, PR link), `GITOPS APP` (read-only: twizz-support, shared-*) — so
+support and sentinel are visible. Projects auto-populates from the `twizz-app`
+org ∪ repos referenced by Applications (incl. `xenosnikos/twizz-support`) ∪ the
+`Project` table, with `DEPLOYED` / `PREVIEWABLE` / `REGISTERED` / `UNONBOARDED`.
+
+### N3.5 Chunks
+
+1. Clusters view + read-only IAM (this round). 2. Registry + `frontendOrigins`
++ multi-origin ingress CORS + Environments-shows-everything + Projects
+auto-populate (this round). 3. Frontend envs: `nebula-build.yml` template in
+`packages/onboard`, `trigger_build`, chart frontend mode, build-watcher,
+`attachTo` (next round).

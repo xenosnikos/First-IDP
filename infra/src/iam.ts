@@ -241,6 +241,29 @@ export function createIamRoles(
             Action: ["ecr:DescribeImages"],
             Resource: `arn:aws:ecr:${region}:${acct}:repository/molybackend`,
           },
+          // ── Clusters page (docs/NEBULA.md §N3.4): observe all three clusters
+          // through CloudWatch Container Insights + EKS describe. READ ONLY —
+          // deliberately no eks:AccessKubernetesApi / no kube path: staging and
+          // prod can be watched from Nebula but never touched.
+          {
+            Sid: "ContainerInsightsLogsRead",
+            Effect: "Allow",
+            Action: [
+              "logs:FilterLogEvents",
+              "logs:GetLogEvents",
+              "logs:DescribeLogStreams",
+              "logs:StartQuery",
+              "logs:GetQueryResults",
+              "logs:StopQuery",
+            ],
+            Resource: `arn:aws:logs:${region}:${acct}:log-group:/aws/containerinsights/*`,
+          },
+          {
+            Sid: "LogsAndMetricsDiscovery",
+            Effect: "Allow",
+            Action: ["logs:DescribeLogGroups", "cloudwatch:GetMetricData", "cloudwatch:ListMetrics", "eks:DescribeCluster", "eks:ListClusters"],
+            Resource: "*",
+          },
         ],
       }),
     ),

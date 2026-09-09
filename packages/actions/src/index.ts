@@ -6,3 +6,4 @@ export * from "./audit";
 export * from "./gate";
 export * from "./named-envs";
 export * from "./adapters";
+export * from "./registry";

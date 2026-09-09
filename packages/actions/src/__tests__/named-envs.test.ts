@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   ALIAS_TAGS,
+  normalizeOrigins,
   DEFAULT_MAX_NAMED_ENVS,
   deriveEnvSecret,
   expiresAtFrom,
@@ -66,13 +67,23 @@ describe("manifest round-trip", () => {
     imageTag: TAG,
     expiresAt: "2026-09-14T00:00:00.000Z",
     db: { mode: "clone", generation: 2 },
-    frontendOrigin: "https://smoke-frontend.prv.twizz.com",
+    kind: "backend",
+    frontendOrigins: ["https://smoke-frontend.prv.twizz.com", "https://smoke-business.prv.twizz.com"],
   };
-  it("serialises in schema order and parses back identically", () => {
+  it("serialises in schema order (v2: kind + frontendOrigins list) and parses back identically", () => {
     const yaml = manifestToYaml(m);
-    expect(yaml.split("\n")[0]).toBe("name: smoke");
+    expect(yaml.split("\n").slice(0, 2)).toEqual(["name: smoke", "kind: backend"]);
     expect(yaml).toContain("expiresAt: \"2026-09-14T00:00:00.000Z\"");
+    expect(yaml).toContain("frontendOrigins:\n  - https://smoke-frontend.prv.twizz.com\n  - https://smoke-business.prv.twizz.com");
     expect(parseManifest(yaml)).toEqual(m);
+  });
+  it("reads a v1 manifest (no kind, single frontendOrigin) as backend with a one-element list", () => {
+    const v1 = manifestToYaml(m).replace("kind: backend\n", "").replace(/frontendOrigins:[\s\S]*$/, "frontendOrigin: https://smoke-frontend.prv.twizz.com\n");
+    expect(parseManifest(v1)).toEqual({ ...m, frontendOrigins: ["https://smoke-frontend.prv.twizz.com"] });
+    expect(parseManifest(manifestToYaml(m).replace(/frontendOrigins:[\s\S]*$/, "frontendOrigin: \"\"\n")).frontendOrigins).toEqual([]);
+  });
+  it("rejects an unknown kind", () => {
+    expect(() => parseManifest(manifestToYaml(m).replace("kind: backend", "kind: worker"))).toThrow(/kind/);
   });
   it("parses the hand-written smoke manifest shape (comments, unquoted values)", () => {
     const hand = `# comment
@@ -86,7 +97,7 @@ db:
   generation: 1
 frontendOrigin: https://smoke-frontend.prv.twizz.com
 `;
-    expect(parseManifest(hand)).toEqual({ ...m, expiresAt: "2026-09-14T00:00:00Z", db: { mode: "clone", generation: 1 } });
+    expect(parseManifest(hand)).toEqual({ ...m, expiresAt: "2026-09-14T00:00:00Z", db: { mode: "clone", generation: 1 }, frontendOrigins: ["https://smoke-frontend.prv.twizz.com"] });
   });
   it("rejects bad manifests loudly", () => {
     expect(() => parseManifest("name: Bad\nservice: moly-backend\n")).toThrow(/invalid name/);
@@ -129,6 +140,17 @@ describe("deriveEnvSecret", () => {
   it("does not invent URIs that the base blob lacks", () => {
     const out = deriveEnvSecret({ MONGO_URI: base.MONGO_URI }, { name: "x", frontendOrigin: "https://x", tokenSecret: "t" });
     expect(out.SHIFT_FOUR_MONGO_URI).toBeUndefined();
+  });
+});
+
+describe("normalizeOrigins", () => {
+  it("falls back, trims, dedupes and validates", () => {
+    expect(normalizeOrigins(undefined, "https://d")).toEqual(["https://d"]);
+    expect(normalizeOrigins(["", "  "], "https://d")).toEqual(["https://d"]);
+    expect(normalizeOrigins([" https://a ", "https://b", "https://a"], "https://d")).toEqual(["https://a", "https://b"]);
+    expect(normalizeOrigins(["https://a:8443"], "https://d")).toEqual(["https://a:8443"]);
+    expect(() => normalizeOrigins(["http://a"], "https://d")).toThrow(/https origin/);
+    expect(() => normalizeOrigins(["https://a/path"], "https://d")).toThrow(/https origin/);
   });
 });
 

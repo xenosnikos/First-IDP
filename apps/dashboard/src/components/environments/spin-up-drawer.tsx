@@ -36,11 +36,12 @@ export function SpinUpDrawer({ open, onClose, onCreated }: { open: boolean; onCl
   const [imageTag, setImageTag] = useState<string>("");
   const [db, setDb] = useState<"isolated" | "clone">("isolated");
   const [ttlHours, setTtlHours] = useState<number>(TTL.default);
-  const [frontendOrigin, setFrontendOrigin] = useState("");
+  const [originsText, setOriginsText] = useState("");
+  const frontendOrigins = originsText.split(/[\n,\s]+/).map((o) => o.trim()).filter(Boolean);
 
   const images = trpc.actions.listReleaseImages.useQuery({ service, limit: 20 }, { enabled: open, staleTime: 60_000 });
   const create = trpc.actions.createNamedEnv.useMutation();
-  const gated = useGatedAction<{ name: string; service: Service; imageTag: string; db: "isolated" | "clone"; ttlHours: number; frontendOrigin?: string }, CreateResult>(
+  const gated = useGatedAction<{ name: string; service: Service; imageTag: string; db: "isolated" | "clone"; ttlHours: number; frontendOrigins?: string[] }, CreateResult>(
     async (args) => (await create.mutateAsync(args)) as GateResult,
   );
 
@@ -48,14 +49,14 @@ export function SpinUpDrawer({ open, onClose, onCreated }: { open: boolean; onCl
   const nameOk = NAME_RE.test(name);
   const tagOk = /^build-[0-9a-f-]{36}$/.test(imageTag) && !ALIAS_TAGS.has(imageTag);
   const ttlOk = Number.isInteger(ttlHours) && ttlHours >= TTL.min && ttlHours <= TTL.max;
-  const originOk = frontendOrigin === "" || /^https:\/\/[a-z0-9.-]+$/i.test(frontendOrigin);
+  const originOk = frontendOrigins.every((o) => /^https:\/\/[a-z0-9.-]+(:\d+)?$/i.test(o));
   const ready = nameOk && tagOk && ttlOk && originOk;
 
   const problems: string[] = [];
   if (name && !nameOk) problems.push("name must match ^[a-z][a-z0-9-]{2,23}$ (it becomes <name>.prv.twizz.com)");
   if (imageTag && !tagOk) problems.push("only immutable build-* tags may be provisioned — aliases (latest/prod/dev) are refused");
   if (!ttlOk) problems.push(`TTL must be ${TTL.min}..${TTL.max} hours`);
-  if (!originOk) problems.push("frontend origin must be an https:// origin with no path");
+  if (!originOk) problems.push("every frontend origin must be an https:// origin (host[:port], no path)");
 
   const close = () => {
     gated.reset();
@@ -177,8 +178,17 @@ export function SpinUpDrawer({ open, onClose, onCreated }: { open: boolean; onCl
             <input type="number" min={TTL.min} max={TTL.max} value={ttlHours} onChange={(e) => setTtlHours(Number(e.target.value))} style={inputStyle} />
           </Field>
 
-          <Field label="frontend origin (optional)" hint={`Browser origin allowed by ingress CORS. Default https://${nameOk ? name : "<name>"}-frontend.prv.twizz.com. Must live under .prv.twizz.com for the SSO cookie to ride.`}>
-            <input value={frontendOrigin} onChange={(e) => setFrontendOrigin(e.target.value.trim())} placeholder={`https://${nameOk ? name : "<name>"}-frontend.prv.twizz.com`} style={inputStyle} />
+          <Field
+            label="frontend origins (optional, one per line)"
+            hint={`Every browser origin this backend's ingress must accept (CORS) — several frontends may call one backend. Default https://${nameOk ? name : "<name>"}-frontend.prv.twizz.com. Origins must live under .prv.twizz.com for the SSO cookie to ride.`}
+          >
+            <textarea
+              value={originsText}
+              onChange={(e) => setOriginsText(e.target.value)}
+              rows={3}
+              placeholder={`https://${nameOk ? name : "<name>"}-fe.prv.twizz.com\nhttps://${nameOk ? name : "<name>"}-business.prv.twizz.com`}
+              style={{ ...inputStyle, fontFamily: "inherit", resize: "vertical" }}
+            />
           </Field>
 
           <p style={{ margin: "4px 0 16px", padding: "8px 10px", fontSize: 10, lineHeight: 1.5, color: "var(--n-ink-muted)", background: "var(--n-plate)", border: "1px solid var(--n-hairline)", borderRadius: "var(--n-radius)" }}>
@@ -198,7 +208,7 @@ export function SpinUpDrawer({ open, onClose, onCreated }: { open: boolean; onCl
             <Button
               variant="ion"
               disabled={!ready}
-              onClick={() => gated.request({ name, service, imageTag, db, ttlHours, frontendOrigin: frontendOrigin || undefined })}
+              onClick={() => gated.request({ name, service, imageTag, db, ttlHours, frontendOrigins: frontendOrigins.length ? frontendOrigins : undefined })}
             >
               Review with the gate
             </Button>

@@ -117,11 +117,12 @@ describe("createNamedEnv", () => {
     expect(manifest).toEqual({
       name: "smoke",
       service: "moly-backend",
+      kind: "backend",
       owner: "local-nick",
       imageTag: TAG,
       expiresAt: "2026-09-14T12:00:00.000Z",
       db: { mode: "clone", generation: 1 },
-      frontendOrigin: "https://smoke-frontend.prv.twizz.com",
+      frontendOrigins: ["https://smoke-frontend.prv.twizz.com"],
     });
     expect(d.gitops.commits).toEqual(["nebula: create env smoke (local:nick)"]);
     expect(res.url).toBe("https://smoke.prv.twizz.com");
@@ -158,7 +159,14 @@ describe("createNamedEnv", () => {
     await expect(createNamedEnv(d, { ...input, name: "Bad" })).rejects.toThrow(/invalid env name/);
     await expect(createNamedEnv(d, { ...input, ttlHours: 0 })).rejects.toThrow(/ttlHours/);
     await expect(createNamedEnv(d, { ...input, ttlHours: 337 })).rejects.toThrow(/ttlHours/);
-    await expect(createNamedEnv(d, { ...input, frontendOrigin: "http://insecure" })).rejects.toThrow(/https/);
+    await expect(createNamedEnv(d, { ...input, frontendOrigins: ["http://insecure"] })).rejects.toThrow(/https/);
+  });
+
+  it("accepts several frontend origins; the first one becomes BUSINESS_URL", async () => {
+    const d = deps();
+    await createNamedEnv(d, { ...input, frontendOrigins: ["https://smoke-fe.prv.twizz.com", "https://smoke-business.prv.twizz.com"] });
+    expect(parseManifest(d.gitops.files.get("named-envs/smoke.yaml")!).frontendOrigins).toEqual(["https://smoke-fe.prv.twizz.com", "https://smoke-business.prv.twizz.com"]);
+    expect(d.secrets.store.get("preview/moly-backend/smoke")!.BUSINESS_URL).toBe("https://smoke-fe.prv.twizz.com");
   });
 });
 

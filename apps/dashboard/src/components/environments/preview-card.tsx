@@ -7,7 +7,7 @@ import { Pill } from "@/components/nebula/pill";
 import { Button } from "@/components/nebula/button";
 import { Row } from "@/components/nebula/plate";
 
-export type NamedEnvView = inferRouterOutputs<AppRouter>["actions"]["listEnvs"]["envs"][number];
+export type NamedEnvView = inferRouterOutputs<AppRouter>["nebula"]["listEnvironments"]["named"][number];
 
 // The signature object (docs/NEBULA.md §2): `<env>.<host>` with one row per
 // fact, each a coloured WORD + a value. Every word here is real data — the
@@ -72,8 +72,15 @@ export function PreviewCard({
           <span>{env.ttl.remaining}</span>
           <span style={{ color: "var(--n-ink-faint)", fontSize: 10 }} title={env.expiresAt}>{expiresLocal}</span>
         </Row>
+        <Row label="origins">
+          {env.frontendOrigins.length === 0 && <span style={{ color: "var(--n-ink-faint)" }}>none (no CORS)</span>}
+          {env.frontendOrigins.map((o) => (
+            <span key={o} style={{ fontSize: 10, padding: "0 6px", border: "1px solid var(--n-hairline-strong)", borderRadius: 3, color: "var(--n-ink-muted)" }}>{o.replace(/^https:\/\//, "")}</span>
+          ))}
+        </Row>
         <Row label="owner" last>
           <span>{env.owner}</span>
+          <Pill word="NAMED" title="Provisioned by Nebula from named-envs/<name>.yaml; the only kind with actions" />
         </Row>
       </div>
 

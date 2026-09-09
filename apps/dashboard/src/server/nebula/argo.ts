@@ -19,7 +19,7 @@ type AppItem = {
 
 export type ArgoStatusMap = { reachable: boolean; reason?: string; apps: Record<string, ArgoStatus> };
 
-async function loadKubeConfig() {
+export async function loadKubeConfig() {
   const k8s = await import("@kubernetes/client-node");
   const kc = new k8s.KubeConfig();
   if (process.env.KUBERNETES_SERVICE_HOST) {

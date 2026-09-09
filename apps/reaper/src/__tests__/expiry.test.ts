@@ -9,7 +9,8 @@ const env = (name: string, expiresAt: string): NamedEnvManifest => ({
   imageTag: "build-75b95f51-a1de-432d-8132-33a2802f622c",
   expiresAt,
   db: { mode: "isolated", generation: 1 },
-  frontendOrigin: "",
+  kind: "backend",
+  frontendOrigins: [],
 });
 
 describe("selectExpired", () => {

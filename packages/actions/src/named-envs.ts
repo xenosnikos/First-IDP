@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Document as YamlDocument, parse as parseYaml, type Scalar } from "yaml";
+import { PROVISIONABLE } from "./registry";
 
 // ── Constants ─────────────────────────────────────────────────────────
 // Everything a caller can influence is validated against these; secret names
@@ -9,9 +10,11 @@ export const GITOPS = { owner: "TwizzyNicky", repo: "twizz-gitops", branch: "mai
 export const PREVIEW_DOMAIN = "prv.twizz.com";
 
 export type ServiceName = "moly-backend";
-export const SERVICES: Record<ServiceName, { ecrRepo: string; sourceSecret: string }> = {
-  "moly-backend": { ecrRepo: "molybackend", sourceSecret: "preview/moly-backend" },
-};
+/** Provisionable backends, derived from the registry (registry.ts). Kept as a
+ * map for the callers that resolve `ecrRepo` / `sourceSecret` by service. */
+export const SERVICES: Record<ServiceName, { ecrRepo: string; sourceSecret: string }> = Object.fromEntries(
+  PROVISIONABLE.map((s) => [s.name, { ecrRepo: s.ecrRepo, sourceSecret: s.sourceSecret! }]),
+) as Record<ServiceName, { ecrRepo: string; sourceSecret: string }>;
 export const SERVICE_NAMES = Object.keys(SERVICES) as ServiceName[];
 
 export const NAME_RE = /^[a-z][a-z0-9-]{2,23}$/;
@@ -22,16 +25,32 @@ export const DEFAULT_MAX_NAMED_ENVS = 6;
 export const TTL_HOURS = { min: 1, max: 336, default: 168 } as const;
 
 export type DbMode = "isolated" | "clone";
+export type EnvKind = "backend" | "frontend";
 
+/** Manifest schema v2 (docs/NEBULA.md §N3.1). `frontendOrigin` (v1, single
+ * string) is still accepted on read and mapped to a one-element list. */
 export type NamedEnvManifest = {
   name: string;
+  kind: EnvKind;
   service: ServiceName;
   owner: string;
   imageTag: string;
   expiresAt: string;
   db: { mode: DbMode; generation: number };
-  frontendOrigin: string;
+  /** Every browser origin the backend's ingress must accept (CORS). */
+  frontendOrigins: string[];
 };
+
+export const ORIGIN_RE = /^https:\/\/[a-z0-9.-]+(:\d+)?$/i;
+
+/** Normalise a caller-supplied origin list: trim, drop empties, dedupe,
+ * validate. Throws on the first bad origin. */
+export function normalizeOrigins(origins: readonly string[] | undefined, fallback: string): string[] {
+  const list = (origins ?? []).map((o) => o.trim()).filter(Boolean);
+  const out = list.length ? [...new Set(list)] : [fallback];
+  for (const o of out) if (!ORIGIN_RE.test(o)) throw new Error(`frontendOrigins: "${o}" is not an https origin (scheme + host[:port], no path)`);
+  return out;
+}
 
 // ── Pure helpers ──────────────────────────────────────────────────────
 
@@ -109,12 +128,13 @@ export function manifestToYaml(m: NamedEnvManifest): string {
   // Key order is the documented schema order (named-envs/README.md).
   const ordered = {
     name: m.name,
+    kind: m.kind,
     service: m.service,
     owner: m.owner,
     imageTag: m.imageTag,
     expiresAt: m.expiresAt,
     db: { mode: m.db.mode, generation: m.db.generation },
-    frontendOrigin: m.frontendOrigin,
+    frontendOrigins: [...m.frontendOrigins],
   };
   const doc = new YamlDocument(ordered);
   // Quote the timestamp so no YAML 1.1 parser (Go's, on the Argo side) turns it
@@ -141,14 +161,26 @@ export function parseManifest(text: string): NamedEnvManifest {
   const generation = Number(db.generation);
   if (!Number.isInteger(generation) || generation < 1) throw new Error("manifest: db.generation must be a positive integer");
   const expiresAt = r.expiresAt instanceof Date ? r.expiresAt.toISOString() : str("expiresAt", r.expiresAt);
+  const kind = r.kind === undefined ? "backend" : str("kind", r.kind);
+  if (kind !== "backend" && kind !== "frontend") throw new Error(`manifest: kind must be backend|frontend`);
+  // v2 list, else v1 single string, else none
+  let frontendOrigins: string[];
+  if (Array.isArray(r.frontendOrigins)) {
+    frontendOrigins = r.frontendOrigins.map((o, i) => str(`frontendOrigins[${i}]`, o)).filter(Boolean);
+  } else if (typeof r.frontendOrigin === "string" && r.frontendOrigin) {
+    frontendOrigins = [r.frontendOrigin];
+  } else {
+    frontendOrigins = [];
+  }
   return {
     name,
+    kind,
     service: service as ServiceName,
     owner: str("owner", r.owner),
     imageTag: str("imageTag", r.imageTag),
     expiresAt,
     db: { mode, generation },
-    frontendOrigin: typeof r.frontendOrigin === "string" ? r.frontendOrigin : "",
+    frontendOrigins,
   };
 }
 
@@ -193,7 +225,8 @@ export type CreateNamedEnvInput = {
   imageTag: string;
   db: DbMode;
   ttlHours: number;
-  frontendOrigin?: string;
+  /** Browser origins allowed by the backend's ingress CORS; default [https://<name>-frontend.prv.twizz.com] */
+  frontendOrigins?: string[];
   /** who is asking — becomes the manifest `owner` (label-safe) */
   actor: string;
 };
@@ -217,8 +250,8 @@ export async function createNamedEnv(deps: NamedEnvDeps, input: CreateNamedEnvIn
   if (!Number.isInteger(input.ttlHours) || input.ttlHours < TTL_HOURS.min || input.ttlHours > TTL_HOURS.max) {
     throw new Error(`ttlHours must be an integer in ${TTL_HOURS.min}..${TTL_HOURS.max}`);
   }
-  const frontendOrigin = input.frontendOrigin ?? defaultFrontendOrigin(name);
-  if (!/^https:\/\/[a-z0-9.-]+$/i.test(frontendOrigin)) throw new Error(`frontendOrigin must be an https origin, got "${frontendOrigin}"`);
+  const frontendOrigins = normalizeOrigins(input.frontendOrigins, defaultFrontendOrigin(name));
+  const frontendOrigin = frontendOrigins[0]; // BUSINESS_URL / USER_URL in the env blob
 
   const path = manifestPath(name);
   if (await deps.gitops.getFile(path)) throw new Error(`env "${name}" already exists (${path})`);
@@ -240,12 +273,13 @@ export async function createNamedEnv(deps: NamedEnvDeps, input: CreateNamedEnvIn
   // 2. the manifest — the env itself
   const manifest: NamedEnvManifest = {
     name,
+    kind: "backend",
     service,
     owner: toLabelValue(input.actor),
     imageTag,
     expiresAt: expiresAtFrom(now(), input.ttlHours),
     db: { mode: input.db, generation: 1 },
-    frontendOrigin,
+    frontendOrigins,
   };
   await deps.gitops.putFile(path, manifestToYaml(manifest), `nebula: create env ${name} (${input.actor})`);
 
