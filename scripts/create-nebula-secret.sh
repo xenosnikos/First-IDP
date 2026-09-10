@@ -6,7 +6,9 @@
 #
 #   AWS_PROFILE=twizz bash scripts/create-nebula-secret.sh
 #
-# Add igor's GitHub login to NEBULA_OPERATORS / ALLOWED_GITHUB_LOGINS once known.
+# ONE-TIME bootstrap. Later user changes: scripts/nebula-allow-login.sh (see the
+# twizz-nebula-users skill). Sign-in now uses the GitHub App twizz-nebula
+# (client Iv23liulodACgG6rqlKr, STATE.md 2026-09-09); the values below are the seed.
 set -euo pipefail
 umask 077
 cd "$(dirname "$0")/.."

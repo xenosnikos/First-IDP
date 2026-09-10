@@ -23,7 +23,7 @@ Rotate because the file predates this audit and its history is unknown:
 - [ ] GitHub OAuth app client secret (twizz-app org OAuth app `Ov23lirMDHUPPYwRkz5A`)
 - [ ] Vercel token (team `team_ocn3vwvvs3VDxcjxNcY7l8Mu`)
 - [ ] MongoDB Atlas API key pair (project `684296275fe8cc27d7b99d9b`, public key `iydvdumt`)
-- [ ] Anthropic API key (Nebula Observer: SM `preview/nebula` key `ANTHROPIC_API_KEY`; set with `scripts/nebula-set-observer-key.sh`, then restart the dashboard)
+- [ ] Anthropic API key — the shared **Twizz R&D** key (labelled as such in the Anthropic console) used by twizz-sentinel (SM `preview/twizz-sentinel`) and the Nebula Observer (SM `preview/nebula`, keys `ANTHROPIC_API_KEY` + `ANTHROPIC_WORKSPACE_ID`; set with `scripts/nebula-set-observer-key.sh`, then restart the dashboard). Rotating it means updating both blobs.
 - [ ] AWS access key pair, if any static pair is present — prefer deleting it entirely and using
       `AWS_PROFILE=twizz` locally / OIDC in CI (Phase 2+ removes all static AWS keys)
 - [ ] Argo / ArgoCD tokens (moot after Phase 1 — old Argo Workflows setup is deleted)

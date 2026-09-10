@@ -294,7 +294,7 @@ has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not
   `preview/github-app` for future app-auth tokens). GitHub App callbacks carry
   `iss=https://github.com/login/oauth` → `@auth/core` 0.37 needed
   `issuer: "https://github.com/login/oauth"` on the provider (`dab20f0`). Operators:
-  `xenosnikos,TwizzyNicky,igormoly`. `scripts/update-nebula-oauth.sh` (file or prompt input).
+  `xenosnikos,TwizzyNicky,igormoly` (later changes: `scripts/nebula-allow-login.sh`).
 - **N3 decisions:** frontends **build on provision** (workflow_dispatch → ECR, never on
   push); staging/QA + prod are **observe-only** (structural: dashboard IAM = CloudWatch/EKS
   read, no kube path). Shipped (`af25cc5`, gitops `c533f81`): `/clusters` (3 clusters, pods +
@@ -318,8 +318,8 @@ has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not
 ## 2026-09-10 — Observer phase 1, Clusters/logs tweaks, org-confined Projects/Environments
 
 - **Access:** `rohitagrohia` added to `ALLOWED_GITHUB_LOGINS` (SM `preview/nebula`, new
-  `scripts/nebula-allow-login.sh`; `update-nebula-oauth.sh` still hardcodes the old list — use
-  the new script). Prod `jobs/email-service` logs verified readable from the dashboard path.
+  `scripts/nebula-allow-login.sh`). Prod `jobs/email-service` logs verified readable from the
+  dashboard path.
 - **Core:** `getPodLogs` → `{status: complete|timeout|failed, lines}` (one `runInsightsQuery`
   poll helper), `getLogHistogram` (`stats count(*) by bin`), `insights-query.ts` builders with
   real escaping (`"`, `\`, `/`); filter regex matches log text **or** pod name. MCP
@@ -337,11 +337,20 @@ has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not
 - **Org confinement:** `shared-*` (namespace `shared`) hidden via `isPlatformApp`; Projects
   filtered to `twizz-app/*` ∪ `PROJECT_EXCEPTIONS` (`xenosnikos/twizz-support`); registry gains
   `twizz-sentinel` + `twizz-support` (`PLANNED`, not provisionable).
-- **Open:** put `ANTHROPIC_API_KEY` in `preview/nebula` (`scripts/nebula-set-observer-key.sh`)
-  and restart the dashboard; build + roll the image (GHA `build-images.yml` → gitops tag);
-  confirm the nebula ingress read timeout ≥ SSE ping (15 s). **Next plan:** spin up a preview
-  from any org repo/branch with config set in the dashboard (Nebula dispatches
-  `nebula-build.yml` on the ref), AI-authored `twizz.yaml`/values + PR.
+- **Deployed 2026-09-10 (`c0857c5` → gitops `f6ed373`, Argo Synced/Healthy):** first build
+  failed because the root `.gitignore` `logs/` rule had swallowed `packages/observer/src/logs`
+  (negation added). `preview/nebula` now holds `ANTHROPIC_API_KEY` + `ANTHROPIC_WORKSPACE_ID`
+  — the shared **Twizz R&D** Anthropic key (same one as twizz-sentinel; labelled as such in
+  the Anthropic console; rotate with `scripts/nebula-set-observer-key.sh`). Ingress has no
+  explicit read timeout (nginx default 60 s); the SSE stream pings every 15 s. Pushes:
+  twizz-idp as `xenosnikos` (gh account switch), twizz-gitops with the TwizzyNicky platform
+  token from SM `preview/github` (no local gh account can see that repo).
+- `scripts/update-nebula-oauth.sh` deleted (it hardcoded the allowlist and would have dropped
+  users); user management is documented in the `twizz-nebula-users` skill.
+- **Known:** prod `jobs/email-service` logs its api.twizz.com bearer token on every Apple Pay
+  cron failure (Observer redacts it; Nick raising with Rohit).
+- **Next:** spin up a preview from any org repo/branch with config set in the dashboard
+  (Nebula dispatches `nebula-build.yml` on the ref), AI-authored `twizz.yaml`/values + PR.
 
 ## Verification
 

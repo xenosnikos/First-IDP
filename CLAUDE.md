@@ -32,19 +32,27 @@ and the strictly-authorized MCP toolset. See STATE.md for phase status.
 | `/environments` | Cross-project environment overview (diagram + table) |
 | `/pipelines` | Recent pipeline runs |
 | `/pipelines/[runId]` | Step timeline + log viewer (points at GitHub Actions from Phase 3) |
+| `/clusters` | Pods + logs across all three clusters (observe-only for staging/prod); URL-addressable log queries; the Observer panel |
 
-The deploy wizard and release board were removed (GitOps replaces both).
+The deploy wizard and release board were removed (GitOps replaces both). The Nebula
+surfaces (`/environments` grid + spin-up drawer, `/projects`, `/clusters`) are the
+in-cluster dashboard at nebula.prv.twizz.com (docs/NEBULA.md).
 
 ## Service Layer
 
-Services in `apps/dashboard/src/server/services/`:
+External-API wrappers live in `packages/core/src/` (`@twizz-idp/core`, shared by the
+dashboard and the MCP server; no Prisma, no Next):
 - `github.ts` - Octokit wrapper (listOrgRepos, listBranches, detectProjectType, getFileContent)
-- `aws.ts` - AWS SDK (Secrets Manager keys, CloudWatch Container Insights, EKS describe, getPodLogs)
-- `vercel.ts` - Vercel API (listProjects, getProjectDetail, listDeployments) — used by introspection
-- `atlas.ts` - MongoDB Atlas Admin API (listClusters, …) — used by introspection
-- `introspect.ts` - Multi-source project/environment introspection (the core asset)
+- `aws.ts` - AWS SDK: Secrets Manager keys, CloudWatch Container Insights (`getLivePods`,
+  `getNodeMetrics`), EKS describe, `getPodLogs` → `{status: complete|timeout|failed, lines}`,
+  `getLogHistogram`; all Logs Insights calls go through one `runInsightsQuery` poll helper
+- `insights-query.ts` - pure Logs Insights query builders + escaping (`LOG_NAME_RE`)
+- `vercel.ts`, `atlas.ts`, `introspect.ts` - Vercel / Atlas / multi-source introspection
 
-Deleted (git history has them): `argo.ts`, `argocd.ts`, `claude.ts`.
+Nebula-specific server code is in `apps/dashboard/src/server/nebula/` (`classify.ts`
+origin/project classification, `kube.ts` cluster snapshot, `observer.ts` Observer audit +
+budget, `deps.ts` gate wiring). Deleted (git history has them): the old
+`apps/dashboard/src/server/services/*`, `argo.ts`, `argocd.ts`, `claude.ts`.
 
 ## tRPC Routers (all behind protectedProcedure)
 
@@ -52,16 +60,26 @@ Deleted (git history has them): `argo.ts`, `argocd.ts`, `claude.ts`.
 - `environment` - list, get (read-only; envs are created/destroyed by GitOps)
 - `pipeline` - getStatus, getStepLogs, list, listAll (DB reads; GitHub Actions wiring lands in Phase 3)
 - `secret` - list, listKeys (names only, never values)
-- `logs` - getPodLogs (CloudWatch application logs)
+- `logs` - getPodLogs (legacy per-environment log viewer)
+- `clusters` - overview, logs, logHistogram (queries only, by construction)
+- `nebula` - listEnvironments, listProjects (read-only Nebula views)
+- `observer` - status (the Observer run itself streams over `POST /api/observer`, SSE)
+- `actions` - the ONLY mutations: named-env create/teardown/extend/clone behind
+  `operatorProcedure` + the `@twizz-idp/actions` gate (policy → nonce → AuditLog)
 
 ## Auth / RBAC
 
 - `lib/auth.config.ts` — edge-safe config (providers + `authorized`); imported by middleware. NO Prisma here.
 - `lib/auth.ts` — full config: `signIn` callback verifies **active GitHub org membership**
-  (`ALLOWED_GITHUB_ORGS`, default `twizz-app,MymTwo`) with the user's own token, or an
-  `ALLOWED_GITHUB_LOGINS` allowlist. Upserts `User`, writes an `AuditLog` row per attempt.
+  (`ALLOWED_GITHUB_ORGS`, default `twizz-app`; unset in-cluster) with the user's own token,
+  or the `ALLOWED_GITHUB_LOGINS` allowlist (what actually admits people today). Upserts
+  `User`, writes an `AuditLog` row per attempt. In-cluster sign-in uses the GitHub App
+  `twizz-nebula` (client `Iv23liulodACgG6rqlKr`); `NEBULA_OPERATORS` gates writes.
 - Middleware matcher covers `/projects`, `/environments`, `/pipelines`.
-- Every write anywhere (dashboard or MCP) must create an `AuditLog` row.
+- Every write anywhere (dashboard or MCP) must create an `AuditLog` row. Observer runs
+  (an LLM call is cost-bearing) write one too: `nebula.observer.<kind>`.
+- User management (Nebula sign-in allowlist, operators, VPN, SSO gates): see the
+  `twizz-nebula-users` skill in `.claude/skills/`; scripts in `scripts/nebula-*.sh`.
 
 ## Prisma (packages/db)
 
@@ -89,9 +107,15 @@ naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app he
 ## Package Names
 
 - `@twizz-idp/db` - Prisma client and schema
-- `@twizz-idp/shared` - Types, validators, constants
+- `@twizz-idp/shared` - Types, constants
+- `@twizz-idp/core` - External-API service layer (GitHub, AWS/CloudWatch, Vercel, Atlas)
+- `@twizz-idp/actions` - The write gate + named-env actions + service registry (dashboard and MCP)
+- `@twizz-idp/observer` - Observer log assistant: pure `./logs` (normalize/redact/compact),
+  scope-locked tools, prompt, Claude harness (`@anthropic-ai/sdk`)
+- `@twizz-idp/onboard` - Repo onboarding CLI (twizz.yaml, workflows, gitops values/appset)
+- `@twizz-idp/reaper` - Named-env TTL reaper CronJob
 - `@twizz-idp/config` - Shared configs
-- `@twizz-idp/dashboard` - Next.js dashboard app
+- `@twizz-idp/dashboard` - Next.js dashboard app; `@twizz-idp/mcp` - stdio MCP server
 
 ## Key External Services
 
@@ -101,7 +125,7 @@ naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app he
 - **EKS Staging**: EKS-Moly-staging (staging in default ns, dev in dev ns) — leave as-is
 - **EKS Non-Prod**: EKS-Twizz-NonProd — owned by this platform (Pulumi, Phase 2)
 - **GitHub orgs**: `twizz-app` (canonical, new repos), `MymTwo` (Moly-backend, frontend)
-- **GitHub OAuth client**: Ov23lirMDHUPPYwRkz5A
+- **GitHub sign-in**: GitHub App `twizz-nebula` (client `Iv23liulodACgG6rqlKr`) in-cluster; legacy OAuth app `Ov23lirMDHUPPYwRkz5A` for local dev
 - **Vercel Team**: Loly (`team_ocn3vwvvs3VDxcjxNcY7l8Mu`) — owns `frontend` project `prj_3Op05Dm743j4qscD37c6hpfHRnfD`
 - **MongoDB Atlas**: Project 684296275fe8cc27d7b99d9b (public key iydvdumt); nonprod cluster `nonprod-twizz`
 - **CloudWatch Logs**: `/aws/containerinsights/{cluster}/application` (pod logs), `/performance` (metrics)
