@@ -29,6 +29,8 @@ Thumbs.db
 
 # Logs
 logs/
+# source module, not runtime logs
+!packages/observer/src/logs/
 *.log
 
 # Build
