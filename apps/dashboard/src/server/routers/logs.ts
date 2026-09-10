@@ -17,6 +17,7 @@ export const logsRouter = router({
       }),
     )
     .query(async ({ input }) => {
-      return awsService.getPodLogs(input);
+      const { lines } = await awsService.getPodLogs(input);
+      return lines;
     }),
 });

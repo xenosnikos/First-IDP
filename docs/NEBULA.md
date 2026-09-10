@@ -412,12 +412,57 @@ action stays in `actions` with the gate. A cluster that cannot be read shows
 Three pages, one line each: **Projects** = repos & what the platform knows about
 them; **Environments** = what is running on non-prod; **Pipelines** = CI runs;
 **Clusters** = pods + logs across all three clusters (observe-only for
-staging/prod). Environments lists every Argo Application on non-prod (not only
-named envs) with an origin word — `NAMED` (Nebula actions), `PR PREVIEW`
-(read-only, PR link), `GITOPS APP` (read-only: twizz-support, shared-*) — so
-support and sentinel are visible. Projects auto-populates from the `twizz-app`
-org ∪ repos referenced by Applications (incl. `xenosnikos/twizz-support`) ∪ the
-`Project` table, with `DEPLOYED` / `PREVIEWABLE` / `REGISTERED` / `UNONBOARDED`.
+staging/prod). Environments lists the Argo Applications on non-prod with an
+origin word — `NAMED` (Nebula actions), `PR PREVIEW` (read-only, PR link),
+`GITOPS APP` (read-only: twizz-support) — so support and sentinel are visible.
+**Nebula is confined to the GitHub org** (2026-09-10): the `shared-*`
+singletons (Moly siblings in namespace `shared`) are platform infrastructure
+and are hidden (`isPlatformApp` in `classify.ts`); support/sentinel are
+visible because they have registry entries (`PLANNED`, never provisionable)
+and `xenosnikos/twizz-support` is an explicit `PROJECT_EXCEPTIONS` entry until
+the repo moves into the org. Projects = repos in `twizz-app` (∪ the exception)
+with `DEPLOYED` / `PREVIEWABLE` / `REGISTERED` / `UNONBOARDED`.
+
+The Clusters logs panel (2026-09-10): the filter regex matches log text **or**
+pod name; ANSI is stripped and lines carry their level word in colour;
+"errors only" keeps ERROR/FATAL/WARN records and their frames; "load older"
+pages by `to = oldest loaded`; a per-15-min histogram (`clusters.logHistogram`)
+shows bursts; the applied query lives in the URL (`?c=&ns=&pod=&w=&q=&err=`);
+a Logs Insights timeout is reported as `UNKNOWN · timed out`, never as "nothing
+matched" (`getPodLogs` now returns `{status, lines}`).
+
+### N3.6 Observer (phase 1) — the read-only log assistant
+
+The first real incarnation of the "Observer" agent from §1. `packages/observer`
+is pure and SDK-independent at its core: `./logs` (browser-safe) normalizes →
+redacts → groups lines into `LogGroup` records (signature, level, ×count,
+first→last, pods, redacted sample) and renders a budgeted, honest compact view;
+`LogGroup` + `embedText()` is the unit a phase-2 embedding index will store.
+Tools (`fetch_logs`, `log_histogram`, `list_pods`, `get_group_samples`,
+`node_metrics`) are plain objects `{name, description, input: zod, run(input,
+ctx)}` whose schemas carry **no cluster/namespace**: scope is fixed server-side
+from the human's applied query and the model can only narrow it. The same
+objects are wrapped for the Anthropic tool runner now and for `apps/mcp`
+`server.tool` later (`toMcpTools`, phase 2).
+
+Dashboard wiring: `POST /api/observer` streams server-sent events (the first
+streaming surface in Nebula; tRPC's batch link cannot stream tokens), auth via
+`auth()`, body validated with zod, window ≤ 24 h. `trpc.observer.status` gives
+the word: `STUB` (no `ANTHROPIC_API_KEY`), `DENIED` (daily cap), `PASS`. Every
+run — allowed, denied, failed, aborted — writes one `AuditLog` row
+(`nebula.observer.<kind>`, resource `cluster/ns[/pod]`, detail = model, usage,
+tool calls, iterations, redaction counts; never prompts or log text). That row
+is also the budget ledger (`OBSERVER_DAILY_RUNS` = 40, `OBSERVER_DAILY_RUNS_PER_USER`
+= 15) — no new table. Model `claude-opus-5`, adaptive thinking, effort medium,
+cached frozen system prompt, server-side refusal fallback, ≤ 8 tool iterations.
+Secrets: the key lives in SM `preview/nebula` (`scripts/nebula-set-observer-key.sh`);
+the ExternalSecret extracts every key, so no gitops change.
+
+Phase 2 seams (not built): `toMcpTools` + an `observer_ask` MCP tool with the
+MCP actor/audit; a `propose_action` tool that returns a proposal the UI binds
+to the existing gate (EmberButton → `actions` router → nonce → AuditLog; the
+agent never holds the operator role); an `ObserverGroup` table with in-process
+cosine first, pgvector later, and a `similar_past_incidents` tool.
 
 ### N3.5 Chunks
 

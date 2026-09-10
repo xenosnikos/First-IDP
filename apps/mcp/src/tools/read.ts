@@ -78,22 +78,22 @@ export function registerReadTools(server: McpServer) {
       namespace: z.string(),
       podName: z.string().optional(),
       minutesBack: z.number().int().min(1).max(1440).default(30),
-      filter: z.string().optional().describe("CloudWatch filter pattern, e.g. ?ERROR"),
+      filter: z.string().max(200).optional().describe("Regex matched against the log text and the pod name, e.g. ERROR|timeout"),
       limit: z.number().int().min(1).max(500).default(100),
     },
     async ({ cluster, namespace, podName, minutesBack, filter, limit }) => {
       const { awsService } = await core();
-      const end = Date.now();
-      const logs = await awsService.getPodLogs({
+      const endSec = Math.floor(Date.now() / 1000); // Logs Insights wants epoch seconds
+      const { status, lines } = await awsService.getPodLogs({
         clusterName: cluster,
         namespace,
         podName,
-        startTime: end - minutesBack * 60_000,
-        endTime: end,
+        startTime: endSec - minutesBack * 60,
+        endTime: endSec,
         filterPattern: filter,
         limit,
       });
-      return text({ lines: logs.length, logs });
+      return text({ status, lines: lines.length, logs: lines });
     },
   );
 

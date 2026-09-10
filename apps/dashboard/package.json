@@ -25,6 +25,7 @@
     "@twizz-idp/actions": "workspace:*",
     "@twizz-idp/core": "workspace:^",
     "@twizz-idp/db": "workspace:*",
+    "@twizz-idp/observer": "workspace:*",
     "@twizz-idp/shared": "workspace:*",
     "next": "^15.1.0",
     "next-auth": "5.0.0-beta.30",

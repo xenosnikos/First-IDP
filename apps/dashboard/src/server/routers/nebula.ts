@@ -68,7 +68,7 @@ export const nebulaRouter = router({
       org: GITHUB_ORG,
       orgError,
       cluster: { reachable: snap.reachable, reason: snap.reason },
-      projects: buildProjectViews(orgRepos, apps, snap.appsets, registered),
+      projects: buildProjectViews(orgRepos, apps, snap.appsets, registered, GITHUB_ORG),
       registry: REGISTRY.map((s) => ({ name: s.name, kind: s.kind, status: s.status, repo: s.repo })),
     };
   }),

@@ -21,8 +21,15 @@ export type LiveAppSet = { name: string; prRepo?: string; prOwner?: string };
 
 export type Origin = Extract<StatusWord, "NAMED" | "PR PREVIEW" | "GITOPS APP">;
 
-/** Applications that are platform plumbing, never "environments". */
+/** Applications that are platform plumbing, never "environments": the
+ * app-of-apps root, Nebula itself, and the `shared-*` singletons (Moly
+ * sibling services in namespace `shared` that preview pods talk to via
+ * ExternalName). Nebula is confined to what lives in the GitHub org; the
+ * shared singletons are infrastructure it does not show. */
 export const HIDDEN_APPS = new Set(["root", "nebula"]);
+export function isPlatformApp(app: { name: string; namespace: string }): boolean {
+  return HIDDEN_APPS.has(app.name) || app.name.startsWith("shared-") || app.namespace === "shared";
+}
 
 export function classifyApp(app: LiveApp): Origin {
   if (app.labels["twizz-idp/named-env"] === "true" || app.name.startsWith("env-")) return "NAMED";
@@ -58,7 +65,7 @@ export type AppView = {
 
 export function buildAppViews(apps: LiveApp[], ingresses: LiveIngress[], deployments: LiveDeployment[], appsets: LiveAppSet[]): AppView[] {
   return apps
-    .filter((a) => !HIDDEN_APPS.has(a.name))
+    .filter((a) => !isPlatformApp(a))
     .map((a) => ({
       name: a.name,
       origin: classifyApp(a),
@@ -88,6 +95,16 @@ export type ProjectView = RepoFact & {
 /** Repos the platform is watching are the gitops repo itself — infra, not a project. */
 export const INFRA_REPOS = new Set(["twizzynicky/twizz-gitops"]);
 
+/** Projects = the GitHub org, plus repos Nebula demos before they move in.
+ * twizz-support lives under xenosnikos/ "while the concept is proven"
+ * (twizz-gitops bootstrap/twizz-support-repo-externalsecret.yaml). */
+export const PROJECT_EXCEPTIONS = new Set(["xenosnikos/twizz-support"]);
+
+export function isProjectRepo(slug: string, org: string): boolean {
+  const k = slug.toLowerCase();
+  return k.startsWith(`${org.toLowerCase()}/`) || PROJECT_EXCEPTIONS.has(k);
+}
+
 /** Union of org repos ∪ repos referenced by Applications ∪ registered rows,
  * with one word per fact. Deployed = an Application maps to the repo (by
  * registry label or by source URL); previewable = a PR-generator appset. */
@@ -96,6 +113,7 @@ export function buildProjectViews(
   apps: AppView[],
   appsets: LiveAppSet[],
   registered: Array<{ id: string; githubRepoUrl: string }>,
+  org = "twizz-app",
 ): ProjectView[] {
   const byKey = new Map<string, ProjectView>();
   const key = (slug: string) => slug.toLowerCase();
@@ -142,7 +160,7 @@ export function buildProjectViews(
     if (v.words.length === 0) v.words.push("UNONBOARDED");
   }
 
-  return [...byKey.values()].sort((x, y) => {
+  return [...byKey.values()].filter((v) => isProjectRepo(v.slug, org)).sort((x, y) => {
     const rank = (p: ProjectView) => (p.words.includes("DEPLOYED") ? 0 : p.words.includes("PREVIEWABLE") ? 1 : p.words.includes("REGISTERED") ? 2 : 3);
     return rank(x) - rank(y) || x.name.localeCompare(y.name);
   });

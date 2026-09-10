@@ -47,6 +47,31 @@ export const REGISTRY: readonly ServiceEntry[] = [
     status: "SHIPPED",
     detect: { service: "moly-backend", repo: "moly-backend" },
   },
+  // ── Demo services shown in Nebula before/while their repos live in the org.
+  // PLANNED: visible on Projects/Environments with a kind, never offered by
+  // the spin-up wizard (PROVISIONABLE stays moly-backend only).
+  {
+    name: "twizz-sentinel",
+    kind: "backend",
+    repo: "twizz-app/twizz-sentinel",
+    ecrRepo: "twizz-sentinel",
+    sourceSecret: "preview/twizz-sentinel",
+    valuesFile: GITOPS_VALUES("twizz-sentinel"),
+    status: "PLANNED",
+    detect: { service: "twizz-sentinel", repo: "twizz-sentinel" },
+  },
+  {
+    // External to the org "while the concept is proven" (twizz-gitops
+    // bootstrap/twizz-support-repo-externalsecret.yaml); move to twizz-app later.
+    name: "twizz-support",
+    kind: "backend",
+    repo: "xenosnikos/twizz-support",
+    ecrRepo: "twizz-support",
+    sourceSecret: "preview/twizz-support",
+    valuesFile: GITOPS_VALUES("twizz-support"),
+    status: "PLANNED",
+    detect: { service: "twizz-support", repo: "twizz-support" },
+  },
   // ── Frontends: verified via the GitHub API 2026-09-09 (docs/NEBULA.md §N3.3).
   // PLANNED until chunk 3 (build-on-provision) lands; listed so the wizard
   // and the Projects page can say so honestly instead of hiding them.

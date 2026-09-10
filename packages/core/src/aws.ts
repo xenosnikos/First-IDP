@@ -8,7 +8,9 @@ import {
   CloudWatchLogsClient,
   StartQueryCommand,
   GetQueryResultsCommand,
+  StopQueryCommand,
 } from "@aws-sdk/client-cloudwatch-logs";
+import { buildLogsQuery, buildHistogramQuery, type InsightsStatus } from "./insights-query";
 import {
   EKSClient,
   DescribeClusterCommand,
@@ -40,6 +42,8 @@ export type LivePod = {
   memLimit?: number;
   nodeName?: string;
 };
+
+export type LogLine = { timestamp: string; message: string; podName: string; containerName: string };
 
 export type EksClusterInfo = {
   name: string;
@@ -111,92 +115,87 @@ export class AWSService {
 
   // ── CloudWatch Container Insights ──────────────
 
+  /** One Logs Insights round-trip: start, poll, and say honestly how it
+   * ended. Callers must not conflate `timeout`/`failed` with "no rows". */
+  private async runInsightsQuery(
+    logGroupName: string,
+    queryString: string,
+    startTime: number,
+    endTime: number,
+    opts: { attempts?: number; intervalMs?: number } = {},
+  ): Promise<{ status: InsightsStatus; rows: Array<(field: string) => string> }> {
+    const attempts = opts.attempts ?? 15;
+    const intervalMs = opts.intervalMs ?? 1500;
+    const started = await cwlClient.send(new StartQueryCommand({ logGroupName, startTime, endTime, queryString }));
+    if (!started.queryId) return { status: "failed", rows: [] };
+    for (let i = 0; i < attempts; i++) {
+      await new Promise((r) => setTimeout(r, intervalMs));
+      const results = await cwlClient.send(new GetQueryResultsCommand({ queryId: started.queryId }));
+      if (results.status === "Complete") {
+        const rows = (results.results ?? []).map((row) => (field: string) => row.find((f) => f.field === field)?.value ?? "");
+        return { status: "complete", rows };
+      }
+      if (results.status === "Failed" || results.status === "Cancelled") return { status: "failed", rows: [] };
+    }
+    try {
+      await cwlClient.send(new StopQueryCommand({ queryId: started.queryId }));
+    } catch {
+      /* best effort */
+    }
+    return { status: "timeout", rows: [] };
+  }
+
   async getLivePods(clusterName: string): Promise<LivePod[]> {
     const logGroup = `/aws/containerinsights/${clusterName}/performance`;
     const now = Math.floor(Date.now() / 1000);
-
-    const queryId = await cwlClient.send(new StartQueryCommand({
-      logGroupName: logGroup,
-      startTime: now - 300,
-      endTime: now,
-      queryString: `fields @timestamp, kubernetes.pod_name, kubernetes.namespace_name, kubernetes.container_name,
+    const { rows } = await this.runInsightsQuery(
+      logGroup,
+      `fields @timestamp, kubernetes.pod_name, kubernetes.namespace_name, kubernetes.container_name,
         pod_status, pod_number_of_container_restarts, pod_cpu_utilization, pod_memory_utilization,
         pod_memory_limit, NodeName
         | filter Type = "Pod"
         | sort @timestamp desc
         | dedup kubernetes.pod_name
         | limit 200`,
+      now - 300,
+      now,
+      { attempts: 10 },
+    );
+    return rows.map((get) => ({
+      podName: get("kubernetes.pod_name"),
+      namespace: get("kubernetes.namespace_name"),
+      containerName: get("kubernetes.container_name"),
+      status: get("pod_status") || "Unknown",
+      restarts: parseInt(get("pod_number_of_container_restarts") || "0", 10),
+      cpuUtil: parseFloat(get("pod_cpu_utilization")) || undefined,
+      memUtil: parseFloat(get("pod_memory_utilization")) || undefined,
+      memLimit: parseFloat(get("pod_memory_limit")) || undefined,
+      nodeName: get("NodeName") || undefined,
     }));
-
-    if (!queryId.queryId) return [];
-
-    // Poll for results
-    let attempts = 0;
-    while (attempts < 10) {
-      await new Promise((r) => setTimeout(r, 1500));
-      const results = await cwlClient.send(
-        new GetQueryResultsCommand({ queryId: queryId.queryId }),
-      );
-
-      if (results.status === "Complete") {
-        return (results.results ?? []).map((row) => {
-          const get = (field: string) => row.find((f) => f.field === field)?.value ?? "";
-          return {
-            podName: get("kubernetes.pod_name"),
-            namespace: get("kubernetes.namespace_name"),
-            containerName: get("kubernetes.container_name"),
-            status: get("pod_status") || "Unknown",
-            restarts: parseInt(get("pod_number_of_container_restarts") || "0", 10),
-            cpuUtil: parseFloat(get("pod_cpu_utilization")) || undefined,
-            memUtil: parseFloat(get("pod_memory_utilization")) || undefined,
-            memLimit: parseFloat(get("pod_memory_limit")) || undefined,
-            nodeName: get("NodeName") || undefined,
-          };
-        });
-      }
-      attempts++;
-    }
-    return [];
   }
 
   async getNodeMetrics(clusterName: string): Promise<Array<{ name: string; cpu: number; mem: number; pods: number }>> {
     const logGroup = `/aws/containerinsights/${clusterName}/performance`;
     const now = Math.floor(Date.now() / 1000);
-
-    const queryId = await cwlClient.send(new StartQueryCommand({
-      logGroupName: logGroup,
-      startTime: now - 300,
-      endTime: now,
-      queryString: `fields @timestamp, NodeName, node_cpu_utilization, node_memory_utilization, node_number_of_running_pods
+    const { rows } = await this.runInsightsQuery(
+      logGroup,
+      `fields @timestamp, NodeName, node_cpu_utilization, node_memory_utilization, node_number_of_running_pods
         | filter Type = "Node"
         | sort @timestamp desc
         | dedup NodeName
         | limit 20`,
+      now - 300,
+      now,
+      { attempts: 10 },
+    );
+    return rows.map((get) => ({
+      name: get("NodeName"),
+      cpu: parseFloat(get("node_cpu_utilization")) || 0,
+      mem: parseFloat(get("node_memory_utilization")) || 0,
+      pods: parseInt(get("node_number_of_running_pods") || "0", 10),
     }));
-
-    if (!queryId.queryId) return [];
-
-    let attempts = 0;
-    while (attempts < 10) {
-      await new Promise((r) => setTimeout(r, 1500));
-      const results = await cwlClient.send(
-        new GetQueryResultsCommand({ queryId: queryId.queryId }),
-      );
-      if (results.status === "Complete") {
-        return (results.results ?? []).map((row) => {
-          const get = (field: string) => row.find((f) => f.field === field)?.value ?? "";
-          return {
-            name: get("NodeName"),
-            cpu: parseFloat(get("node_cpu_utilization")) || 0,
-            mem: parseFloat(get("node_memory_utilization")) || 0,
-            pods: parseInt(get("node_number_of_running_pods") || "0", 10),
-          };
-        });
-      }
-      attempts++;
-    }
-    return [];
   }
+
 
   // ── EKS Cluster Info ───────────────────────────
 
@@ -236,6 +235,9 @@ export class AWSService {
 
   // ── Application Logs (Fluent-bit -> CloudWatch) ──
 
+  /** Newest `limit` lines in the window, returned chronologically, plus how
+   * the query ended. `filterPattern` is a regex matched against the log text
+   * and the pod name. Times are epoch SECONDS. */
   async getPodLogs(params: {
     clusterName: string;
     namespace: string;
@@ -245,60 +247,43 @@ export class AWSService {
     endTime: number;
     filterPattern?: string;
     limit?: number;
-  }): Promise<Array<{ timestamp: string; message: string; podName: string; containerName: string }>> {
+  }): Promise<{ status: InsightsStatus; lines: LogLine[] }> {
     const logGroup = `/aws/containerinsights/${params.clusterName}/application`;
-    const limit = params.limit ?? 500;
+    const query = buildLogsQuery({
+      namespace: params.namespace,
+      podName: params.podName,
+      containerName: params.containerName,
+      filter: params.filterPattern,
+      limit: params.limit ?? 500,
+    });
+    const { status, rows } = await this.runInsightsQuery(logGroup, query, params.startTime, params.endTime);
+    const lines = rows
+      .map((get) => ({
+        timestamp: get("@timestamp"),
+        message: get("log"),
+        podName: get("kubernetes.pod_name"),
+        containerName: get("kubernetes.container_name"),
+      }))
+      .reverse(); // query sorts desc for the limit; display chronologically
+    return { status, lines };
+  }
 
-    let query = `fields @timestamp, log, kubernetes.pod_name, kubernetes.container_name
-      | filter kubernetes.namespace_name = "${params.namespace}"`;
-
-    if (params.podName) {
-      query += `\n| filter kubernetes.pod_name like "${params.podName}"`;
-    }
-    if (params.containerName) {
-      query += `\n| filter kubernetes.container_name = "${params.containerName}"`;
-    }
-    if (params.filterPattern) {
-      // Escape quotes in the filter pattern
-      const escaped = params.filterPattern.replace(/"/g, '\\"');
-      query += `\n| filter log like /${escaped}/`;
-    }
-    query += `\n| sort @timestamp desc\n| limit ${limit}`;
-
-    const queryId = await cwlClient.send(new StartQueryCommand({
-      logGroupName: logGroup,
-      startTime: params.startTime,
-      endTime: params.endTime,
-      queryString: query,
-    }));
-
-    if (!queryId.queryId) return [];
-
-    let attempts = 0;
-    while (attempts < 15) {
-      await new Promise((r) => setTimeout(r, 1500));
-      const results = await cwlClient.send(
-        new GetQueryResultsCommand({ queryId: queryId.queryId }),
-      );
-
-      if (results.status === "Complete") {
-        return (results.results ?? []).map((row) => {
-          const get = (field: string) => row.find((f) => f.field === field)?.value ?? "";
-          return {
-            timestamp: get("@timestamp"),
-            message: get("log"),
-            podName: get("kubernetes.pod_name"),
-            containerName: get("kubernetes.container_name"),
-          };
-        }).reverse(); // Chronological order (query sorts desc for limit, reverse for display)
-      }
-
-      if (results.status === "Failed" || results.status === "Cancelled") {
-        return [];
-      }
-      attempts++;
-    }
-    return [];
+  /** Line counts per time bin for the same scope as getPodLogs. */
+  async getLogHistogram(params: {
+    clusterName: string;
+    namespace: string;
+    podName?: string;
+    filterPattern?: string;
+    startTime: number;
+    endTime: number;
+    binMinutes?: number;
+  }): Promise<{ status: InsightsStatus; binMinutes: number; bins: Array<{ t: string; n: number }> }> {
+    const logGroup = `/aws/containerinsights/${params.clusterName}/application`;
+    const binMinutes = params.binMinutes ?? 15;
+    const query = buildHistogramQuery({ namespace: params.namespace, podName: params.podName, filter: params.filterPattern, binMinutes });
+    const { status, rows } = await this.runInsightsQuery(logGroup, query, params.startTime, params.endTime);
+    const bins = rows.map((get) => ({ t: get("t"), n: parseInt(get("n") || "0", 10) }));
+    return { status, binMinutes, bins };
   }
 }
 

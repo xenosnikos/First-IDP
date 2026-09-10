@@ -14,7 +14,7 @@ const nextConfig: NextConfig = {
     "/api/trpc/[trpc]": ["../mcp/policy.yaml"],
     "/environments": ["../mcp/policy.yaml"],
   },
-  transpilePackages: ["@twizz-idp/db", "@twizz-idp/shared", "@twizz-idp/actions", "@twizz-idp/core"],
+  transpilePackages: ["@twizz-idp/db", "@twizz-idp/shared", "@twizz-idp/actions", "@twizz-idp/core", "@twizz-idp/observer"],
   // Node-only client with dynamic requires; keep it out of the webpack bundle.
   serverExternalPackages: ["@kubernetes/client-node"],
 };

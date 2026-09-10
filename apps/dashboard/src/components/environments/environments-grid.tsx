@@ -19,7 +19,7 @@ const ORIGINS: Origin[] = ["NAMED", "PR PREVIEW", "GITOPS APP"];
 const ORIGIN_BLURB: Record<Origin, string> = {
   NAMED: "Provisioned by Nebula from twizz-gitops/named-envs — the only kind with actions.",
   "PR PREVIEW": "Created by an Argo CD ApplicationSet from a PR carrying the `preview` label; lives and dies with the label.",
-  "GITOPS APP": "A standing Application in twizz-gitops (support workbench, shared singletons). Read-only here.",
+  "GITOPS APP": "A standing Application in twizz-gitops (the support workbench, external to the org while the concept is proven). Read-only here.",
 };
 
 // Environments = what is running on non-prod (docs/NEBULA.md §N3.4): every

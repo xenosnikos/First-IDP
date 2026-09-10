@@ -1,6 +1,6 @@
 # TWIZZ-IDP - Project State
 
-Last updated: 2026-09-08
+Last updated: 2026-09-09
 
 ## Architecture stance (decided 2026-08-11)
 
@@ -286,6 +286,62 @@ First-IDP (pre-existing, unrelated to images) — triage.
 GitHub login to `NEBULA_OPERATORS`/`ALLOWED_GITHUB_LOGINS` in `preview/nebula`; Postgres PVC
 has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not in the blob
 (introspection rows degrade gracefully); external check from a NetBird device pending.
+
+## 2026-09-09 — Sign-in fixed; N3 (1/2) shipped: Clusters, Environments=all of non-prod, Projects auto, registry, multi-origin CORS
+
+- **Sign-in:** Nebula uses the **GitHub App `twizz-nebula`** (App ID 4849677, client
+  `Iv23liulodACgG6rqlKr`; secret in `preview/nebula`; App private key stored as
+  `preview/github-app` for future app-auth tokens). GitHub App callbacks carry
+  `iss=https://github.com/login/oauth` → `@auth/core` 0.37 needed
+  `issuer: "https://github.com/login/oauth"` on the provider (`dab20f0`). Operators:
+  `xenosnikos,TwizzyNicky,igormoly`. `scripts/update-nebula-oauth.sh` (file or prompt input).
+- **N3 decisions:** frontends **build on provision** (workflow_dispatch → ECR, never on
+  push); staging/QA + prod are **observe-only** (structural: dashboard IAM = CloudWatch/EKS
+  read, no kube path). Shipped (`af25cc5`, gitops `c533f81`): `/clusters` (3 clusters, pods +
+  aggregated Container Insights logs), `/environments` = every Argo app on non-prod with origin
+  pill NAMED / PR PREVIEW / GITOPS APP (actions on NAMED only), `/projects` = twizz-app org ∪
+  gitops-deployed repos (catches `xenosnikos/twizz-support`), TS service registry
+  (`packages/actions/src/registry.ts`: moly-backend SHIPPED; frontend/business/moly_admin/
+  twizz-admin PLANNED with verified frameworks + API env vars), manifest v2
+  (`kind`, `frontendOrigins[]`, v1 compat), chart/appset multi-origin CORS. Design: NEBULA.md §N3.
+- **Next (N3 2/2): frontend envs** — `nebula-build.yml` PRs into the 4 frontend repos, per-FE
+  ECR repos, chart `serve: static|next-standalone|node-server`, `trigger_build` + watcher,
+  attach-to-backend. Note moly_admin is Next 9 (no standalone) → node-server mode.
+- **shared-* Degraded root cause:** `alertservice:dev` + `molyffmpeg:dev` **don't exist in ECR**
+  (only latest/prod) → ImagePullBackOff; `lolygram-discovery:dev` crash-loops — needs
+  `AWS_REGION`/`AWS_SECRET_NAME` + a `preview/lolygram-discovery` blob + boot keys (same stock-
+  image pattern as Moly). USER DECISION: which tags/blobs for the Moly siblings.
+- Gotcha: gitops remote can advance under you (Nick's twizz-support commits) → fetch+inspect+
+  rebase before push. Box network flakes: EKS API "no route to host" / pulumi chart-index
+  timeouts — retry.
+
+## 2026-09-10 — Observer phase 1, Clusters/logs tweaks, org-confined Projects/Environments
+
+- **Access:** `rohitagrohia` added to `ALLOWED_GITHUB_LOGINS` (SM `preview/nebula`, new
+  `scripts/nebula-allow-login.sh`; `update-nebula-oauth.sh` still hardcodes the old list — use
+  the new script). Prod `jobs/email-service` logs verified readable from the dashboard path.
+- **Core:** `getPodLogs` → `{status: complete|timeout|failed, lines}` (one `runInsightsQuery`
+  poll helper), `getLogHistogram` (`stats count(*) by bin`), `insights-query.ts` builders with
+  real escaping (`"`, `\`, `/`); filter regex matches log text **or** pod name. MCP
+  `service_logs` ms→seconds bug fixed. Core now has vitest.
+- **Clusters page:** split into `clusters-view` / `logs-panel` / `log-histogram` /
+  `observer-panel`; URL state `?c=&ns=&pod=&w=&q=&err=`; pod picker grouped by deployment
+  ("all replicas of X"); level word + colour per line (ANSI stripped, continuation lines
+  inherit); errors-only; load older (cursor `to = oldest`, dedup `ts|pod|msg`); histogram;
+  timeout shown as `UNKNOWN · timed out`.
+- **`packages/observer` (new):** pure `./logs` (ansi, level, signature, redact, normalize,
+  compact/LogGroup/embedText), scope-locked tools, frozen prompt, `runObserver` over the SDK
+  tool runner (streaming), `MemoryBudget`/`budgetVerdict`; 29 tests. Dashboard: `POST
+  /api/observer` (SSE), `observer.status`, AuditLog as the run ledger (`nebula.observer.<kind>`).
+  Design: NEBULA.md §N3.6.
+- **Org confinement:** `shared-*` (namespace `shared`) hidden via `isPlatformApp`; Projects
+  filtered to `twizz-app/*` ∪ `PROJECT_EXCEPTIONS` (`xenosnikos/twizz-support`); registry gains
+  `twizz-sentinel` + `twizz-support` (`PLANNED`, not provisionable).
+- **Open:** put `ANTHROPIC_API_KEY` in `preview/nebula` (`scripts/nebula-set-observer-key.sh`)
+  and restart the dashboard; build + roll the image (GHA `build-images.yml` → gitops tag);
+  confirm the nebula ingress read timeout ≥ SSE ping (15 s). **Next plan:** spin up a preview
+  from any org repo/branch with config set in the dashboard (Nebula dispatches
+  `nebula-build.yml` on the ref), AI-authored `twizz.yaml`/values + PR.
 
 ## Verification
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildAppViews, buildProjectViews, classifyApp, prLink, type LiveApp } from "@/server/nebula/classify";
+import { buildAppViews, buildProjectViews, classifyApp, isPlatformApp, isProjectRepo, prLink, type LiveApp } from "@/server/nebula/classify";
 import { podWord } from "@/lib/nebula/status";
 
 const GITOPS = "https://github.com/TwizzyNicky/twizz-gitops";
@@ -13,6 +13,9 @@ const LIVE: LiveApp[] = [
   app({ name: "twizz-admin-pr-139", namespace: "pr-twizz-admin-139", labels: { "twizz-idp/repo": "twizz-admin", "twizz-idp/pr": "139" }, ownerKind: "ApplicationSet", ownerName: "twizz-admin-preview" }),
   app({ name: "shared-ffmpeg-service", namespace: "shared", health: "Degraded" }),
   app({ name: "twizz-support", namespace: "twizz-support", project: "twizz-support", sourceRepoUrls: ["git@github.com:xenosnikos/twizz-support.git"] }),
+  app({ name: "shared-lolygram-discovery", namespace: "shared", health: "Degraded" }),
+  app({ name: "shared-alertservice", namespace: "shared", health: "Degraded" }),
+  app({ name: "some-external-thing", namespace: "ext", sourceRepoUrls: ["https://github.com/someone-else/random.git"] }),
 ];
 const APPSETS = [{ name: "twizz-admin-preview", prOwner: "twizz-app", prRepo: "twizz-admin" }, { name: "moly-backend-preview", prOwner: "twizz-app", prRepo: "Moly-backend" }, { name: "named-envs" }];
 
@@ -36,11 +39,18 @@ describe("buildAppViews", () => {
     [{ namespace: "env-smoke", name: "moly-backend", images: ["…/molybackend:build-75b9"], ready: 1, desired: 1 }, { namespace: "shared", name: "ffmpeg-service", images: ["…/molyffmpeg:dev"], ready: 0, desired: 1 }],
     APPSETS,
   );
-  it("hides root/nebula and joins hosts + images by namespace", () => {
-    expect(views.map((v) => v.name)).toEqual(["shared-ffmpeg-service", "twizz-support", "env-smoke", "twizz-admin-pr-139"]);
+  it("hides root/nebula and the shared-* singletons; joins hosts + images by namespace", () => {
+    expect(views.map((v) => v.name)).toEqual(["some-external-thing", "twizz-support", "env-smoke", "twizz-admin-pr-139"]);
     expect(views.find((v) => v.name === "env-smoke")).toMatchObject({ origin: "NAMED", hosts: ["smoke.prv.twizz.com"], images: ["…/molybackend:build-75b9"], service: "moly-backend" });
-    expect(views.find((v) => v.name === "twizz-support")).toMatchObject({ origin: "GITOPS APP", hosts: ["support.prv.twizz.com"], sourceRepos: ["xenosnikos/twizz-support"], service: undefined });
-    expect(views.find((v) => v.name === "shared-ffmpeg-service")).toMatchObject({ health: "Degraded", images: ["…/molyffmpeg:dev"] });
+    expect(views.find((v) => v.name === "twizz-support")).toMatchObject({ origin: "GITOPS APP", hosts: ["support.prv.twizz.com"], sourceRepos: ["xenosnikos/twizz-support"], service: "twizz-support" });
+    expect(views.some((v) => v.name.startsWith("shared-"))).toBe(false);
+  });
+  it("isPlatformApp: root, nebula, shared-* by name or namespace", () => {
+    expect(isPlatformApp({ name: "root", namespace: "argocd" })).toBe(true);
+    expect(isPlatformApp({ name: "shared-alertservice", namespace: "shared" })).toBe(true);
+    expect(isPlatformApp({ name: "anything", namespace: "shared" })).toBe(true);
+    expect(isPlatformApp({ name: "sharedish-app", namespace: "x" })).toBe(false);
+    expect(isPlatformApp({ name: "env-smoke", namespace: "env-smoke" })).toBe(false);
   });
 });
 
@@ -53,9 +63,13 @@ describe("buildProjectViews", () => {
   ];
   const views = buildProjectViews(org, apps, APPSETS, [{ id: "p1", githubRepoUrl: "https://github.com/twizz-app/frontend" }]);
   const by = (slug: string) => views.find((v) => v.slug.toLowerCase() === slug.toLowerCase())!;
-  it("unions org repos, app-referenced repos (incl. outside the org) and registered rows", () => {
+  it("confines projects to the org plus the explicit demo exception", () => {
     expect(views.map((v) => v.slug)).toContain("xenosnikos/twizz-support");
     expect(by("xenosnikos/twizz-support").words).toEqual(["DEPLOYED"]);
+    expect(by("xenosnikos/twizz-support").registry).toEqual({ name: "twizz-support", kind: "backend", status: "PLANNED" });
+    expect(views.some((v) => v.slug === "someone-else/random")).toBe(false);
+    expect(isProjectRepo("Twizz-App/anything", "twizz-app")).toBe(true);
+    expect(isProjectRepo("xenosnikos/other", "twizz-app")).toBe(false);
     expect(by("twizz-app/Moly-backend").words).toEqual(["DEPLOYED", "PREVIEWABLE"]);
     expect(by("twizz-app/Moly-backend").apps).toEqual(["env-smoke"]);
     expect(by("twizz-app/twizz-admin").words).toEqual(["DEPLOYED", "PREVIEWABLE"]);

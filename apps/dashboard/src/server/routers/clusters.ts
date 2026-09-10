@@ -1,6 +1,6 @@
 import { z } from "zod";
 import { router, protectedProcedure } from "../trpc";
-import { awsService } from "@twizz-idp/core";
+import { awsService, LOG_NAME_RE } from "@twizz-idp/core";
 import { podWord } from "@/lib/nebula/status";
 
 // Clusters page (docs/NEBULA.md §N3.4). QUERIES ONLY, by construction: this
@@ -16,6 +16,28 @@ export const CLUSTERS = [
 ] as const;
 export type ClusterName = (typeof CLUSTERS)[number]["name"];
 const clusterName = z.enum(CLUSTERS.map((c) => c.name) as [ClusterName, ...ClusterName[]]);
+
+const k8sName = (max: number) => z.string().min(1).max(max).regex(LOG_NAME_RE, "kubernetes name");
+const logsInput = z.object({
+  cluster: clusterName,
+  namespace: k8sName(63),
+  podName: k8sName(253).optional(),
+  minutesBack: z.number().int().min(5).max(1440).default(30),
+  from: z.string().datetime().optional(),
+  to: z.string().datetime().optional(),
+  filter: z.string().max(200).optional(),
+});
+
+/** Explicit `from`/`to` win; otherwise the trailing `minutesBack`. Windows are
+ * capped at 24 h (Container Insights retention here is one day anyway). */
+function windowOf(i: { minutesBack: number; from?: string; to?: string }): { start: number; end: number } {
+  const now = Date.now();
+  let end = i.to ? Math.min(Date.parse(i.to), now) : now;
+  let start = i.from ? Date.parse(i.from) : end - i.minutesBack * 60_000;
+  if (!(end > start)) end = start + 60_000;
+  if (end - start > 24 * 3600_000) start = end - 24 * 3600_000;
+  return { start, end };
+}
 
 export const clustersRouter = router({
   /** All three clusters, pods grouped by namespace. A cluster that cannot be
@@ -47,22 +69,14 @@ export const clustersRouter = router({
   }),
 
   /** Aggregated Container Insights application logs for one namespace
-   * (optionally one pod) over a window, newest last. */
+   * (optionally one pod) over a window, newest last. `from`/`to` (ISO) win
+   * over `minutesBack` so the client can page older with `to = oldest`.
+   * `status` says how the query ended — a timeout is not "no logs". */
   logs: protectedProcedure
-    .input(
-      z.object({
-        cluster: clusterName,
-        namespace: z.string().min(1).max(63),
-        podName: z.string().max(253).optional(),
-        minutesBack: z.number().int().min(5).max(1440).default(30),
-        filter: z.string().max(200).optional(),
-        limit: z.number().int().min(50).max(1000).default(300),
-      }),
-    )
+    .input(logsInput.extend({ limit: z.number().int().min(50).max(1000).default(300) }))
     .query(async ({ input }) => {
-      const end = Date.now();
-      const start = end - input.minutesBack * 60_000;
-      const lines = await awsService.getPodLogs({
+      const { start, end } = windowOf(input);
+      const { status, lines } = await awsService.getPodLogs({
         clusterName: input.cluster,
         namespace: input.namespace,
         podName: input.podName || undefined,
@@ -71,6 +85,32 @@ export const clustersRouter = router({
         filterPattern: input.filter || undefined,
         limit: input.limit,
       });
-      return { cluster: input.cluster, namespace: input.namespace, from: new Date(start).toISOString(), to: new Date(end).toISOString(), count: lines.length, lines };
+      return {
+        cluster: input.cluster,
+        namespace: input.namespace,
+        from: new Date(start).toISOString(),
+        to: new Date(end).toISOString(),
+        status,
+        count: lines.length,
+        oldest: lines[0]?.timestamp ?? null,
+        lines,
+      };
+    }),
+
+  /** Line counts per bin over the same scope — the burst finder. */
+  logHistogram: protectedProcedure
+    .input(logsInput.extend({ binMinutes: z.union([z.literal(5), z.literal(15), z.literal(60)]).default(15) }))
+    .query(async ({ input }) => {
+      const { start, end } = windowOf(input);
+      const { status, bins, binMinutes } = await awsService.getLogHistogram({
+        clusterName: input.cluster,
+        namespace: input.namespace,
+        podName: input.podName || undefined,
+        filterPattern: input.filter || undefined,
+        startTime: Math.floor(start / 1000),
+        endTime: Math.floor(end / 1000),
+        binMinutes: input.binMinutes,
+      });
+      return { status, binMinutes, from: new Date(start).toISOString(), to: new Date(end).toISOString(), bins };
     }),
 });

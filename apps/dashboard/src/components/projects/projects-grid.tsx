@@ -27,7 +27,7 @@ export function ProjectsGrid() {
 
   return (
     <div style={{ padding: 28, maxWidth: 1400 }}>
-      <PageHeader title="Projects" kicker={`repos & what the platform knows about them · ${q.data?.org ?? "twizz-app"} ∪ cluster-referenced ∪ registered`} />
+      <PageHeader title="Projects" kicker={`repos in ${q.data?.org ?? "twizz-app"} & what the platform knows about them · plus support, external while the concept is proven`} />
 
       <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap", marginBottom: 18, fontSize: 11, color: "var(--n-ink-muted)" }}>
         <span>{q.isLoading ? "reading GitHub + cluster…" : `${q.data?.projects.length ?? 0} repos`}</span>

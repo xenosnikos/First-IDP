@@ -24,12 +24,15 @@ describe("registry", () => {
     expect(SERVICE_NAMES).toEqual(["moly-backend"]);
     expect(SERVICES["moly-backend"]).toEqual({ ecrRepo: "molybackend", sourceSecret: "preview/moly-backend" });
     expect(getService("business")?.status).toBe("PLANNED");
+    expect(getService("twizz-sentinel")?.status).toBe("PLANNED");
+    expect(getService("twizz-support")?.status).toBe("PLANNED");
   });
   it("maps live Argo apps back to entries by label, then by source repo", () => {
     expect(serviceForApp({ "twizz-idp/service": "moly-backend" })?.name).toBe("moly-backend");
     expect(serviceForApp({ "twizz-idp/repo": "twizz-admin", "twizz-idp/pr": "139" })?.name).toBe("twizz-admin");
     expect(serviceForApp({}, ["https://github.com/twizz-app/Moly-backend.git"])?.name).toBe("moly-backend");
-    expect(serviceForApp({}, ["git@github.com:xenosnikos/twizz-support.git"])).toBeUndefined();
+    expect(serviceForApp({}, ["git@github.com:xenosnikos/twizz-support.git"])?.name).toBe("twizz-support");
+    expect(serviceForApp({}, ["https://github.com/someone-else/random.git"])).toBeUndefined();
   });
   it("repoSlug handles https and ssh forms", () => {
     expect(repoSlug("https://github.com/TwizzyNicky/twizz-gitops")).toBe("TwizzyNicky/twizz-gitops");

@@ -9,7 +9,7 @@ export type AppView = inferRouterOutputs<AppRouter>["nebula"]["listEnvironments"
 
 // A read-only card for everything on non-prod that Nebula did not provision:
 // PR previews (ApplicationSet PR generator) and standing gitops apps
-// (twizz-support, shared-*). Same plate, same words, no actions — and no
+// (twizz-support; the shared-* singletons are hidden as platform infra). Same plate, same words, no actions — and no
 // isolation caveat: that claim is only made for NAMED envs.
 export function AppCard({ app }: { app: AppView }) {
   const shortImages = app.images.map((i) => i.replace(/^.*\/([^/]+)$/, "$1"));
