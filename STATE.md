@@ -375,9 +375,24 @@ has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not
   (nonprod Atlas host); IAM edits in `infra/src/iam.ts` (EcrEnsureRepo on the GHA role,
   dashboard `preview/*/*` writes + ECR describe on `*`, reaper ECR describe) — `pulumi up`
   running/applied (check `scratchpad/pulumi-up.log` / `pulumi stack`).
-- **Next:** push twizz-idp → images; bump reaper tag in gitops + push gitops (appset/chart/
-  watcher); verify: dispatch `nebula-build.yml` by hand for twizz-sentinel@main, hand-drop a
-  pending manifest, watch promotion; then Phase B (dashboard flow + Configurator).
+- **VERIFIED 2026-09-11 (Phase A end to end):** twizz-idp `08db515` pushed (images built);
+  gitops `a4b7106` (appset/chart/watcher, reaper image bumped) → Argo Synced. Dispatched
+  `nebula-build.yml` by hand for `twizz-sentinel@86ab429` → ECR repo `twizz-sentinel`
+  auto-created, tag `nb-sentinel-smoke-86ab429fd1d3` pushed (run 34593849870, correlated by
+  display_title). Hand-dropped `named-envs/pending/sentinel-smoke.yaml` + `apps/twizz-sentinel/
+  envs/sentinel-smoke.yaml` + SM `preview/twizz-sentinel/sentinel-smoke` → **build-watcher
+  PROMOTED in ≤1 min** (one commit) → `env-sentinel-smoke` Healthy: ExternalSecret
+  `preview/twizz-sentinel/sentinel-smoke` SecretSynced → pod env `PORT=8090 SENTINEL_ENV=…
+  NEBULA_CONFIG_REV=1 MONGO_URI db=nebula_sentinel-smoke`, probes on /health, ingress
+  `sentinel-smoke.prv.twizz.com`, app "listening on :8090". The env has a 24 h TTL but the
+  reaper is still `REAPER_DRY_RUN=true` — tear it down by hand or flip dry-run.
+- Builder hardening: skips the build when `<service>:<tag>` already exists (immutable tags).
+- Gotcha: the AWS JS SDK + Octokit timed out from this box (TLS handshake / TimeoutError)
+  while the CLI and `gh api` worked — network flake; retry, or use CLI for one-off ops.
+- **Next: Phase B** (dashboard flow) per the plan file: B1 GitHub reads/pagination, B2
+  `runAgentLoop` extraction + Configurator, B3 gated `createEnvFromRepo`/`rebuildFromRef`/
+  `setEnvVars` + owner-or-operator teardown, B4 "spin up from a repo" drawer, B5 cards +
+  Projects "spin up", B6 docs. Start it in a fresh session (this one is near its context limit).
 
 ## Verification
 
