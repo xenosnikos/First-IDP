@@ -196,6 +196,8 @@ export function createIamRoles(
             Action: ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret", "secretsmanager:DeleteSecret"],
             Resource: `arn:aws:secretsmanager:${region}:${acct}:secret:preview/*`,
           },
+          // build-watcher: verify the builder's tag landed before promoting
+          { Sid: "BuildImages", Effect: "Allow", Action: ["ecr:DescribeImages"], Resource: `arn:aws:ecr:${region}:${acct}:repository/*` },
         ],
       }),
     ),
@@ -233,13 +235,16 @@ export function createIamRoles(
               "secretsmanager:TagResource",
               "secretsmanager:DeleteSecret",
             ],
-            Resource: `arn:aws:secretsmanager:${region}:${acct}:secret:preview/moly-backend*`,
+            // per-env blobs only (preview/<service>/<name>); the shared source
+            // blobs (preview/moly-backend, preview/nebula, preview/github, …)
+            // stay read-only for the dashboard
+            Resource: [`arn:aws:secretsmanager:${region}:${acct}:secret:preview/moly-backend/*`, `arn:aws:secretsmanager:${region}:${acct}:secret:preview/*/*`],
           },
           {
             Sid: "ReleaseImages",
             Effect: "Allow",
             Action: ["ecr:DescribeImages"],
-            Resource: `arn:aws:ecr:${region}:${acct}:repository/molybackend`,
+            Resource: `arn:aws:ecr:${region}:${acct}:repository/*`,
           },
           // ── Clusters page (docs/NEBULA.md §N3.4): observe all three clusters
           // through CloudWatch Container Insights + EKS describe. READ ONLY —
@@ -423,6 +428,14 @@ export function createIamRoles(
               "ecr:BatchGetImage",
               "ecr:GetDownloadUrlForLayer",
             ],
+            Resource: `arn:aws:ecr:${region}:${acct}:repository/*`,
+          },
+          {
+            // nebula-build.yml creates <service> repos on first use
+            // (scan on push, immutable tags, lifecycle keep-last-30)
+            Sid: "EcrEnsureRepo",
+            Effect: "Allow",
+            Action: ["ecr:DescribeRepositories", "ecr:CreateRepository", "ecr:PutLifecyclePolicy", "ecr:PutImageScanningConfiguration", "ecr:TagResource"],
             Resource: `arn:aws:ecr:${region}:${acct}:repository/*`,
           },
         ],

@@ -1,0 +1,75 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`helpers > values generators are deterministic snapshots 1`] = `
+"# Written by Nebula for service "twizz-sentinel" (build-on-provision). Per-env values live in envs/<name>.yaml; the ApplicationSet sets image.tag, ingress.host and externalSecret.remoteRef.
+
+nameOverride: twizz-sentinel
+fullnameOverride: twizz-sentinel
+image:
+  repository: 848281935985.dkr.ecr.eu-west-1.amazonaws.com/twizz-sentinel
+  tag: set-by-nebula
+  pullPolicy: IfNotPresent
+replicaCount: 1
+service:
+  type: ClusterIP
+  port: 8080
+ingress:
+  enabled: true
+  className: nginx
+  host: ""
+  tls:
+    enabled: false
+  annotations:
+    nginx.ingress.kubernetes.io/proxy-body-size: 50m
+    nginx.ingress.kubernetes.io/proxy-read-timeout: "300"
+serviceAccount:
+  create: true
+  roleArn: arn:aws:iam::848281935985:role/twizz-nonprod-preview-pods
+externalSecret:
+  enabled: true
+  secretStore: aws-secrets-manager
+  remoteRef: set-by-nebula
+  refreshInterval: 1m
+resources:
+  requests:
+    cpu: 100m
+    memory: 256Mi
+  limits:
+    memory: 1Gi
+ttl: 168h
+namespace:
+  resourceQuota:
+    enabled: true
+    cpu: "2"
+    memory: 4Gi
+    pods: "10"
+  networkPolicy:
+    enabled: true
+"
+`;
+
+exports[`helpers > values generators are deterministic snapshots 2`] = `
+"# Written by Nebula for env "x" from that branch's twizz.yaml. Non-secret only; secrets come from preview/<service>/x.
+
+service:
+  port: 8090
+readinessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 10
+  periodSeconds: 10
+livenessProbe:
+  httpGet:
+    path: /health
+    port: http
+  initialDelaySeconds: 30
+  periodSeconds: 30
+env:
+  NODE_ENV: production
+  PORT: "8090"
+  HTTP_PORT: "8090"
+  A: "1"
+  B: "2"
+"
+`;

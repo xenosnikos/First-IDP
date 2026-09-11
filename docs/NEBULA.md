@@ -471,3 +471,55 @@ cosine first, pgvector later, and a `similar_past_incidents` tool.
 auto-populate (this round). 3. Frontend envs: `nebula-build.yml` template in
 `packages/onboard`, `trigger_build`, chart frontend mode, build-watcher,
 `attachTo` (next round).
+
+
+### N3.7 Build-on-provision: a preview from any org repo/branch (Phase A shipped 2026-09-10)
+
+The loop inside "confined to the org": pick a `twizz-app` repo at a commit,
+Nebula builds it and brings the env up. Decisions: a **central builder**
+(`.github/workflows/nebula-build.yml` in twizz-idp, `workflow_dispatch`,
+checks out `twizz-app/<repo>@<sha>` with `NEBULA_GH_TOKEN`, OIDC →
+`twizz-gha-ecr-push`, creates ECR repo `<service>` on first use, pushes
+`<service>:nb-<env>-<sha12>`; `run-name` carries env/service/sha so Nebula
+correlates the run); **self-service** through the human gate; the repo config
+is `twizz.yaml` v2 (`@twizz-idp/shared` zod schema; secrets are NAMES, build
+args public-prefix only, placeholders `${NEBULA_API_URL}` etc.).
+
+Platform mechanics (`packages/actions`):
+- **Manifest v3** (`source`, `build{status,expectedTag,runId,runUrl,reason}`,
+  `config{port,healthPath,rev,envVarNames,dockerfile,context,buildArgs}`,
+  `attachTo`, `db.mode none`, `kind worker`); `imageTag` optional while
+  building. **Building envs live in `named-envs/pending/`** — outside the
+  ApplicationSet's non-recursive glob, so `missingkey=error` never sees an
+  image-less file. `listNamedEnvs → {envs, pending, broken}` isolates a bad
+  file instead of breaking the page or the reaper.
+- `createEnvFromRepo`: secret `preview/<service>/<name>` (generic blob:
+  PORT/APP_URL/REDIS_*/TOKEN_SECRET, `MONGO_URI` from `preview/_defaults`
+  when `needs.mongo`, plus the human's env vars — SM only, never git) → ONE
+  Git-Data-API commit (`apps/<service>/values.yaml` once, `apps/<service>/envs/<name>.yaml`
+  from twizz.yaml, `named-envs/pending/<name>.yaml`, backend `frontendOrigins`
+  append on attach) → dispatch. `rebuildEnv`, `setEnvVars` (SM merge +
+  `config.rev++` → chart `checksum/config` rolls pods), `createBranch`,
+  `openConfigPr` (PR into the CHOSEN branch), `teardown` for both dirs.
+- **Secrets without app code**: the appset points `externalSecret.remoteRef`
+  at `preview/<service>/<name>` for every service except moly-backend (boot
+  keys), so each blob key becomes a pod env var via `envFrom`.
+- **build-watcher** (`apps/reaper/src/watch-builds.ts`, 1-min CronJob, same
+  image): attach run → wait → promote (one commit: delete pending + write
+  deployable with `imageTag`, PASS) or FAIL (run link, expiry shortened to
+  24 h). Reaper keeps in-flight builds < 2 h even when expired.
+- Policy: `create_env_from_repo` (`repo: twizz-app/*`), `open_config_pr`
+  (`branch: nebula/*`), `create_branch`, `set_env_vars`, `rebuild_env`. No
+  `trigger_build` tool — dispatch happens inside the actions. `global_deny
+  *prod*` rejects prod-shaped repos/refs (intended).
+- IAM: builder role can create ECR repos; dashboard writes only
+  `preview/*/*`; reaper reads ECR. `NEBULA_GH_TOKEN` (Actions secret on
+  First-IDP) = the platform token; `preview/_defaults` holds the nonprod
+  Atlas host.
+
+Phase B (next): the dashboard flow — paginated repo/branch pickers, branch
+creation, the **Configurator** agent (reuses the Observer harness; proposes
+`twizz.yaml` + Dockerfile via a terminal `propose_config` tool; the human
+edits the exact bytes; nonce binds `filesHash`; secret values travel only
+with the confirm and never reach fields/summary/audit), the "spin up from a
+repo" drawer, env cards with build words + rebuild, Projects "spin up".

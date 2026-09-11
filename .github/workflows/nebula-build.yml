@@ -1,0 +1,139 @@
+# Nebula's central builder (docs/NEBULA.md §N3.7). Builds ANY twizz-app repo at
+# a given commit and pushes <service>:nb-<envName>-<sha12> to ECR. Dispatched by
+# Nebula (workflow_dispatch on this repo); the run is correlated by run-name.
+# The image tag is deterministic — Nebula never reads outputs, the build-watcher
+# verifies the tag exists in ECR. Secrets never enter build args (twizz.yaml
+# allows public-prefix keys only; Nebula enforces it before dispatch).
+name: nebula-build
+run-name: "nebula-build ${{ inputs.envName }} ${{ inputs.service }} ${{ inputs.sha }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      repo:
+        description: "Repository name inside the twizz-app org"
+        required: true
+        type: string
+      ref:
+        description: "Branch the commit came from (informational)"
+        required: true
+        type: string
+      sha:
+        description: "Commit to build (40-hex)"
+        required: true
+        type: string
+      service:
+        description: "ECR repo / Helm release name"
+        required: true
+        type: string
+      envName:
+        description: "Nebula env name (DNS label)"
+        required: true
+        type: string
+      dockerfile:
+        description: "Dockerfile path relative to context"
+        required: false
+        default: Dockerfile
+        type: string
+      context:
+        description: "Build context directory"
+        required: false
+        default: "."
+        type: string
+      buildArgs:
+        description: "JSON object of public build args"
+        required: false
+        default: "{}"
+        type: string
+      target:
+        description: "Optional multi-stage target"
+        required: false
+        default: ""
+        type: string
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  ECR_REGISTRY: 848281935985.dkr.ecr.eu-west-1.amazonaws.com
+
+concurrency:
+  group: nebula-build-${{ inputs.envName }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Validate inputs
+        id: v
+        env:
+          REPO: ${{ inputs.repo }}
+          SHA: ${{ inputs.sha }}
+          SERVICE: ${{ inputs.service }}
+          ENV_NAME: ${{ inputs.envName }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.context }}
+          BUILD_ARGS: ${{ inputs.buildArgs }}
+        run: |
+          set -euo pipefail
+          [[ "$REPO" =~ ^[A-Za-z0-9_.-]+$ ]] || { echo "bad repo"; exit 1; }
+          [[ "$SHA" =~ ^[0-9a-f]{40}$ ]] || { echo "bad sha"; exit 1; }
+          [[ "$SERVICE" =~ ^[a-z][a-z0-9-]{1,39}$ ]] || { echo "bad service"; exit 1; }
+          [[ "$ENV_NAME" =~ ^[a-z][a-z0-9-]{2,23}$ ]] || { echo "bad envName"; exit 1; }
+          [[ "$DOCKERFILE" != *".."* && "$CONTEXT" != *".."* ]] || { echo "bad path"; exit 1; }
+          echo "$BUILD_ARGS" | jq -e 'type=="object" and (keys|all(test("^(REACT_APP_[A-Z0-9_]+|VITE_[A-Z0-9_]+|NEXT_PUBLIC_[A-Z0-9_]+|NODE_ENV|BUILD_[A-Z0-9_]+)$")))' >/dev/null || { echo "buildArgs must be a JSON object with public keys only"; exit 1; }
+          echo "tag=nb-${ENV_NAME}-${SHA:0:12}" >> "$GITHUB_OUTPUT"
+          echo "$BUILD_ARGS" | jq -r 'to_entries[] | "\(.key)=\(.value)"' > /tmp/build-args.txt
+          echo "args<<EOF" >> "$GITHUB_OUTPUT"; cat /tmp/build-args.txt >> "$GITHUB_OUTPUT"; echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout twizz-app/${{ inputs.repo }}@${{ inputs.sha }}
+        uses: actions/checkout@v4
+        with:
+          repository: twizz-app/${{ inputs.repo }}
+          ref: ${{ inputs.sha }}
+          token: ${{ secrets.NEBULA_GH_TOKEN }}
+          path: src
+          fetch-depth: 1
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::848281935985:role/twizz-gha-ecr-push
+          aws-region: eu-west-1
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Ensure ECR repository ${{ inputs.service }}
+        env:
+          SERVICE: ${{ inputs.service }}
+        run: |
+          set -euo pipefail
+          if ! aws ecr describe-repositories --repository-names "$SERVICE" >/dev/null 2>&1; then
+            aws ecr create-repository --repository-name "$SERVICE" \
+              --image-scanning-configuration scanOnPush=true \
+              --image-tag-mutability IMMUTABLE \
+              --tags Key=managed-by,Value=nebula >/dev/null
+            aws ecr put-lifecycle-policy --repository-name "$SERVICE" --lifecycle-policy-text '{"rules":[{"rulePriority":1,"description":"expire untagged after 7d","selection":{"tagStatus":"untagged","countType":"sinceImagePushed","countUnit":"days","countNumber":7},"action":{"type":"expire"}},{"rulePriority":2,"description":"keep last 30","selection":{"tagStatus":"any","countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}]}' >/dev/null
+            echo "created ECR repo $SERVICE"
+          fi
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Build and push ${{ inputs.service }}:${{ steps.v.outputs.tag }}
+        uses: docker/build-push-action@v6
+        with:
+          context: src/${{ inputs.context }}
+          file: src/${{ inputs.context }}/${{ inputs.dockerfile }}
+          target: ${{ inputs.target }}
+          push: true
+          tags: ${{ env.ECR_REGISTRY }}/${{ inputs.service }}:${{ steps.v.outputs.tag }}
+          build-args: ${{ steps.v.outputs.args }}
+          cache-from: type=gha,scope=${{ inputs.service }}
+          cache-to: type=gha,mode=max,scope=${{ inputs.service }}
+          provenance: false
+
+      - name: Summary
+        run: |
+          echo "pushed ${ECR_REGISTRY}/${{ inputs.service }}:${{ steps.v.outputs.tag }} (env ${{ inputs.envName }}, ${{ inputs.repo }}@${{ inputs.ref }})" >> "$GITHUB_STEP_SUMMARY"

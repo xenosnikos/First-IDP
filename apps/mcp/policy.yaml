@@ -51,3 +51,38 @@ write_tools:
     allow:
       name: ["*"]
       # ttlHours 1..336 enforced in code
+
+  # ── Build-on-provision envs (docs/NEBULA.md §N3.7): any twizz-app repo/ref ──
+  # Secret names, ECR repos and image tags are derived from repo/sha in code.
+  # global_deny *prod* also rejects repos/refs whose names contain "prod" (intended).
+  create_env_from_repo:
+    allow:
+      repo: ["twizz-app/*"]
+      kind: ["backend", "frontend", "worker"]
+      name: ["*"]
+      service: ["*"]
+      sha: ["*"]
+    deny:
+      name: ["*prod*", "*staging*", "shared", "dev", "nebula", "argocd"]
+      service: ["nebula", "argocd", "shared", "kube-*", "default"]
+
+  open_config_pr:
+    allow:
+      repo: ["twizz-app/*"]
+      base: ["*"]
+      branch: ["nebula/*"]
+
+  create_branch:
+    allow:
+      repo: ["twizz-app/*"]
+      name: ["*"]
+    deny:
+      name: ["main", "master", "*prod*", "*staging*"]
+
+  set_env_vars:
+    allow:
+      name: ["*"]
+
+  rebuild_env:
+    allow:
+      name: ["*"]

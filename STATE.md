@@ -352,6 +352,33 @@ has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not
 - **Next:** spin up a preview from any org repo/branch with config set in the dashboard
   (Nebula dispatches `nebula-build.yml` on the ref), AI-authored `twizz.yaml`/values + PR.
 
+## 2026-09-10 (evening) — Build-on-provision Phase A (platform) built
+
+- Plan: `/root/.claude/plans/i-want-to-tweak-bubbly-book.md` (Phase A = platform, Phase B = UI).
+  Design: NEBULA.md §N3.7. Decisions: central builder, self-service gate, config PR into the
+  chosen branch, `twizz.yaml` stays.
+- **Code (all tests green: actions 65, shared 6, reaper 14, dashboard 32, observer 29, core 8):**
+  manifest v3 + `named-envs/pending/`, `listNamedEnvs → {envs,pending,broken}`, `findEnv`,
+  `resolveService`, `nebulaTag`, `GithubGitops.commit` (Git Data API, atomic), `GithubBuilds`,
+  `SecretsManagerStore.putJson`; `packages/shared/twizz-yaml.ts` (v2 schema, `fromLegacy`,
+  `substituteBuildArgs`); `packages/actions/{twizz-yaml,values,env-from-repo}.ts`
+  (`createEnvFromRepo`, `rebuildEnv`, `setEnvVars`, `createBranch`, `openConfigPr`,
+  `configPrBody`); `.github/workflows/nebula-build.yml`; `apps/reaper/src/{builds,watch-builds}.ts`
+  + pending-aware expiry; policy entries + gate tests; consumers updated (nebula router now
+  returns `pending`/`broken`).
+- **Gitops (uncommitted until the image builds):** appset per-env `envs/<name>.yaml` +
+  `ignoreMissingValueFiles`, `externalSecret.remoteRef` conditional on service,
+  `redis.enabled` by kind, `env.NEBULA_CONFIG_REV`, `twizz-idp/source-ref` annotation; chart
+  `checksum/config` pod annotation; `build-watcher` CronJob (`command: tsx`, `args:
+  src/watch-builds.ts`).
+- **Infra/setup done:** `NEBULA_GH_TOKEN` Actions secret on First-IDP; SM `preview/_defaults`
+  (nonprod Atlas host); IAM edits in `infra/src/iam.ts` (EcrEnsureRepo on the GHA role,
+  dashboard `preview/*/*` writes + ECR describe on `*`, reaper ECR describe) — `pulumi up`
+  running/applied (check `scratchpad/pulumi-up.log` / `pulumi stack`).
+- **Next:** push twizz-idp → images; bump reaper tag in gitops + push gitops (appset/chart/
+  watcher); verify: dispatch `nebula-build.yml` by hand for twizz-sentinel@main, hand-drop a
+  pending manifest, watch promotion; then Phase B (dashboard flow + Configurator).
+
 ## Verification
 
 ```

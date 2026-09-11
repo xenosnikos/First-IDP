@@ -29,7 +29,7 @@ export function PreviewCard({
 }) {
   const [ttl, setTtl] = useState(168);
   const host = env.url.replace(/^https:\/\//, "");
-  const shortTag = env.imageTag.replace(/^build-/, "").slice(0, 8);
+  const shortTag = (env.imageTag ?? "building").replace(/^build-/, "").replace(/^nb-.*-([0-9a-f]{12})$/, "$1").slice(0, 12);
   const expiresLocal = new Date(env.expiresAt).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" });
 
   return (

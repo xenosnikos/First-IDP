@@ -39,12 +39,17 @@ export const nebulaRouter = router({
       readClusterSnapshot(),
     ]);
     const views = buildAppViews(snap.apps, snap.ingresses, snap.deployments, snap.appsets);
-    const named = Array.isArray(manifests) ? manifests : [];
+    const list = "error" in manifests ? { envs: [], pending: [], broken: [] } : manifests;
+    const named = list.envs;
     const namedByApp = new Map(named.map((m) => [`env-${m.name}`, m]));
     return {
       cluster: { name: "EKS-Twizz-NonProd", reachable: snap.reachable, reason: snap.reason },
-      gitopsError: Array.isArray(manifests) ? undefined : manifests.error,
+      gitopsError: "error" in manifests ? manifests.error : undefined,
       named: named.map((m) => namedView(m, views.find((v) => v.name === `env-${m.name}`), snap.reachable, now)),
+      // build-on-provision envs still building (or failed): no Argo app yet
+      pending: list.pending.map((m) => ({ ...m, url: `https://${m.name}.prv.twizz.com`, word: m.build?.status === "FAIL" ? ("FAIL" as const) : ("RUNNING" as const) })),
+      // manifests that did not parse — shown, never hidden
+      broken: list.broken,
       // live NAMED apps whose manifest is gone (being pruned) still show, read-only
       others: views.filter((v) => !(v.origin === "NAMED" && namedByApp.has(v.name))).map((v) => ({ ...v, ...argoWord({ sync: v.sync, health: v.health }) })),
     };

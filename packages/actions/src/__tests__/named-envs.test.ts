@@ -1,6 +1,10 @@
 import { describe, expect, it } from "vitest";
 import {
   ALIAS_TAGS,
+  IMAGE_TAG_RE,
+  envSecretName,
+  nebulaTag,
+  resolveService,
   normalizeOrigins,
   DEFAULT_MAX_NAMED_ENVS,
   deriveEnvSecret,
@@ -82,8 +86,9 @@ describe("manifest round-trip", () => {
     expect(parseManifest(v1)).toEqual({ ...m, frontendOrigins: ["https://smoke-frontend.prv.twizz.com"] });
     expect(parseManifest(manifestToYaml(m).replace(/frontendOrigins:[\s\S]*$/, "frontendOrigin: \"\"\n")).frontendOrigins).toEqual([]);
   });
-  it("rejects an unknown kind", () => {
-    expect(() => parseManifest(manifestToYaml(m).replace("kind: backend", "kind: worker"))).toThrow(/kind/);
+  it("rejects an unknown kind (worker is valid since v3)", () => {
+    expect(() => parseManifest(manifestToYaml(m).replace("kind: backend", "kind: sidecar"))).toThrow(/kind/);
+    expect(parseManifest(manifestToYaml(m).replace("kind: backend", "kind: worker")).kind).toBe("worker");
   });
   it("parses the hand-written smoke manifest shape (comments, unquoted values)", () => {
     const hand = `# comment
@@ -101,9 +106,61 @@ frontendOrigin: https://smoke-frontend.prv.twizz.com
   });
   it("rejects bad manifests loudly", () => {
     expect(() => parseManifest("name: Bad\nservice: moly-backend\n")).toThrow(/invalid name/);
-    expect(() => parseManifest(manifestToYaml(m).replace("moly-backend", "nope"))).toThrow(/unknown service/);
+    expect(() => parseManifest(manifestToYaml(m).replace("moly-backend", "Nope_Service"))).toThrow(/invalid service/);
     expect(() => parseManifest(manifestToYaml(m).replace("mode: clone", "mode: shared"))).toThrow(/db.mode/);
-    expect(() => parseManifest(manifestToYaml(m).replace("generation: 2", "generation: 0"))).toThrow(/generation/);
+    expect(() => parseManifest(manifestToYaml(m).replace("generation: 2", "generation: -1"))).toThrow(/generation/);
+    expect(() => parseManifest(manifestToYaml(m).replace(/imageTag: .*\n/, ""))).toThrow(/imageTag/);
+  });
+});
+
+describe("manifest v3 (build-on-provision)", () => {
+  const v3: NamedEnvManifest = {
+    name: "sentinel-nebula-test",
+    kind: "backend",
+    service: "twizz-sentinel",
+    owner: "rohitagrohia",
+    expiresAt: "2026-09-17T12:00:00.000Z",
+    db: { mode: "none", generation: 0 },
+    frontendOrigins: [],
+    source: { repo: "twizz-app/twizz-sentinel", ref: "nebula-test", sha: "a".repeat(40), prNumber: 12, prUrl: "https://github.com/twizz-app/twizz-sentinel/pull/12" },
+    build: { status: "PENDING", expectedTag: "nb-sentinel-nebula-test-aaaaaaaaaaaa", startedAt: "2026-09-10T12:00:00.000Z" },
+    config: { port: 8090, healthPath: "/health", rev: 1, envVarNames: ["LOG_LEVEL"] },
+  };
+  it("round-trips every v3 key, quotes timestamps, and tolerates a missing imageTag while pending", () => {
+    const y = manifestToYaml(v3);
+    expect(y).not.toContain("imageTag");
+    expect(y).toContain('startedAt: "2026-09-10T12:00:00.000Z"');
+    expect(y).toContain("prNumber: 12");
+    expect(parseManifest(y, { where: "pending" })).toEqual(v3);
+    expect(() => parseManifest(y)).toThrow(/imageTag/);
+  });
+  it("keeps v3 keys through a promote (imageTag + PASS) and drops nothing on re-serialisation", () => {
+    const promoted: NamedEnvManifest = { ...v3, imageTag: v3.build!.expectedTag, build: { ...v3.build!, status: "PASS", finishedAt: "2026-09-10T12:05:00.000Z", runId: 42, runUrl: "https://x/42" } };
+    const back = parseManifest(manifestToYaml(promoted));
+    expect(back).toEqual(promoted);
+    expect(manifestToYaml(back)).toBe(manifestToYaml(promoted));
+  });
+  it("ignores unknown keys and rejects a PASS without imageTag even in pending", () => {
+    const y = manifestToYaml(v3) + "somethingNew: 1\n";
+    expect(parseManifest(y, { where: "pending" }).name).toBe(v3.name);
+    const passed = manifestToYaml({ ...v3, build: { ...v3.build!, status: "PASS" } });
+    expect(() => parseManifest(passed, { where: "pending" })).toThrow(/imageTag/);
+  });
+  it("validates image tags for both schemes and derives the builder tag", () => {
+    expect(IMAGE_TAG_RE.test("nb-sentinel-nebula-test-aaaaaaaaaaaa")).toBe(true);
+    expect(IMAGE_TAG_RE.test(nebulaTag("biz-feat-x", "0123456789abcdef0123"))).toBe(true);
+    expect(IMAGE_TAG_RE.test("nb-x-latest")).toBe(false);
+    expect(IMAGE_TAG_RE.test("nb-1bad-aaaaaaaaaaaa")).toBe(false);
+    expect(isValidImageTag("nb-smoke-aaaaaaaaaaaa")).toBe(true);
+  });
+  it("resolves services: registry by repo (moly keeps its ECR + boot path), else the repo slug; reserved names refused", () => {
+    expect(resolveService("twizz-app/Moly-backend")).toMatchObject({ service: "moly-backend", ecrRepo: "molybackend", legacyBoot: true, kind: "backend" });
+    expect(resolveService("twizz-app/twizz-sentinel")).toMatchObject({ service: "twizz-sentinel", ecrRepo: "twizz-sentinel", legacyBoot: false });
+    expect(resolveService("twizz-app/Some_New.Repo")).toMatchObject({ service: "some-new-repo", ecrRepo: "some-new-repo" });
+    expect(() => resolveService("twizz-app/nebula")).toThrow(/reserved|valid/);
+    expect(() => resolveService("twizz-app/kube-proxy")).toThrow();
+    expect(envSecretName("twizz-sentinel", "x")).toBe("preview/twizz-sentinel/x");
+    expect(envSecretName("moly-backend", "x")).toBe("preview/moly-backend/x");
   });
 });
 

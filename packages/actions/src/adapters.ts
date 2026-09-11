@@ -3,10 +3,21 @@ import {
   SecretsManagerClient,
   GetSecretValueCommand,
   CreateSecretCommand,
+  PutSecretValueCommand,
   DeleteSecretCommand,
 } from "@aws-sdk/client-secrets-manager";
 import { ECRClient, DescribeImagesCommand, paginateDescribeImages } from "@aws-sdk/client-ecr";
-import { GITOPS, type GitopsRepo, type ImageInfo, type ImageRegistry, type SecretStore } from "./named-envs";
+import {
+  GITOPS,
+  type BuildDispatcher,
+  type BuildInputs,
+  type BuildRun,
+  type FileChange,
+  type GitopsRepo,
+  type ImageInfo,
+  type ImageRegistry,
+  type SecretStore,
+} from "./named-envs";
 
 /** GitHub Contents API over TwizzyNicky/twizz-gitops. Each put/delete is one
  * commit on `main` — Argo CD's git generator picks it up on its next poll. */
@@ -50,6 +61,93 @@ export class GithubGitops implements GitopsRepo {
       throw e;
     }
   }
+
+  /** Several files in ONE commit on `main` via the Git Data API, so a
+   * promotion (delete pending + create deployable) or a teardown (manifest +
+   * values) can never land half-done. One retry on a non-fast-forward. */
+  async commit(changes: FileChange[], message: string): Promise<string> {
+    if (changes.length === 0) throw new Error("commit: no changes");
+    const { owner, repo, branch } = this.repo;
+    const attempt = async (): Promise<string> => {
+      const { data: ref } = await this.gh.git.getRef({ owner, repo, ref: `heads/${branch}` });
+      const baseSha = ref.object.sha;
+      const tree = await Promise.all(
+        changes.map(async (c) => {
+          if (c.content === null) return { path: c.path, mode: "100644" as const, type: "blob" as const, sha: null };
+          const { data: blob } = await this.gh.git.createBlob({ owner, repo, content: c.content, encoding: "utf-8" });
+          return { path: c.path, mode: "100644" as const, type: "blob" as const, sha: blob.sha };
+        }),
+      );
+      const { data: newTree } = await this.gh.git.createTree({ owner, repo, base_tree: baseSha, tree });
+      const { data: commit } = await this.gh.git.createCommit({ owner, repo, message, tree: newTree.sha, parents: [baseSha] });
+      await this.gh.git.updateRef({ owner, repo, ref: `heads/${branch}`, sha: commit.sha });
+      return commit.sha;
+    };
+    try {
+      return await attempt();
+    } catch (e) {
+      if ((e as { status?: number }).status === 422) return attempt();
+      throw e;
+    }
+  }
+}
+
+/** The central builder: workflow_dispatch on twizz-idp's nebula-build.yml and
+ * run correlation by the workflow's `run-name` (display_title). */
+export class GithubBuilds implements BuildDispatcher {
+  constructor(
+    private readonly gh: Octokit,
+    private readonly wf = { owner: "xenosnikos", repo: "First-IDP", workflow: "nebula-build.yml", ref: "main" },
+  ) {}
+
+  displayTitle(i: Pick<BuildInputs, "envName" | "service" | "sha">): string {
+    return `nebula-build ${i.envName} ${i.service} ${i.sha}`;
+  }
+
+  async dispatch(inputs: BuildInputs): Promise<void> {
+    await this.gh.actions.createWorkflowDispatch({
+      owner: this.wf.owner,
+      repo: this.wf.repo,
+      workflow_id: this.wf.workflow,
+      ref: this.wf.ref,
+      inputs: {
+        repo: inputs.repo,
+        ref: inputs.ref,
+        sha: inputs.sha,
+        service: inputs.service,
+        envName: inputs.envName,
+        dockerfile: inputs.dockerfile,
+        context: inputs.context,
+        buildArgs: JSON.stringify(inputs.buildArgs),
+        target: inputs.target ?? "",
+      },
+    });
+  }
+
+  private toRun(r: { id: number; html_url: string; status: string | null; conclusion: string | null; created_at: string }): BuildRun {
+    const status = r.status === "completed" ? "completed" : r.status === "in_progress" ? "in_progress" : "queued";
+    return { id: r.id, url: r.html_url, status, conclusion: r.conclusion ?? undefined, createdAt: r.created_at };
+  }
+
+  async findRun(q: { displayTitle: string; createdAfter: Date }): Promise<BuildRun | null> {
+    const { data } = await this.gh.actions.listWorkflowRuns({
+      owner: this.wf.owner,
+      repo: this.wf.repo,
+      workflow_id: this.wf.workflow,
+      event: "workflow_dispatch",
+      created: `>=${q.createdAfter.toISOString()}`,
+      per_page: 50,
+    });
+    const match = data.workflow_runs
+      .filter((r) => (r.display_title ?? r.name) === q.displayTitle)
+      .sort((a, b) => b.run_number - a.run_number)[0];
+    return match ? this.toRun(match) : null;
+  }
+
+  async getRun(runId: number): Promise<BuildRun> {
+    const { data } = await this.gh.actions.getWorkflowRun({ owner: this.wf.owner, repo: this.wf.repo, run_id: runId });
+    return this.toRun(data);
+  }
 }
 
 export class SecretsManagerStore implements SecretStore {
@@ -69,6 +167,10 @@ export class SecretsManagerStore implements SecretStore {
         Tags: Object.entries(tags).map(([Key, Value]) => ({ Key, Value })),
       }),
     );
+  }
+
+  async putJson(name: string, value: Record<string, string>) {
+    await this.sm.send(new PutSecretValueCommand({ SecretId: name, SecretString: JSON.stringify(value) }));
   }
 
   async deleteNow(name: string) {

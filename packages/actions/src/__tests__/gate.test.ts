@@ -33,8 +33,22 @@ describe("policy.yaml — named-env tools", () => {
     expect(evaluatePolicy(policy, "extend_named_env", { name: "smoke", ttlHours: "24" })).toEqual(ok);
     expect(evaluatePolicy(policy, "teardown_named_env", { name: "prod-like" }).allowed).toBe(false);
   });
-  it("unknown tools are denied by default", () => {
+  it("unknown tools are denied by default (dispatch lives inside the actions, never as a tool)", () => {
     expect(evaluatePolicy(policy, "trigger_build", { repo: "twizz-app/x" }).allowed).toBe(false);
+  });
+  it("build-on-provision tools: org repos only, reserved names refused, prod-shaped refs caught globally", () => {
+    const f = { name: "biz-feat", repo: "twizz-app/business", ref: "feat/x", sha: "a".repeat(40), kind: "frontend", service: "business" };
+    expect(evaluatePolicy(policy, "create_env_from_repo", f)).toEqual(ok);
+    expect(evaluatePolicy(policy, "create_env_from_repo", { ...f, repo: "someone/business" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "create_env_from_repo", { ...f, service: "nebula" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "create_env_from_repo", { ...f, ref: "production" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "create_env_from_repo", { ...f, kind: "sidecar" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "open_config_pr", { repo: "twizz-app/business", base: "dev", branch: "nebula/biz-feat" })).toEqual(ok);
+    expect(evaluatePolicy(policy, "open_config_pr", { repo: "twizz-app/business", base: "dev", branch: "feat/x" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "create_branch", { repo: "twizz-app/business", name: "feat/x" })).toEqual(ok);
+    expect(evaluatePolicy(policy, "create_branch", { repo: "twizz-app/business", name: "main" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "rebuild_env", { name: "biz-feat" })).toEqual(ok);
+    expect(evaluatePolicy(policy, "set_env_vars", { name: "biz-feat" })).toEqual(ok);
   });
 });
 

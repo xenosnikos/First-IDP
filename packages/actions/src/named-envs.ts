@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import { Document as YamlDocument, parse as parseYaml, type Scalar } from "yaml";
-import { PROVISIONABLE } from "./registry";
+import { PROVISIONABLE, REGISTRY, type ServiceEntry } from "./registry";
 
 // ── Constants ─────────────────────────────────────────────────────────
 // Everything a caller can influence is validated against these; secret names
@@ -9,36 +9,66 @@ import { PROVISIONABLE } from "./registry";
 export const GITOPS = { owner: "TwizzyNicky", repo: "twizz-gitops", branch: "main", dir: "named-envs" } as const;
 export const PREVIEW_DOMAIN = "prv.twizz.com";
 
-export type ServiceName = "moly-backend";
-/** Provisionable backends, derived from the registry (registry.ts). Kept as a
- * map for the callers that resolve `ecrRepo` / `sourceSecret` by service. */
-export const SERVICES: Record<ServiceName, { ecrRepo: string; sourceSecret: string }> = Object.fromEntries(
+/** Any service name (a registry entry or a repo slug). Release-image
+ * provisioning (`create_named_env`) is still limited to `SERVICE_NAMES`. */
+export type ServiceName = string;
+/** Provisionable backends for the RELEASE-IMAGE path, derived from the
+ * registry (registry.ts): resolve `ecrRepo` / `sourceSecret` by service. */
+export const SERVICES: Record<string, { ecrRepo: string; sourceSecret: string }> = Object.fromEntries(
   PROVISIONABLE.map((s) => [s.name, { ecrRepo: s.ecrRepo, sourceSecret: s.sourceSecret! }]),
-) as Record<ServiceName, { ecrRepo: string; sourceSecret: string }>;
-export const SERVICE_NAMES = Object.keys(SERVICES) as ServiceName[];
+);
+export const SERVICE_NAMES = Object.keys(SERVICES);
 
 export const NAME_RE = /^[a-z][a-z0-9-]{2,23}$/;
-export const IMAGE_TAG_RE = /^build-[0-9a-f-]{36}$/;
+/** Service = ECR repo name = Helm release name; a repo slug or registry name. */
+export const SERVICE_RE = /^[a-z][a-z0-9-]{1,39}$/;
+/** Services that are platform plumbing and can never be a preview service. */
+export const RESERVED_SERVICES = /^(nebula|argocd|shared|kube-.*|default|redis|postgres)$/;
+/** `build-<uuid>` = CodeBuild release images (moly-backend); `nb-<env>-<sha12>`
+ * = images the central builder produced for one env from one commit. */
+export const IMAGE_TAG_RE = /^(build-[0-9a-f-]{36}|nb-[a-z][a-z0-9-]{2,23}-[0-9a-f]{12})$/;
+export const PENDING_DIR = "named-envs/pending";
 /** Floating tags CodeBuild re-points on every build — never a "release version". */
 export const ALIAS_TAGS = new Set(["latest", "prod", "dev", "staging"]);
 export const DEFAULT_MAX_NAMED_ENVS = 6;
 export const TTL_HOURS = { min: 1, max: 336, default: 168 } as const;
 
-export type DbMode = "isolated" | "clone";
-export type EnvKind = "backend" | "frontend";
+export type DbMode = "isolated" | "clone" | "none";
+export type EnvKind = "backend" | "frontend" | "worker";
+export type BuildStatus = "PENDING" | "RUNNING" | "PASS" | "FAIL";
 
-/** Manifest schema v2 (docs/NEBULA.md §N3.1). `frontendOrigin` (v1, single
- * string) is still accepted on read and mapped to a one-element list. */
+/** Manifest schema v3 (docs/NEBULA.md §N3.7). v1 `frontendOrigin` and v2 files
+ * are still accepted on read. A file under `named-envs/` must carry
+ * `imageTag` (the ApplicationSet renders it); a file under
+ * `named-envs/pending/` is being built (or failed) and may not. */
 export type NamedEnvManifest = {
   name: string;
   kind: EnvKind;
   service: ServiceName;
   owner: string;
-  imageTag: string;
+  /** Present ⇔ deployable. Absent while the central builder runs. */
+  imageTag?: string;
   expiresAt: string;
   db: { mode: DbMode; generation: number };
   /** Every browser origin the backend's ingress must accept (CORS). */
   frontendOrigins: string[];
+  /** Where the image came from (build-on-provision envs only). */
+  source?: { repo: string; ref: string; sha: string; prNumber?: number; prUrl?: string };
+  build?: {
+    status: BuildStatus;
+    /** Deterministic: nb-<name>-<sha12>; the watcher verifies it in ECR. */
+    expectedTag: string;
+    startedAt: string;
+    finishedAt?: string;
+    runId?: number;
+    runUrl?: string;
+    reason?: string;
+  };
+  /** Snapshot of twizz.yaml + dashboard config that shaped the env (public
+   * values only: build args are baked into the image anyway). */
+  config?: { port: number; healthPath: string; rev: number; envVarNames: string[]; dockerfile?: string; context?: string; buildArgs?: Record<string, string> };
+  /** Frontend envs: the NAMED backend env whose API they were built against. */
+  attachTo?: string;
 };
 
 export const ORIGIN_RE = /^https:\/\/[a-z0-9.-]+(:\d+)?$/i;
@@ -62,8 +92,32 @@ export function isValidImageTag(tag: string): boolean {
   return IMAGE_TAG_RE.test(tag) && !ALIAS_TAGS.has(tag);
 }
 
+/** `preview/<service>/<name>` for every service (for moly-backend this equals
+ * `<sourceSecret>/<name>`, so the release-image path is unchanged). */
 export function envSecretName(service: ServiceName, name: string): string {
-  return `${SERVICES[service].sourceSecret}/${name}`;
+  return `preview/${service}/${name}`;
+}
+
+export function isValidService(service: string): boolean {
+  return SERVICE_RE.test(service) && !RESERVED_SERVICES.test(service);
+}
+
+/** Image tag the central builder produces for one env from one commit. */
+export function nebulaTag(name: string, sha: string): string {
+  return `nb-${name}-${sha.slice(0, 12)}`;
+}
+
+/** Which service a GitHub repo maps to: a registry entry by `repo` (moly-backend
+ * keeps its ECR repo, source blob and boot-key path), else the repo slug. */
+export function resolveService(repoSlug: string): { service: string; ecrRepo: string; kind?: EnvKind; legacyBoot: boolean; registry?: ServiceEntry } {
+  const entry = REGISTRY.find((e) => e.repo.toLowerCase() === repoSlug.toLowerCase());
+  if (entry) {
+    const legacyBoot = entry.name === "moly-backend";
+    return { service: entry.name, ecrRepo: entry.ecrRepo, kind: entry.kind, legacyBoot, registry: entry };
+  }
+  const service = (repoSlug.split("/")[1] ?? repoSlug).toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-+|-+$/g, "");
+  if (!isValidService(service)) throw new Error(`repo "${repoSlug}" does not map to a valid service name (${SERVICE_RE}, not reserved)`);
+  return { service, ecrRepo: service, legacyBoot: false };
 }
 
 export function envHost(name: string): string {
@@ -78,8 +132,8 @@ export function envDbName(name: string): string {
   return `nebula_${name}`;
 }
 
-export function manifestPath(name: string): string {
-  return `${GITOPS.dir}/${name}.yaml`;
+export function manifestPath(name: string, pending = false): string {
+  return `${pending ? PENDING_DIR : GITOPS.dir}/${name}.yaml`;
 }
 
 /** Replace (or insert) the database path of a Mongo URI, preserving scheme,
@@ -125,25 +179,65 @@ export function toLabelValue(raw: string): string {
 }
 
 export function manifestToYaml(m: NamedEnvManifest): string {
-  // Key order is the documented schema order (named-envs/README.md).
-  const ordered = {
+  // Key order is the documented schema order (named-envs/README.md). Optional
+  // v3 blocks are emitted only when present — never as null, because the
+  // ApplicationSet renders with missingkey=error and `hasKey` guards.
+  const ordered: Record<string, unknown> = {
     name: m.name,
     kind: m.kind,
     service: m.service,
     owner: m.owner,
-    imageTag: m.imageTag,
+    ...(m.imageTag ? { imageTag: m.imageTag } : {}),
     expiresAt: m.expiresAt,
     db: { mode: m.db.mode, generation: m.db.generation },
     frontendOrigins: [...m.frontendOrigins],
   };
+  if (m.source) ordered.source = { repo: m.source.repo, ref: m.source.ref, sha: m.source.sha, ...(m.source.prNumber != null ? { prNumber: m.source.prNumber } : {}), ...(m.source.prUrl ? { prUrl: m.source.prUrl } : {}) };
+  if (m.build) {
+    const b = m.build;
+    ordered.build = {
+      status: b.status,
+      expectedTag: b.expectedTag,
+      startedAt: b.startedAt,
+      ...(b.finishedAt ? { finishedAt: b.finishedAt } : {}),
+      ...(b.runId != null ? { runId: b.runId } : {}),
+      ...(b.runUrl ? { runUrl: b.runUrl } : {}),
+      ...(b.reason ? { reason: b.reason } : {}),
+    };
+  }
+  if (m.config) {
+    ordered.config = {
+      port: m.config.port,
+      healthPath: m.config.healthPath,
+      rev: m.config.rev,
+      envVarNames: [...m.config.envVarNames],
+      ...(m.config.dockerfile ? { dockerfile: m.config.dockerfile } : {}),
+      ...(m.config.context ? { context: m.config.context } : {}),
+      ...(m.config.buildArgs && Object.keys(m.config.buildArgs).length ? { buildArgs: { ...m.config.buildArgs } } : {}),
+    };
+  }
+  if (m.attachTo) ordered.attachTo = m.attachTo;
   const doc = new YamlDocument(ordered);
-  // Quote the timestamp so no YAML 1.1 parser (Go's, on the Argo side) turns it
-  // into a time value; matches the documented schema.
+  // Quote timestamps so no YAML 1.1 parser (Go's, on the Argo side) turns them
+  // into time values; matches the documented schema.
   (doc.get("expiresAt", true) as Scalar).type = "QUOTE_DOUBLE";
+  if (m.build) {
+    (doc.getIn(["build", "startedAt"], true) as Scalar).type = "QUOTE_DOUBLE";
+    if (m.build.finishedAt) (doc.getIn(["build", "finishedAt"], true) as Scalar).type = "QUOTE_DOUBLE";
+  }
   return doc.toString({ lineWidth: 0 });
 }
 
-export function parseManifest(text: string): NamedEnvManifest {
+const iso = (k: string, v: unknown): string => {
+  if (v instanceof Date) return v.toISOString();
+  if (typeof v !== "string") throw new Error(`manifest: "${k}" must be a string`);
+  return v;
+};
+
+/** Tolerant on shape (unknown keys ignored, v1/v2/v3 accepted), strict on
+ * meaning. `imageTag` is required for a deployable file (`where:
+ * "deployable"`, the default) and for any file whose build passed. */
+export function parseManifest(text: string, opts: { where?: "deployable" | "pending" } = {}): NamedEnvManifest {
   const raw = parseYaml(text);
   if (!raw || typeof raw !== "object") throw new Error("manifest is not a YAML mapping");
   const r = raw as Record<string, unknown>;
@@ -155,14 +249,14 @@ export function parseManifest(text: string): NamedEnvManifest {
   const name = str("name", r.name);
   if (!isValidName(name)) throw new Error(`manifest: invalid name "${name}"`);
   const service = str("service", r.service);
-  if (!(service in SERVICES)) throw new Error(`manifest: unknown service "${service}"`);
+  if (!SERVICE_RE.test(service)) throw new Error(`manifest: invalid service "${service}"`);
   const mode = str("db.mode", db.mode);
-  if (mode !== "isolated" && mode !== "clone") throw new Error(`manifest: db.mode must be isolated|clone`);
+  if (mode !== "isolated" && mode !== "clone" && mode !== "none") throw new Error(`manifest: db.mode must be isolated|clone|none`);
   const generation = Number(db.generation);
-  if (!Number.isInteger(generation) || generation < 1) throw new Error("manifest: db.generation must be a positive integer");
-  const expiresAt = r.expiresAt instanceof Date ? r.expiresAt.toISOString() : str("expiresAt", r.expiresAt);
+  if (!Number.isInteger(generation) || generation < 0) throw new Error("manifest: db.generation must be a non-negative integer");
+  const expiresAt = iso("expiresAt", r.expiresAt);
   const kind = r.kind === undefined ? "backend" : str("kind", r.kind);
-  if (kind !== "backend" && kind !== "frontend") throw new Error(`manifest: kind must be backend|frontend`);
+  if (kind !== "backend" && kind !== "frontend" && kind !== "worker") throw new Error(`manifest: kind must be backend|frontend|worker`);
   // v2 list, else v1 single string, else none
   let frontendOrigins: string[];
   if (Array.isArray(r.frontendOrigins)) {
@@ -172,19 +266,68 @@ export function parseManifest(text: string): NamedEnvManifest {
   } else {
     frontendOrigins = [];
   }
+
+  let source: NamedEnvManifest["source"];
+  if (r.source && typeof r.source === "object") {
+    const so = r.source as Record<string, unknown>;
+    source = { repo: str("source.repo", so.repo), ref: str("source.ref", so.ref), sha: str("source.sha", so.sha) };
+    if (so.prNumber != null) source.prNumber = Number(so.prNumber);
+    if (typeof so.prUrl === "string") source.prUrl = so.prUrl;
+  }
+  let build: NamedEnvManifest["build"];
+  if (r.build && typeof r.build === "object") {
+    const b = r.build as Record<string, unknown>;
+    const status = str("build.status", b.status);
+    if (!["PENDING", "RUNNING", "PASS", "FAIL"].includes(status)) throw new Error(`manifest: build.status must be PENDING|RUNNING|PASS|FAIL`);
+    build = { status: status as BuildStatus, expectedTag: str("build.expectedTag", b.expectedTag), startedAt: iso("build.startedAt", b.startedAt) };
+    if (b.finishedAt != null) build.finishedAt = iso("build.finishedAt", b.finishedAt);
+    if (b.runId != null) build.runId = Number(b.runId);
+    if (typeof b.runUrl === "string") build.runUrl = b.runUrl;
+    if (typeof b.reason === "string") build.reason = b.reason;
+  }
+  let config: NamedEnvManifest["config"];
+  if (r.config && typeof r.config === "object") {
+    const c = r.config as Record<string, unknown>;
+    config = {
+      port: Number(c.port),
+      healthPath: str("config.healthPath", c.healthPath),
+      rev: Number.isInteger(Number(c.rev)) ? Number(c.rev) : 0,
+      envVarNames: Array.isArray(c.envVarNames) ? c.envVarNames.map((k, i) => str(`config.envVarNames[${i}]`, k)) : [],
+    };
+    if (!Number.isInteger(config.port) || config.port < 1 || config.port > 65535) throw new Error("manifest: config.port must be a port number");
+    if (typeof c.dockerfile === "string") config.dockerfile = c.dockerfile;
+    if (typeof c.context === "string") config.context = c.context;
+    if (c.buildArgs && typeof c.buildArgs === "object") {
+      config.buildArgs = Object.fromEntries(Object.entries(c.buildArgs as Record<string, unknown>).map(([k, v]) => [k, String(v)]));
+    }
+  }
+  const attachTo = typeof r.attachTo === "string" && r.attachTo ? r.attachTo : undefined;
+  if (attachTo && !isValidName(attachTo)) throw new Error(`manifest: invalid attachTo "${attachTo}"`);
+
+  const where = opts.where ?? "deployable";
+  const imageTag = typeof r.imageTag === "string" && r.imageTag ? r.imageTag : undefined;
+  if (!imageTag && (where === "deployable" || build?.status === "PASS")) throw new Error(`manifest: "imageTag" is required for a deployable env`);
+
   return {
     name,
     kind,
-    service: service as ServiceName,
+    service,
     owner: str("owner", r.owner),
-    imageTag: str("imageTag", r.imageTag),
+    ...(imageTag ? { imageTag } : {}),
     expiresAt,
     db: { mode, generation },
     frontendOrigins,
+    ...(source ? { source } : {}),
+    ...(build ? { build } : {}),
+    ...(config ? { config } : {}),
+    ...(attachTo ? { attachTo } : {}),
   };
 }
 
 // ── Ports (implemented in adapters.ts; faked in tests) ────────────────
+
+/** One file in an atomic multi-file commit; `content: null` deletes. */
+export type FileChange = { path: string; content: string | null };
 
 export interface GitopsRepo {
   /** null when the path does not exist */
@@ -192,13 +335,40 @@ export interface GitopsRepo {
   putFile(path: string, content: string, message: string, sha?: string): Promise<void>;
   deleteFile(path: string, message: string, sha: string): Promise<void>;
   listDir(path: string): Promise<string[]>;
+  /** Several files in ONE commit (Git Data API). Returns the commit sha. */
+  commit(changes: FileChange[], message: string): Promise<string>;
 }
 
 export interface SecretStore {
   getJson(name: string): Promise<Record<string, string>>;
   createJson(name: string, value: Record<string, string>, tags: Record<string, string>): Promise<void>;
+  /** Replace the value of an existing secret. */
+  putJson(name: string, value: Record<string, string>): Promise<void>;
   /** Immediate, unrecoverable delete (ForceDeleteWithoutRecovery). */
   deleteNow(name: string): Promise<void>;
+}
+
+export type BuildInputs = {
+  repo: string;
+  ref: string;
+  sha: string;
+  service: string;
+  envName: string;
+  dockerfile: string;
+  context: string;
+  buildArgs: Record<string, string>;
+  target?: string;
+};
+export type BuildRun = { id: number; url: string; status: "queued" | "in_progress" | "completed"; conclusion?: string; createdAt: string };
+
+/** The central builder (.github/workflows/nebula-build.yml in twizz-idp). */
+export interface BuildDispatcher {
+  /** workflow_dispatch: 204, no run id — correlate with findRun. */
+  dispatch(inputs: BuildInputs): Promise<void>;
+  findRun(q: { displayTitle: string; createdAfter: Date }): Promise<BuildRun | null>;
+  getRun(runId: number): Promise<BuildRun>;
+  /** The display title the workflow's run-name renders for these inputs. */
+  displayTitle(inputs: Pick<BuildInputs, "envName" | "service" | "sha">): string;
 }
 
 export type ImageInfo = { tags: string[]; pushedAt: Date | undefined; digest: string | undefined };
@@ -231,14 +401,54 @@ export type CreateNamedEnvInput = {
   actor: string;
 };
 
-export async function listNamedEnvs(deps: Pick<NamedEnvDeps, "gitops">): Promise<NamedEnvManifest[]> {
-  const files = (await deps.gitops.listDir(GITOPS.dir)).filter((f) => f.endsWith(".yaml"));
-  const out: NamedEnvManifest[] = [];
-  for (const f of files) {
-    const file = await deps.gitops.getFile(`${GITOPS.dir}/${f}`);
-    if (file) out.push(parseManifest(file.content));
+export type ListResult = {
+  /** Deployable envs (named-envs/*.yaml) */
+  envs: NamedEnvManifest[];
+  /** Building or failed envs (named-envs/pending/*.yaml) */
+  pending: NamedEnvManifest[];
+  /** Files that did not parse — shown, never hidden; never fatal. */
+  broken: Array<{ path: string; error: string }>;
+};
+
+/** Both directories, one bad file never breaks the rest. */
+export async function listNamedEnvs(deps: Pick<NamedEnvDeps, "gitops">): Promise<ListResult> {
+  const out: ListResult = { envs: [], pending: [], broken: [] };
+  for (const [dir, where] of [[GITOPS.dir, "deployable"], [PENDING_DIR, "pending"]] as const) {
+    const files = (await deps.gitops.listDir(dir)).filter((f) => f.endsWith(".yaml"));
+    for (const f of files) {
+      const path = `${dir}/${f}`;
+      try {
+        const file = await deps.gitops.getFile(path);
+        if (!file) continue;
+        const m = parseManifest(file.content, { where });
+        (where === "pending" ? out.pending : out.envs).push(m);
+      } catch (e) {
+        out.broken.push({ path, error: String((e as Error).message ?? e) });
+      }
+    }
   }
-  return out.sort((a, b) => a.name.localeCompare(b.name));
+  out.envs.sort((a, b) => a.name.localeCompare(b.name));
+  out.pending.sort((a, b) => a.name.localeCompare(b.name));
+  return out;
+}
+
+/** Find an env in either directory. */
+export async function findEnv(
+  deps: Pick<NamedEnvDeps, "gitops">,
+  name: string,
+): Promise<{ manifest: NamedEnvManifest; path: string; sha: string; pending: boolean } | null> {
+  for (const pending of [false, true]) {
+    const path = manifestPath(name, pending);
+    const file = await deps.gitops.getFile(path);
+    if (file) return { manifest: parseManifest(file.content, { where: pending ? "pending" : "deployable" }), path, sha: file.sha, pending };
+  }
+  return null;
+}
+
+/** Live count for the cap: deployable + pending. */
+export async function countEnvs(deps: Pick<NamedEnvDeps, "gitops">): Promise<number> {
+  const [a, b] = await Promise.all([deps.gitops.listDir(GITOPS.dir), deps.gitops.listDir(PENDING_DIR)]);
+  return a.filter((f) => f.endsWith(".yaml")).length + b.filter((f) => f.endsWith(".yaml")).length;
 }
 
 export async function createNamedEnv(deps: NamedEnvDeps, input: CreateNamedEnvInput) {
@@ -254,9 +464,9 @@ export async function createNamedEnv(deps: NamedEnvDeps, input: CreateNamedEnvIn
   const frontendOrigin = frontendOrigins[0]; // BUSINESS_URL / USER_URL in the env blob
 
   const path = manifestPath(name);
-  if (await deps.gitops.getFile(path)) throw new Error(`env "${name}" already exists (${path})`);
+  if (await findEnv(deps, name)) throw new Error(`env "${name}" already exists`);
 
-  const live = (await deps.gitops.listDir(GITOPS.dir)).filter((f) => f.endsWith(".yaml")).length;
+  const live = await countEnvs(deps);
   const max = deps.maxNamedEnvs ?? DEFAULT_MAX_NAMED_ENVS;
   if (live >= max) throw new Error(`named-env cap reached (${live}/${max}); tear one down first`);
 
@@ -296,19 +506,22 @@ export async function createNamedEnv(deps: NamedEnvDeps, input: CreateNamedEnvIn
 }
 
 /** Delete the manifest (Argo prunes the app; the chart's PostDelete hook drops
- * the db) and the per-env secret. The `env-<name>` NAMESPACE is not deleted
- * by Argo and is not touched here (no kube API in this package) — the reaper
- * removes it. */
+ * the db), the env's values file if any, and the per-env secret — one commit.
+ * Works for deployable and pending envs. The `env-<name>` NAMESPACE is not
+ * deleted by Argo and is not touched here (no kube API in this package) — the
+ * reaper removes it. */
 export async function teardownNamedEnv(deps: Pick<NamedEnvDeps, "gitops" | "secrets">, input: { name: string; actor: string }) {
   const { name } = input;
   if (!isValidName(name)) throw new Error(`invalid env name "${name}"`);
-  const path = manifestPath(name);
-  const file = await deps.gitops.getFile(path);
-  if (!file) throw new Error(`env "${name}" does not exist (${path})`);
-  const manifest = parseManifest(file.content);
+  const found = await findEnv(deps, name);
+  if (!found) throw new Error(`env "${name}" does not exist`);
+  const { manifest, path } = found;
   const secretName = envSecretName(manifest.service, name);
 
-  await deps.gitops.deleteFile(path, `nebula: teardown env ${name} (${input.actor})`, file.sha);
+  const changes: FileChange[] = [{ path, content: null }];
+  const envValues = envValuesPath(manifest.service, name);
+  if (await deps.gitops.getFile(envValues)) changes.push({ path: envValues, content: null });
+  await deps.gitops.commit(changes, `nebula: teardown env ${name} (${input.actor})`);
   let secretDeleted = true;
   let secretError: string | undefined;
   try {
@@ -320,6 +533,7 @@ export async function teardownNamedEnv(deps: Pick<NamedEnvDeps, "gitops" | "secr
   return {
     name,
     manifestDeleted: true,
+    pending: found.pending,
     secret: secretName,
     secretDeleted,
     ...(secretError ? { secretError } : {}),
@@ -327,18 +541,28 @@ export async function teardownNamedEnv(deps: Pick<NamedEnvDeps, "gitops" | "secr
   };
 }
 
+/** Per-env non-secret Helm values (port, probes, env block) in twizz-gitops. */
+export function envValuesPath(service: string, name: string): string {
+  return `apps/${service}/envs/${name}.yaml`;
+}
+
+export function serviceValuesPath(service: string): string {
+  return `apps/${service}/values.yaml`;
+}
+
 export async function cloneStagingDb(deps: Pick<NamedEnvDeps, "gitops">, input: { name: string; actor: string }) {
   const { name } = input;
   if (!isValidName(name)) throw new Error(`invalid env name "${name}"`);
-  const path = manifestPath(name);
-  const file = await deps.gitops.getFile(path);
-  if (!file) throw new Error(`env "${name}" does not exist (${path})`);
-  const manifest = parseManifest(file.content);
+  const found = await findEnv(deps, name);
+  if (!found) throw new Error(`env "${name}" does not exist`);
+  if (found.pending) throw new Error(`env "${name}" is still building; clone once it is deployed`);
+  const { manifest, path, sha } = found;
+  if (manifest.service !== "moly-backend") throw new Error(`clone-staging-db is only available for moly-backend envs`);
   const next: NamedEnvManifest = { ...manifest, db: { mode: "clone", generation: manifest.db.generation + 1 } };
-  await deps.gitops.putFile(path, manifestToYaml(next), `nebula: re-clone db for env ${name} -> generation ${next.db.generation} (${input.actor})`, file.sha);
+  await deps.gitops.putFile(path, manifestToYaml(next), `nebula: re-clone db for env ${name} -> generation ${next.db.generation} (${input.actor})`, sha);
   return {
     name,
-    source: SERVICES[manifest.service].sourceSecret,
+    source: SERVICES[manifest.service]?.sourceSecret ?? `preview/${manifest.service}`,
     targetDb: envDbName(name),
     generation: next.db.generation,
     previousMode: manifest.db.mode,
@@ -356,12 +580,11 @@ export async function extendNamedEnv(
   if (!Number.isInteger(input.ttlHours) || input.ttlHours < TTL_HOURS.min || input.ttlHours > TTL_HOURS.max) {
     throw new Error(`ttlHours must be an integer in ${TTL_HOURS.min}..${TTL_HOURS.max}`);
   }
-  const path = manifestPath(name);
-  const file = await deps.gitops.getFile(path);
-  if (!file) throw new Error(`env "${name}" does not exist (${path})`);
-  const manifest = parseManifest(file.content);
+  const found = await findEnv(deps, name);
+  if (!found) throw new Error(`env "${name}" does not exist`);
+  const { manifest, path, sha } = found;
   const expiresAt = expiresAtFrom(now(), input.ttlHours);
-  await deps.gitops.putFile(path, manifestToYaml({ ...manifest, expiresAt }), `nebula: extend env ${name} to ${expiresAt} (${input.actor})`, file.sha);
+  await deps.gitops.putFile(path, manifestToYaml({ ...manifest, expiresAt }), `nebula: extend env ${name} to ${expiresAt} (${input.actor})`, sha);
   return { name, previousExpiresAt: manifest.expiresAt, expiresAt };
 }
 
@@ -374,10 +597,11 @@ export async function listReleaseImages(
   service: ServiceName,
   limit = 20,
 ): Promise<ReleaseImage[]> {
-  const repo = SERVICES[service].ecrRepo;
-  const images = await deps.images.listImages(repo);
+  const entry = SERVICES[service];
+  if (!entry) throw new Error(`"${service}" has no release images (not a registry backend)`);
+  const images = await deps.images.listImages(entry.ecrRepo);
   return images
-    .map((i) => ({ i, tag: i.tags.find((t) => IMAGE_TAG_RE.test(t)) }))
+    .map((i) => ({ i, tag: i.tags.find((t) => t.startsWith("build-") && IMAGE_TAG_RE.test(t)) }))
     .filter((x): x is { i: ImageInfo; tag: string } => !!x.tag)
     .sort((a, b) => (b.i.pushedAt?.getTime() ?? 0) - (a.i.pushedAt?.getTime() ?? 0))
     .slice(0, limit)

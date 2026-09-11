@@ -1,10 +1,12 @@
 import { describe, expect, it } from "vitest";
+import { FakeEcr, FakeGitops, FakeSecrets } from "./fakes";
 import {
   cloneStagingDb,
   createNamedEnv,
   extendNamedEnv,
   listNamedEnvs,
   listReleaseImages,
+  manifestToYaml,
   parseManifest,
   teardownNamedEnv,
   type GitopsRepo,
@@ -15,72 +17,6 @@ import {
 
 const TAG = "build-75b95f51-a1de-432d-8132-33a2802f622c";
 const NOW = new Date("2026-09-07T12:00:00Z");
-
-class FakeGitops implements GitopsRepo {
-  files = new Map<string, string>();
-  commits: string[] = [];
-  private shaOf(content: string) {
-    return `sha-${content.length}-${content.slice(0, 8)}`;
-  }
-  async getFile(path: string) {
-    const content = this.files.get(path);
-    return content === undefined ? null : { content, sha: this.shaOf(content) };
-  }
-  async putFile(path: string, content: string, message: string, sha?: string) {
-    const existing = this.files.get(path);
-    if (existing !== undefined && sha !== this.shaOf(existing)) throw new Error("sha mismatch (GitHub 409)");
-    if (existing === undefined && sha) throw new Error("sha given for a new file");
-    this.files.set(path, content);
-    this.commits.push(message);
-  }
-  async deleteFile(path: string, message: string, sha: string) {
-    const existing = this.files.get(path);
-    if (existing === undefined || sha !== this.shaOf(existing)) throw new Error("sha mismatch (GitHub 409)");
-    this.files.delete(path);
-    this.commits.push(message);
-  }
-  async listDir(dir: string) {
-    return [...this.files.keys()].filter((p) => p.startsWith(dir + "/")).map((p) => p.slice(dir.length + 1));
-  }
-}
-
-class FakeSecrets implements SecretStore {
-  store = new Map<string, Record<string, string>>();
-  tags = new Map<string, Record<string, string>>();
-  constructor() {
-    this.store.set("preview/moly-backend", {
-      MONGO_URI: "mongodb+srv://u:p@host/moly?retryWrites=true",
-      SHIFT_FOUR_MONGO_URI: "mongodb+srv://u:p@host/moly",
-      BUSINESS_URL: "https://stg.twizz.com",
-      TOKEN_SECRET: "old",
-      REDIS_HOST: "staging-redis",
-      REDIS_PASSWORD: "x",
-    });
-  }
-  async getJson(name: string) {
-    const v = this.store.get(name);
-    if (!v) throw new Error(`ResourceNotFoundException: ${name}`);
-    return { ...v };
-  }
-  async createJson(name: string, value: Record<string, string>, tags: Record<string, string>) {
-    if (this.store.has(name)) throw new Error(`ResourceExistsException: ${name}`);
-    this.store.set(name, value);
-    this.tags.set(name, tags);
-  }
-  async deleteNow(name: string) {
-    if (!this.store.delete(name)) throw new Error(`ResourceNotFoundException: ${name}`);
-  }
-}
-
-class FakeEcr implements ImageRegistry {
-  constructor(private images: Record<string, ImageInfo[]>) {}
-  async describeTag(repo: string, tag: string) {
-    return this.images[repo]?.find((i) => i.tags.includes(tag)) ?? null;
-  }
-  async listImages(repo: string) {
-    return this.images[repo] ?? [];
-  }
-}
 
 function deps(overrides: Partial<{ maxNamedEnvs: number }> = {}) {
   const gitops = new FakeGitops();
@@ -218,7 +154,23 @@ describe("cloneStagingDb / extendNamedEnv / list", () => {
     const d = deps();
     await createNamedEnv(d, { ...input, name: "zeta" });
     await createNamedEnv(d, { ...input, name: "alpha" });
-    expect((await listNamedEnvs(d)).map((m) => m.name)).toEqual(["alpha", "zeta"]);
+    expect((await listNamedEnvs(d)).envs.map((m) => m.name)).toEqual(["alpha", "zeta"]);
+  });
+  it("isolates a broken manifest and lists pending envs separately", async () => {
+    const d = deps();
+    await createNamedEnv(d, { ...input, name: "alpha" });
+    d.gitops.files.set("named-envs/broken.yaml", "name: Bad\nservice: x\n");
+    d.gitops.files.set("named-envs/pending/beta.yaml", manifestToYaml({ name: "beta", kind: "backend", service: "twizz-sentinel", owner: "x", expiresAt: "2026-09-17T12:00:00.000Z", db: { mode: "none", generation: 0 }, frontendOrigins: [], build: { status: "RUNNING", expectedTag: "nb-beta-aaaaaaaaaaaa", startedAt: "2026-09-10T12:00:00.000Z" } }));
+    const r = await listNamedEnvs(d);
+    expect(r.envs.map((m) => m.name)).toEqual(["alpha"]);
+    expect(r.pending.map((m) => m.name)).toEqual(["beta"]);
+    expect(r.broken).toEqual([{ path: "named-envs/broken.yaml", error: expect.stringMatching(/invalid name/) }]);
+    // the cap counts pending too
+    await expect(createNamedEnv({ ...d, maxNamedEnvs: 2 }, { ...input, name: "gamma" })).rejects.toThrow(/cap/);
+    // teardown of a pending env removes it in one commit
+    const t = await teardownNamedEnv(d, { name: "beta", actor: "x" });
+    expect(t.pending).toBe(true);
+    expect(d.gitops.files.has("named-envs/pending/beta.yaml")).toBe(false);
   });
   it("lists release images newest first with aliases, skipping non-build tags", async () => {
     const d = deps();

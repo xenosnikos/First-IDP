@@ -10,11 +10,11 @@ import {
   cloneStagingDb,
   createNamedEnv,
   extendNamedEnv,
+  envSecretName,
   listNamedEnvs,
   listReleaseImages,
   teardownNamedEnv,
   type GateResult,
-  type ServiceName,
 } from "@twizz-idp/actions";
 import { router, protectedProcedure } from "../trpc";
 import { isOperator } from "@/lib/nebula/operators";
@@ -48,7 +48,7 @@ const operatorProcedure = protectedProcedure.use(async ({ ctx, next, path }) => 
 
 const confirmSchema = z.string().min(8).max(64).optional();
 const envName = z.string().regex(NAME_RE, "DNS label: ^[a-z][a-z0-9-]{2,23}$");
-const serviceSchema = z.enum(SERVICE_NAMES as [ServiceName, ...ServiceName[]]);
+const serviceSchema = z.enum(SERVICE_NAMES as [string, ...string[]]);
 const ttlSchema = z.number().int().min(TTL_HOURS.min).max(TTL_HOURS.max);
 
 /** The gate result goes to the client as-is (nonce travels as `confirm`). */
@@ -67,10 +67,12 @@ export const actionsRouter = router({
    * enriched with live Argo Application health read in-cluster. */
   listEnvs: protectedProcedure.query(async () => {
     const now = new Date();
-    const [envs, argo] = await Promise.all([listNamedEnvs({ gitops: new GithubGitops(octokit()) }), readArgoApplications()]);
+    const [list, argo] = await Promise.all([listNamedEnvs({ gitops: new GithubGitops(octokit()) }), readArgoApplications()]);
     return {
       argo: { reachable: argo.reachable, reason: argo.reason },
-      envs: envs.map((m) => {
+      pending: list.pending,
+      broken: list.broken,
+      envs: list.envs.map((m) => {
         const appName = `env-${m.name}`;
         const status = argoStatusFor(argo, appName);
         return {
@@ -79,7 +81,7 @@ export const actionsRouter = router({
           argoApp: appName,
           namespace: appName,
           dbName: `nebula_${m.name}`,
-          secret: `${SERVICES[m.service].sourceSecret}/${m.name}`,
+          secret: envSecretName(m.service, m.name),
           argo: { ...status, ...argoWord(status) },
           ttl: ttlWord(m.expiresAt, now),
         };
@@ -110,7 +112,7 @@ export const actionsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const { name, service, imageTag, db, ttlHours, frontendOrigins, confirm } = input;
       const fields = { name, service, imageTag, db, ttlHours: String(ttlHours), frontendOrigins: (frontendOrigins ?? []).join(" ") };
-      const summary = `Create named env '${name}' (${service}:${imageTag}, db=${db}, ttl=${ttlHours}h) -> https://${name}.prv.twizz.com; writes secret ${SERVICES[service].sourceSecret}/${name} + named-envs/${name}.yaml`;
+      const summary = `Create named env '${name}' (${service}:${imageTag}, db=${db}, ttl=${ttlHours}h) -> https://${name}.prv.twizz.com; writes secret ${envSecretName(service, name)} + named-envs/${name}.yaml`;
       const gate = gateFor(ctx.prisma, ctx.login);
       return shape(
         await gate("create_named_env", fields, confirm, summary, () =>

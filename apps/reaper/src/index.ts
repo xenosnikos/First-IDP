@@ -33,8 +33,9 @@ const audit = createAudit({
 
 /** Phase 1: expired named envs → teardownNamedEnv (manifest + secret). */
 export async function reapExpired(deps: { gitops: GithubGitops; secrets: SecretsManagerStore }, now: Date) {
-  const envs = await listNamedEnvs(deps);
-  const decisions = selectExpired(envs, now);
+  const { envs, pending, broken } = await listNamedEnvs(deps);
+  for (const b of broken) log(`broken manifest ${b.path}: ${b.error} (kept)`);
+  const decisions = selectExpired(envs, now, pending);
   let failures = 0;
   for (const d of decisions) {
     if (d.action === "keep") {
@@ -53,7 +54,7 @@ export async function reapExpired(deps: { gitops: GithubGitops; secrets: Secrets
       log(`env ${d.name}: teardown FAILED: ${String(e)}`);
     }
   }
-  return { total: envs.length, expired: decisions.filter((d) => d.action === "teardown").length, failures };
+  return { total: envs.length + pending.length, expired: decisions.filter((d) => d.action === "teardown").length, failures };
 }
 
 /** Phase 2: preview namespaces whose Argo Application is gone. */

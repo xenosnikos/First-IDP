@@ -166,6 +166,9 @@ importers:
 
   apps/reaper:
     dependencies:
+      '@aws-sdk/client-ecr':
+        specifier: ^3.700.0
+        version: 3.1108.0
       '@aws-sdk/client-secrets-manager':
         specifier: ^3.700.0
         version: 3.1026.0
@@ -225,9 +228,15 @@ importers:
       '@octokit/rest':
         specifier: ^21.0.0
         version: 21.1.1
+      '@twizz-idp/shared':
+        specifier: workspace:*
+        version: link:../shared
       yaml:
         specifier: ^2.6.0
         version: 2.9.0
+      zod:
+        specifier: ^3.25.0
+        version: 3.25.76
     devDependencies:
       '@types/node':
         specifier: ^22.0.0
@@ -326,12 +335,15 @@ importers:
   packages/shared:
     dependencies:
       zod:
-        specifier: ^3.24.0
+        specifier: ^3.25.0
         version: 3.25.76
     devDependencies:
       typescript:
         specifier: ^5.7.0
         version: 5.9.3
+      vitest:
+        specifier: ^3.0.0
+        version: 3.2.7(@types/node@22.19.17)(jiti@2.6.1)(lightningcss@1.32.0)(tsx@4.23.12)(yaml@2.9.0)
 
 packages:
 

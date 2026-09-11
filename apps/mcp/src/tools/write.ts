@@ -19,7 +19,6 @@ import {
   extendNamedEnv,
   teardownNamedEnv,
   type GateResult,
-  type ServiceName,
 } from "@twizz-idp/actions";
 import { gate, actor } from "../gate.js";
 import { operatorCreds, region } from "../auth.js";
@@ -70,7 +69,7 @@ const envName = z
   .regex(/^[a-z][a-z0-9-]{2,23}$/, "DNS label: ^[a-z][a-z0-9-]{2,23}$")
   .describe("Named-env name; becomes namespace env-<name> and host <name>.prv.twizz.com");
 
-const serviceSchema = z.enum(SERVICE_NAMES as [ServiceName, ...ServiceName[]]);
+const serviceSchema = z.enum(SERVICE_NAMES as [string, ...string[]]);
 
 const ttlSchema = z.number().int().min(TTL_HOURS.min).max(TTL_HOURS.max).default(TTL_HOURS.default);
 
@@ -186,7 +185,7 @@ export function registerWriteTools(server: McpServer) {
     },
     async ({ name, service, imageTag, db, ttlHours, frontendOrigins, confirm }) => {
       const fields = { name, service, imageTag, db, ttlHours: String(ttlHours), frontendOrigins: (frontendOrigins ?? []).join(" ") };
-      const summary = `Create named env '${name}' (${service}:${imageTag}, db=${db}, ttl=${ttlHours}h) -> https://${name}.prv.twizz.com; writes secret ${SERVICES[service].sourceSecret}/${name} + named-envs/${name}.yaml`;
+      const summary = `Create named env '${name}' (${service}:${imageTag}, db=${db}, ttl=${ttlHours}h) -> https://${name}.prv.twizz.com; writes secret preview/${service}/${name} + named-envs/${name}.yaml`;
       return gated("create_named_env", fields, confirm, summary, async () =>
         createNamedEnv(await namedEnvDeps("create_named_env", name), { name, service, imageTag, db, ttlHours, frontendOrigins, actor }),
       );

@@ -9,7 +9,6 @@ import {
   SERVICE_NAMES,
   listNamedEnvs,
   listReleaseImages,
-  type ServiceName,
 } from "@twizz-idp/actions";
 import { ensureReadonlyCreds, operatorCreds, region } from "../auth.js";
 import { actor } from "../gate.js";
@@ -170,10 +169,12 @@ export function registerReadTools(server: McpServer) {
     async () => {
       const token = process.env.GITHUB_TOKEN;
       if (!token) return text({ error: "GITHUB_TOKEN not set for the MCP server" });
-      const envs = await listNamedEnvs({ gitops: new GithubGitops(new Octokit({ auth: token })) });
+      const { envs, pending, broken } = await listNamedEnvs({ gitops: new GithubGitops(new Octokit({ auth: token })) });
       return text({
         count: envs.length,
         envs: envs.map((m) => ({ ...m, url: `https://${m.name}.prv.twizz.com`, namespace: `env-${m.name}`, argoApp: `env-${m.name}` })),
+        pending: pending.map((m) => ({ name: m.name, service: m.service, build: m.build, source: m.source })),
+        broken,
       });
     },
   );
@@ -182,7 +183,7 @@ export function registerReadTools(server: McpServer) {
     "list_release_images",
     "Existing release images for a service: immutable ECR build-* tags (newest first) with the floating aliases (prod/latest/dev) that currently point at them. Pick one of these for create_named_env.",
     {
-      service: z.enum(SERVICE_NAMES as [ServiceName, ...ServiceName[]]).default("moly-backend"),
+      service: z.enum(SERVICE_NAMES as [string, ...string[]]).default("moly-backend"),
       limit: z.number().int().min(1).max(50).default(20),
     },
     async ({ service, limit }) => {
