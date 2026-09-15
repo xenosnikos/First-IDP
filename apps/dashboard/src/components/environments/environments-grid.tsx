@@ -10,10 +10,18 @@ import { GateDialog } from "@/components/nebula/gate-dialog";
 import { useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
 import type { StatusWord } from "@/lib/nebula/status";
 import { PreviewCard, type NamedEnvView } from "./preview-card";
+import { PendingCard, type PendingEnvView } from "./pending-card";
 import { AppCard, type AppView } from "./app-card";
 import { SpinUpDrawer } from "./spin-up-drawer";
+import { RepoSpinUpDrawer } from "./repo-spin-up-drawer";
 
-type CardAction = { kind: "extend"; env: NamedEnvView; ttlHours: number } | { kind: "reclone"; env: NamedEnvView } | { kind: "teardown"; env: NamedEnvView };
+type EnvRef = { name: string };
+type CardAction =
+  | { kind: "extend"; env: EnvRef; ttlHours: number }
+  | { kind: "reclone"; env: EnvRef }
+  | { kind: "teardown"; env: EnvRef }
+  | { kind: "rebuild"; env: EnvRef }
+  | { kind: "envvars"; env: EnvRef; vars: Record<string, string> };
 type Origin = "NAMED" | "PR PREVIEW" | "GITOPS APP";
 const ORIGINS: Origin[] = ["NAMED", "PR PREVIEW", "GITOPS APP"];
 const ORIGIN_BLURB: Record<Origin, string> = {
@@ -29,12 +37,16 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
   const utils = trpc.useUtils();
   const q = trpc.nebula.listEnvironments.useQuery(undefined, { refetchInterval: 30_000, retry: false });
   const [wizardOpen, setWizardOpen] = useState(false);
+  const [repoOpen, setRepoOpen] = useState(false);
+  const me = trpc.actions.me.useQuery(undefined, { staleTime: 60_000 });
   const [action, setAction] = useState<CardAction | null>(null);
   const [filter, setFilter] = useState<Origin | "ALL">("ALL");
 
   const extend = trpc.actions.extendNamedEnv.useMutation();
   const reclone = trpc.actions.cloneStagingDb.useMutation();
   const teardown = trpc.actions.teardownNamedEnv.useMutation();
+  const rebuild = trpc.actions.rebuildFromRef.useMutation();
+  const envvars = trpc.actions.setEnvVars.useMutation();
 
   // The action rides inside the gated args so the nonce is bound to it
   // server-side; there is no stale-closure path to confirm a different env.
@@ -43,9 +55,11 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
       const { action: a, confirm } = args;
       if (a.kind === "extend") return (await extend.mutateAsync({ name: a.env.name, ttlHours: a.ttlHours, confirm })) as GateResult;
       if (a.kind === "reclone") return (await reclone.mutateAsync({ name: a.env.name, confirm })) as GateResult;
+      if (a.kind === "rebuild") return (await rebuild.mutateAsync({ name: a.env.name, confirm })) as GateResult;
+      if (a.kind === "envvars") return (await envvars.mutateAsync({ name: a.env.name, vars: a.vars, confirm })) as GateResult;
       return (await teardown.mutateAsync({ name: a.env.name, confirm })) as GateResult;
     },
-    [extend, reclone, teardown],
+    [extend, reclone, teardown, rebuild, envvars],
   );
   const gated = useGatedAction<{ action: CardAction }>(run);
 
@@ -61,18 +75,33 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
   };
 
   const title =
-    action?.kind === "extend" ? `Extend ${action.env.name} (+${action.ttlHours}h)` : action?.kind === "reclone" ? `Re-clone db into ${action.env.name}` : action ? `Tear down ${action.env.name}` : "";
+    action?.kind === "extend"
+      ? `Extend ${action.env.name} (+${action.ttlHours}h)`
+      : action?.kind === "reclone"
+        ? `Re-clone db into ${action.env.name}`
+        : action?.kind === "rebuild"
+          ? `Rebuild ${action.env.name} from its branch`
+          : action?.kind === "envvars"
+            ? `Set env vars on ${action.env.name}`
+            : action
+              ? `Tear down ${action.env.name}`
+              : "";
 
-  const named = q.data?.named ?? [];
-  const others = q.data?.others ?? [];
+  const named = useMemo(() => q.data?.named ?? [], [q.data]);
+  const pending = useMemo(() => q.data?.pending ?? [], [q.data]);
+  const broken = q.data?.broken ?? [];
+  const others = useMemo(() => q.data?.others ?? [], [q.data]);
+  const ownerLabel = (me.data?.ownerLabel ?? login).toLowerCase();
+  const isOwner = (owner: string) => owner.toLowerCase() === ownerLabel;
   const groups = useMemo(() => {
-    const g: Record<Origin, Array<{ kind: "named"; env: NamedEnvView } | { kind: "app"; app: AppView }>> = { NAMED: [], "PR PREVIEW": [], "GITOPS APP": [] };
+    const g: Record<Origin, Array<{ kind: "named"; env: NamedEnvView } | { kind: "pending"; env: PendingEnvView } | { kind: "app"; app: AppView }>> = { NAMED: [], "PR PREVIEW": [], "GITOPS APP": [] };
+    for (const env of pending) g.NAMED.push({ kind: "pending", env });
     for (const env of named) g.NAMED.push({ kind: "named", env });
     for (const app of others) g[app.origin as Origin].push({ kind: "app", app });
     return g;
-  }, [named, others]);
-  const total = named.length + others.length;
-  const healthCounts = [...named.map((e) => e.argo.word), ...others.map((a) => a.word)].reduce<Record<string, number>>((acc, w) => ({ ...acc, [w]: (acc[w] ?? 0) + 1 }), {});
+  }, [named, pending, others]);
+  const total = named.length + pending.length + others.length;
+  const healthCounts = [...named.map((e) => e.argo.word), ...pending.map((e) => e.word), ...others.map((a) => a.word)].reduce<Record<string, number>>((acc, w) => ({ ...acc, [w]: (acc[w] ?? 0) + 1 }), {});
   const visible = filter === "ALL" ? ORIGINS : [filter];
 
   return (
@@ -81,12 +110,13 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
         <Link href="/environments/topology" style={{ color: "var(--n-ink-muted)", fontSize: 11, textDecoration: "none", marginRight: 8 }}>
           topology (all tiers) →
         </Link>
+        <Button variant="ion" onClick={() => setRepoOpen(true)} title="any twizz-app repo/branch; Nebula builds it (self-service, through the gate)">Spin up from a repo</Button>
         {operator ? (
-          <Button variant="ion" onClick={() => setWizardOpen(true)}>Spin up</Button>
+          <Button onClick={() => setWizardOpen(true)} title="moly-backend from an existing release image (operators)">Release image</Button>
         ) : (
           <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}>
-            <Button disabled>Spin up</Button>
-            <Pill word="READ-ONLY" title={`${login} is not in NEBULA_OPERATORS`} />
+            <Button disabled title="release-image spin-ups are operator-only">Release image</Button>
+            <Pill word="READ-ONLY" title={`${login} is not in NEBULA_OPERATORS; you can still spin up from a repo and manage your own envs`} />
           </span>
         )}
       </PageHeader>
@@ -133,6 +163,11 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
             <Pill word="FAIL" /> named-envs unreadable — {q.data.gitopsError}
           </span>
         )}
+        {broken.map((b) => (
+          <span key={b.path} style={{ display: "inline-flex", gap: 6, alignItems: "center", flexBasis: "100%" }} title={b.error}>
+            <Pill word="UNKNOWN" /> {b.path} did not parse — {b.error}
+          </span>
+        ))}
         {q.isFetching && !q.isLoading && <span style={{ color: "var(--n-ink-faint)" }}>refreshing…</span>}
       </div>
 
@@ -151,7 +186,7 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
       {q.data && total === 0 && (
         <div className="n-plate" style={{ padding: 32, textAlign: "center" }}>
           <div className="n-display" style={{ fontSize: 22, marginBottom: 8 }}>Nothing is running on non-prod</div>
-          <p style={{ color: "var(--n-ink-muted)", margin: 0 }}>Spin up a named env from an existing release image, or label a PR `preview`.</p>
+          <p style={{ color: "var(--n-ink-muted)", margin: 0 }}>Spin up a preview from any twizz-app repo, or label a PR `preview`.</p>
         </div>
       )}
 
@@ -178,10 +213,15 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
                     key={it.env.name}
                     env={it.env}
                     operator={operator}
+                    owner={isOwner(it.env.owner)}
                     onExtend={(e, ttlHours) => start({ kind: "extend", env: e, ttlHours })}
                     onReclone={(e) => start({ kind: "reclone", env: e })}
                     onTeardown={(e) => start({ kind: "teardown", env: e })}
+                    onRebuild={(e) => start({ kind: "rebuild", env: e })}
+                    onEnvVars={(e, vars) => start({ kind: "envvars", env: e, vars })}
                   />
+                ) : it.kind === "pending" ? (
+                  <PendingCard key={`pending-${it.env.name}`} env={it.env} canAct={operator || isOwner(it.env.owner)} onRebuild={(e) => start({ kind: "rebuild", env: e })} onTeardown={(e) => start({ kind: "teardown", env: e })} />
                 ) : (
                   <AppCard key={it.app.name} app={it.app} />
                 ),
@@ -194,6 +234,7 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
       <GateDialog title={title} phase={gated.phase} onConfirm={gated.confirm} onClose={closeGate} />
 
       <SpinUpDrawer open={wizardOpen} onClose={() => setWizardOpen(false)} onCreated={() => utils.nebula.listEnvironments.invalidate()} />
+      <RepoSpinUpDrawer open={repoOpen} onClose={() => setRepoOpen(false)} onCreated={() => utils.nebula.listEnvironments.invalidate()} />
     </div>
   );
 }

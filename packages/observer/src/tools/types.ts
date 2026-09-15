@@ -1,4 +1,5 @@
 import type { z } from "zod/v4";
+import type { AgentEvent, AgentTool } from "../agent";
 import type { LogLine } from "../logs/normalize";
 
 /** Fixed by the human's selection on the dashboard (or by explicit MCP args
@@ -33,14 +34,8 @@ export type ObserverDeps = {
   getNodeMetrics?(cluster: string): Promise<Array<{ name: string; cpu: number; mem: number; pods: number }>>;
 };
 
-export type ObserverEvent =
-  | { type: "status"; word: "RUNNING" | "PASS" | "FAIL" | "DENIED" | "STUB"; note?: string }
-  | { type: "text"; delta: string }
-  | { type: "tool_use"; id: string; name: string; input: unknown }
-  | { type: "tool_result"; id: string; name: string; status?: string; lines?: number; groups?: number; chars: number; redacted?: number; ms: number; truncated?: boolean }
-  | { type: "usage"; input: number; output: number; cacheRead: number; cacheWrite: number; iterations: number }
-  | { type: "done"; word: "PASS"; text: string }
-  | { type: "error"; word: "FAIL" | "DENIED" | "STUB"; message: string };
+/** The Observer streams the generic agent events. */
+export type ObserverEvent = AgentEvent;
 
 export type ObserverCtx = {
   scope: ObserverScope;
@@ -55,12 +50,7 @@ export type ObserverCtx = {
 
 /** SDK-independent tool: the same object is wrapped for Anthropic (dashboard)
  * and for MCP (phase 2). Input schemas never carry cluster/namespace. */
-export type ObserverTool<I extends z.ZodTypeAny = z.ZodTypeAny> = {
-  name: string;
-  description: string;
-  input: I;
-  run(input: z.infer<I>, ctx: ObserverCtx): Promise<string>;
-};
+export type ObserverTool<I extends z.ZodTypeAny = z.ZodTypeAny> = AgentTool<I, ObserverCtx>;
 
 /** Identity helper so `run(input)` is typed from the schema. */
 export function defineTool<I extends z.ZodTypeAny>(t: ObserverTool<I>): ObserverTool<I> {

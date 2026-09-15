@@ -4,4 +4,6 @@ export * from "./logs";
 export * from "./tools";
 export * from "./prompt";
 export * from "./budget";
+export * from "./agent";
 export * from "./run";
+export * from "./configurator";

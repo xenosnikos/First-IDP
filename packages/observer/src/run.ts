@@ -1,31 +1,20 @@
 import Anthropic from "@anthropic-ai/sdk";
-import { betaZodTool } from "@anthropic-ai/sdk/helpers/beta/zod";
-import type { BetaMessageStream } from "@anthropic-ai/sdk/lib/BetaMessageStream";
 import type { BetaMessageParam } from "@anthropic-ai/sdk/resources/beta/messages/messages";
+import { DEFAULT_MODEL, runAgentLoop, type AgentLoopResult } from "./agent";
 import { redact } from "./logs/redact";
 import { SYSTEM_PROMPT, userMessageFor, type ObserverKind } from "./prompt";
 import { fetchLogs, toolsFor } from "./tools";
 import { scopeText } from "./tools/scope";
-import type { ObserverCtx, ObserverDeps, ObserverEvent, ObserverScope, ObserverTool } from "./tools/types";
+import type { ObserverCtx, ObserverDeps, ObserverEvent, ObserverScope } from "./tools/types";
 
-export const DEFAULT_MODEL = "claude-opus-5";
+export { DEFAULT_MODEL };
 export const MAX_ITERATIONS = 8;
 export const MAX_HISTORY_TURNS = 12;
 export const MAX_TURN_CHARS = 8000;
-const TOOL_RESULT_CAP = 32_000;
 
 export type HistoryTurn = { role: "user" | "assistant"; content: string };
 
-export type ObserverResult = {
-  text: string;
-  model: string;
-  usage: { input: number; output: number; cacheRead: number; cacheWrite: number };
-  toolCalls: Array<{ name: string; input: unknown; ms?: number }>;
-  iterations: number;
-  stopReason: string;
-  redactions: Record<string, number>;
-  durationMs: number;
-};
+export type ObserverResult = AgentLoopResult & { redactions: Record<string, number> };
 
 export type RunObserverOptions = {
   client: Anthropic;
@@ -66,42 +55,8 @@ export function normalizeHistory(history: HistoryTurn[] | undefined): BetaMessag
   return out;
 }
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-function wrapTool(tool: ObserverTool<any>, ctx: ObserverCtx, calls: ObserverResult["toolCalls"]) {
-  return betaZodTool({
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.input,
-    run: async (input) => {
-      const t0 = Date.now();
-      const id = `${tool.name}-${calls.length + 1}`;
-      ctx.onEvent?.({ type: "tool_use", id, name: tool.name, input });
-      const entry = { name: tool.name, input, ms: 0 };
-      calls.push(entry);
-      let text: string;
-      try {
-        text = await tool.run(input, ctx);
-      } catch (e) {
-        text = `tool error: ${String((e as Error).message ?? e)}`;
-      }
-      entry.ms = Date.now() - t0;
-      let truncated = false;
-      if (text.length > TOOL_RESULT_CAP) {
-        text = text.slice(0, TOOL_RESULT_CAP) + `\n… [tool result truncated at ${TOOL_RESULT_CAP} chars — narrow the query]`;
-        truncated = true;
-      }
-      if (truncated) ctx.onEvent?.({ type: "tool_result", id, name: tool.name, chars: text.length, ms: entry.ms, truncated });
-      return text;
-    },
-  });
-}
-
 export async function runObserver(o: RunObserverOptions): Promise<ObserverResult> {
-  const started = Date.now();
-  const model = o.model ?? DEFAULT_MODEL;
   const ctx: ObserverCtx = { scope: o.scope, deps: o.deps, onEvent: o.onEvent, signal: o.signal, notes: {}, redactions: {} };
-  const calls: ObserverResult["toolCalls"] = [];
-  const usage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   const emit = (e: ObserverEvent) => o.onEvent?.(e);
 
   // One-click kinds get the current view up front so they usually cost one turn.
@@ -116,55 +71,14 @@ export async function runObserver(o: RunObserverOptions): Promise<ObserverResult
     { role: "user", content: userMessageFor(o.kind, { scopeText: scopeText(o.scope), compactText, selection, userText: o.userText }) },
   ];
 
-  const tools = toolsFor(ctx).map((t) => wrapTool(t, ctx, calls));
-  emit({ type: "status", word: "RUNNING", note: "thinking" });
-
-  const runner = o.client.beta.messages.toolRunner(
-    {
-      model,
-      max_tokens: 16_000,
-      thinking: { type: "adaptive" },
-      output_config: { effort: "medium" },
-      betas: ["server-side-fallback-2026-07-01"],
-      fallbacks: "default",
-      system: [{ type: "text", text: SYSTEM_PROMPT, cache_control: { type: "ephemeral" } }],
-      tools,
-      messages,
-      max_iterations: o.maxIterations ?? MAX_ITERATIONS,
-      stream: true,
-    },
-    { signal: o.signal },
-  );
-
-  let iterations = 0;
-  let text = "";
-  let stopReason = "end_turn";
-  let refusal: string | undefined;
-  for await (const stream of runner as AsyncIterable<BetaMessageStream>) {
-    iterations++;
-    let turnText = "";
-    stream.on("text", (delta: string) => {
-      turnText += delta;
-      emit({ type: "text", delta });
-    });
-    const msg = await stream.finalMessage();
-    usage.input += msg.usage.input_tokens ?? 0;
-    usage.output += msg.usage.output_tokens ?? 0;
-    usage.cacheRead += msg.usage.cache_read_input_tokens ?? 0;
-    usage.cacheWrite += msg.usage.cache_creation_input_tokens ?? 0;
-    stopReason = msg.stop_reason ?? "end_turn";
-    if (turnText) text = turnText; // the last assistant prose is the answer
-    if (msg.stop_reason === "refusal") {
-      refusal = msg.stop_details && "explanation" in msg.stop_details ? String((msg.stop_details as { explanation?: string }).explanation ?? "refused") : "refused";
-      break;
-    }
-    if (msg.stop_reason === "pause_turn") runner.pushMessages({ role: "assistant", content: msg.content });
-    emit({ type: "usage", ...usage, iterations });
-  }
-
-  if (refusal) text = (text ? text + "\n\n" : "") + `[The model declined to continue: ${refusal}]`;
-  if (stopReason === "max_tokens") text += "\n\n[Answer cut off at the token limit — ask a narrower question.]";
-  if (stopReason === "tool_use") text += `\n\n[Stopped after ${iterations} tool iterations without a final answer — narrow the scope or ask a more specific question.]`;
-
-  return { text, model, usage, toolCalls: calls, iterations, stopReason, redactions: ctx.redactions, durationMs: Date.now() - started };
+  const r = await runAgentLoop<ObserverCtx>({
+    client: o.client,
+    system: SYSTEM_PROMPT,
+    tools: toolsFor(ctx),
+    ctx,
+    messages,
+    model: o.model,
+    maxIterations: o.maxIterations ?? MAX_ITERATIONS,
+  });
+  return { ...r, redactions: ctx.redactions };
 }

@@ -473,7 +473,7 @@ auto-populate (this round). 3. Frontend envs: `nebula-build.yml` template in
 `attachTo` (next round).
 
 
-### N3.7 Build-on-provision: a preview from any org repo/branch (Phase A shipped 2026-09-10)
+### N3.7 Build-on-provision: a preview from any org repo/branch (Phase A shipped 2026-09-10, Phase B built 2026-09-15)
 
 The loop inside "confined to the org": pick a `twizz-app` repo at a commit,
 Nebula builds it and brings the env up. Decisions: a **central builder**
@@ -517,9 +517,47 @@ Platform mechanics (`packages/actions`):
   First-IDP) = the platform token; `preview/_defaults` holds the nonprod
   Atlas host.
 
-Phase B (next): the dashboard flow — paginated repo/branch pickers, branch
-creation, the **Configurator** agent (reuses the Observer harness; proposes
-`twizz.yaml` + Dockerfile via a terminal `propose_config` tool; the human
-edits the exact bytes; nonce binds `filesHash`; secret values travel only
-with the confirm and never reach fields/summary/audit), the "spin up from a
-repo" drawer, env cards with build words + rebuild, Projects "spin up".
+**Phase B (built 2026-09-15): the developer flow.**
+- **GitHub reads with the human's token** (`packages/core github.ts`): `listOrgRepos`
+  paginated (archived dropped, `pushedAt`), `listBranches({q, limit})`, `getBranchHead`,
+  `listTree` (vendored dirs + binaries dropped, 3000-entry cap), `getFileContent` 256 KB cap.
+  Router `project`: `listGithubRepos({q})` (60 s cache per login), `listBranches`,
+  `getBranchHead`, `repoConfig({repo, sha})` (twizz.yaml text + Dockerfile presence at the
+  pinned commit), `twizzConfigs` (kind column, 10 min cache). Everything is confined to
+  `GITHUB_ORG` by `orgRepo()`.
+- **Generic agent loop** `packages/observer/src/agent.ts` (`runAgentLoop`, `AgentTool`,
+  `AgentEvent`, terminal tools) — the Observer is now a thin caller; existing tests unchanged.
+- **Configurator** (`packages/observer/src/configurator/`): tools `detect_stack`,
+  `read_existing_config`, `list_files`, `read_file` (credential-looking values masked, `.env*`
+  keys only, 12 reads/run), terminal `propose_config` validated by `checkProposal` (strict
+  twizz.yaml v2 + Dockerfile cross-checks: path = context+dockerfile, `FROM`, no baked
+  credentials, every build arg declared with `ARG`). Frozen system prompt; one nudge turn if
+  the model stops without a proposal, then an honest FAIL. Dashboard: `POST /api/configurator`
+  (SSE; re-reads the branch head and refuses if it moved), ledger `nebula.configurator`
+  (caps `CONFIGURATOR_DAILY_RUNS_PER_USER=3`, `CONFIGURATOR_DAILY_RUNS=20`; audit rows carry
+  tool names/paths/timings, never file contents), status in `observer.configuratorStatus`.
+- **Gated actions** (`routers/actions.ts`): `createEnvFromRepo` folds branch creation, the
+  config PR(s) and the build into ONE human confirm. `fields` = name/repo/ref/sha/newBranch/
+  kind/service/db/ttl/attach/`files`+`filesHash`/`secretNames`/`envHash`/`prTarget`; secret
+  VALUES are refused on the request call and accepted only with the nonce (keys must equal
+  the declared names; blank = set later), and reach the SM blob only. The action re-reads the
+  pinned branch head and refuses if it moved; `files: []` builds the branch as is (no PR);
+  `prTarget: chosen+default` opens a second PR into the default branch. `rebuildFromRef`
+  (head sha resolved on both calls and bound by the nonce), `setEnvVars` (names + hash in
+  fields), and **owner-or-operator** teardown/extend (denials audited before the gate).
+  `cloneStagingDb` and the release-image path stay operator-only.
+- **UI**: "Spin up from a repo" drawer (`components/environments/repo-spin-up-drawer.tsx` +
+  `repo-spin-up/{pickers,config-section}.tsx`, hooks `use-configurator.ts`, pure helpers in
+  `lib/nebula/repo-spin-up.ts`): repo → branch (existing/new, DENIED preview for names policy
+  would refuse) → config (Configurator / by-hand templates / the repo's own twizz.yaml, edited
+  as text and validated live with the shared zod schema; proposed Dockerfile use/skip) →
+  env name (slug), TTL, db, attach (NAMED backend env, staging API via
+  `NEBULA_STAGING_API_URL`, or a twizz.com origin) with the resolved build-arg preview,
+  secrets (masked inputs, blank = later), env overrides, PR target → inline gate → result
+  (URL, PR links, tag). Opened from Environments (everyone) and from a Projects row.
+  Cards: `PendingCard` (RUNNING/FAIL with run link + reason), `PreviewCard` gains source/build
+  rows, "Rebuild from ref", "Env vars"; broken manifests show as UNKNOWN rows. Projects: kind
+  column from `twizz.yaml`, "Spin up" per org repo.
+- Known limits: `global_deny *prod*` also hits SECRET NAMES containing "prod" (e.g.
+  `PRODUCT_KEY`) — rename or ask an operator; the Configurator reads with the human's grant,
+  so a repo the App installation cannot see shows FAIL with GitHub's message.

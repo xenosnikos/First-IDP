@@ -394,6 +394,45 @@ has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not
   `setEnvVars` + owner-or-operator teardown, B4 "spin up from a repo" drawer, B5 cards +
   Projects "spin up", B6 docs. Start it in a fresh session (this one is near its context limit).
 
+## 2026-09-15 — Build-on-provision Phase B (developer flow) built
+
+- Per the plan file (`/root/.claude/plans/i-want-to-tweak-bubbly-book.md`) and NEBULA.md §N3.7
+  "Phase B". **All tests green: actions 67, shared 6, observer 36, dashboard 48, core/mcp/
+  reaper typecheck clean, `next build` passes.** Not yet committed/pushed or deployed.
+- **B1** `packages/core github.ts`: paginated `listOrgRepos` (+`pushedAt`, archived dropped),
+  `listBranches({q,limit})`, `getBranchHead`, `listTree`, 256 KB `getFileContent` cap. Router
+  `project`: `listGithubRepos({q})`, `listBranches`, `getBranchHead`, `repoConfig`,
+  `twizzConfigs`; `githubFor(ctx)` (session token) + `orgRepo()` (org-confined).
+- **B2** `packages/observer/src/agent.ts` (`runAgentLoop`, terminal tools, returns the
+  conversation); Observer is a thin caller. `configurator/` (types, proposal `checkProposal`,
+  tools, frozen prompt, `runConfigurator` with one nudge turn). Dashboard
+  `server/nebula/configurator.ts` (ledger `nebula.configurator`, caps 3/user/day, 20/day),
+  `app/api/configurator/route.ts` (SSE; branch-moved refusal), `observer.configuratorStatus`.
+- **B3** `routers/actions.ts`: `createEnvFromRepo` (one gate: branch → config PR(s) →
+  secret → pending manifest → dispatch; fields carry `filesHash`/`envHash`/`secretNames`;
+  secret values refused on request, required with the nonce), `rebuildFromRef`, `setEnvVars`,
+  owner-or-operator `teardownNamedEnv`/`extendNamedEnv` (`ownedEnv()`), `me` returns
+  `ownerLabel` + `NEBULA_STAGING_API_URL`. `packages/actions/src/fields.ts` (`hashFiles`,
+  `hashVars`, `nameList`). `namedEnvDeps()` gains `builds: new GithubBuilds(gh)`. Policy:
+  `create_env_from_repo` denies `newBranch: main|master|*staging*`.
+- **B4/B5** `components/environments/repo-spin-up-drawer.tsx` + `repo-spin-up/{pickers,
+  config-section}.tsx`, `lib/nebula/{repo-spin-up,use-configurator}.ts`; `PendingCard`;
+  `PreviewCard` source/build rows + Rebuild + Env vars + owner-or-operator buttons;
+  Environments header "Spin up from a repo" (everyone) + "Release image" (operators); broken
+  manifests as UNKNOWN rows; Projects kind column (`twizzConfigs`) + "Spin up" per repo.
+  Dashboard gains the `yaml` dep (client-side twizz.yaml parsing); observer gains
+  `@twizz-idp/shared` + `yaml`.
+- **B6** NEBULA.md §N3.7 Phase B paragraph, CLAUDE.md (routers/packages/routes),
+  apps/dashboard/CLAUDE.md write policy, `twizz-nebula-users` skill (owner-or-operator).
+- **Not verified live yet** (needs a deploy): the plan's steps 6–8 (Projects → spin up
+  `twizz-sentinel` on a new branch → Configurator proposal → gate → PR + RUNNING → PASS;
+  a frontend attach; audit grep for a secret value; owner vs stranger teardown). To deploy:
+  commit + push twizz-idp as `xenosnikos` (image build), bump the dashboard image in gitops
+  `apps/nebula/`, optionally set `NEBULA_STAGING_API_URL` and `CONFIGURATOR_*` caps in the
+  nebula env. `sentinel-smoke` from Phase A is still up (reaper dry-run).
+- Known: `global_deny *prod*` also refuses SECRET NAMES containing "prod" (e.g. `PRODUCT_KEY`)
+  because names ride in gate fields; documented in NEBULA.md.
+
 ## Verification
 
 ```

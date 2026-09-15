@@ -26,10 +26,10 @@ and the strictly-authorized MCP toolset. See STATE.md for phase status.
 
 | Route | Description |
 |-------|-------------|
-| `/projects` | GitHub org repo list |
+| `/projects` | GitHub org repo list with twizz.yaml kind + "Spin up" per repo |
 | `/projects/[id]` | Project introspection (stack, environments, deployments) |
 | `/projects/[id]/environments/[envId]` | Environment detail, pipeline history, service logs |
-| `/environments` | Cross-project environment overview (diagram + table) |
+| `/environments` | Nebula grid: NAMED/pending/PR-preview/gitops apps; "Spin up from a repo" drawer (any twizz-app repo/branch, Configurator, gate) |
 | `/pipelines` | Recent pipeline runs |
 | `/pipelines/[runId]` | Step timeline + log viewer (points at GitHub Actions from Phase 3) |
 | `/clusters` | Pods + logs across all three clusters (observe-only for staging/prod); URL-addressable log queries; the Observer panel |
@@ -56,16 +56,21 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
 
 ## tRPC Routers (all behind protectedProcedure)
 
-- `project` - list, listGithubRepos, listBranches, get, detectType, create (registration only)
+- `project` - list, listGithubRepos({q}), listBranches({repo,q}), getBranchHead, repoConfig, twizzConfigs,
+  get, detectType, create (reads use the SESSION token; confined to GITHUB_ORG by `orgRepo()`)
 - `environment` - list, get (read-only; envs are created/destroyed by GitOps)
 - `pipeline` - getStatus, getStepLogs, list, listAll (DB reads; GitHub Actions wiring lands in Phase 3)
 - `secret` - list, listKeys (names only, never values)
 - `logs` - getPodLogs (legacy per-environment log viewer)
 - `clusters` - overview, logs, logHistogram (queries only, by construction)
 - `nebula` - listEnvironments, listProjects (read-only Nebula views)
-- `observer` - status (the Observer run itself streams over `POST /api/observer`, SSE)
-- `actions` - the ONLY mutations: named-env create/teardown/extend/clone behind
-  `operatorProcedure` + the `@twizz-idp/actions` gate (policy → nonce → AuditLog)
+- `observer` - status, configuratorStatus (runs stream over `POST /api/observer` and
+  `POST /api/configurator`, SSE; both audited and capped)
+- `actions` - the ONLY mutations, all behind the `@twizz-idp/actions` gate (policy → nonce →
+  AuditLog): release-image create + clone-staging-db (operators), `createEnvFromRepo`
+  (any signed-in user; branch + config PR + pending manifest + central build in one confirm;
+  secret values only with the nonce), `rebuildFromRef`/`setEnvVars`/teardown/extend
+  (owner-or-operator)
 
 ## Auth / RBAC
 
@@ -110,8 +115,9 @@ naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app he
 - `@twizz-idp/shared` - Types, constants
 - `@twizz-idp/core` - External-API service layer (GitHub, AWS/CloudWatch, Vercel, Atlas)
 - `@twizz-idp/actions` - The write gate + named-env actions + service registry (dashboard and MCP)
-- `@twizz-idp/observer` - Observer log assistant: pure `./logs` (normalize/redact/compact),
-  scope-locked tools, prompt, Claude harness (`@anthropic-ai/sdk`)
+- `@twizz-idp/observer` - the agent harness (`agent.ts` generic loop over `@anthropic-ai/sdk`),
+  the Observer log assistant (pure `./logs`, scope-locked tools, prompt) and the Configurator
+  (`./configurator`: read-only repo tools + terminal `propose_config` → twizz.yaml/Dockerfile)
 - `@twizz-idp/onboard` - Repo onboarding CLI (twizz.yaml, workflows, gitops values/appset)
 - `@twizz-idp/reaper` - Named-env TTL reaper CronJob
 - `@twizz-idp/config` - Shared configs

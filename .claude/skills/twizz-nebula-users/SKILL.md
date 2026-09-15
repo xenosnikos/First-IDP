@@ -14,8 +14,11 @@ in a different place. Check them in this order when someone "can't get in".
 | 2 | **Google SSO** (ingress-nginx global auth, oauth2-proxy at `auth.prv.twizz.com`) | any **twizz.com** Google Workspace account | Google Workspace (no allowlist to edit; the admin-gate allowlist in `infra/Pulumi.nonprod.yaml` is for the admin apps, not Nebula) | redirect loop or "unauthorized" before the Nebula page loads |
 | 3 | **Nebula sign-in** (GitHub App `twizz-nebula`) | GitHub login in `ALLOWED_GITHUB_LOGINS` (SM `preview/nebula`), or active member of `ALLOWED_GITHUB_ORGS` (unset in-cluster) | `scripts/nebula-allow-login.sh` | "sign in" bounces back; an `AuditLog` row `action=signin allowed=false` names the login |
 
-Writes (spin up / teardown / extend / clone) additionally need the login in
-`NEBULA_OPERATORS`. Reads (Environments, Projects, Clusters, Observer) need only gate 3.
+Writes: **any signed-in user** can "Spin up from a repo" (build-on-provision, through the
+human gate) and manage the envs they own (teardown / extend / env vars / rebuild —
+`manifest.owner` = their GitHub login). `NEBULA_OPERATORS` additionally unlocks the
+release-image spin-up, clone-staging-db, and acting on anyone's env. Reads (Environments,
+Projects, Clusters, Observer, Configurator) need only gate 3.
 
 ## Add a person (read-only)
 

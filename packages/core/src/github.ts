@@ -35,7 +35,7 @@ function mapJobPhase(status: string | null, conclusion: string | null): Workflow
   return "Pending";
 }
 
-type Repo = {
+export type Repo = {
   id: number;
   name: string;
   fullName: string;
@@ -43,10 +43,22 @@ type Repo = {
   language: string | null;
   defaultBranch: string;
   updatedAt: string;
+  /** Last push — the honest "activity" signal for a picker. */
+  pushedAt: string;
   private: boolean;
 };
 
-type Branch = { name: string; sha: string };
+export type Branch = { name: string; sha: string; protected?: boolean };
+
+export type BranchHead = { sha: string; committedAt: string | null; message: string; author: string | null };
+
+export type TreeEntry = { path: string; type: "blob" | "tree"; size?: number };
+
+/** Directories nobody wants to configure from; dropped from `listTree`. */
+export const TREE_SKIP_RE = /(^|\/)(node_modules|\.git|dist|build|\.next|coverage|\.turbo|vendor|__pycache__)(\/|$)/;
+/** Binary-ish extensions the Configurator never needs to read. */
+export const BINARY_EXT_RE = /\.(png|jpe?g|gif|webp|svg|ico|pdf|zip|gz|tgz|tar|woff2?|ttf|otf|eot|mp[34]|mov|wasm|jar|class|so|dylib|dll|exe|bin|lock)$/i;
+export const FILE_CONTENT_CAP = 256 * 1024;
 
 export class GitHubService {
   private octokit: Octokit;
@@ -55,51 +67,76 @@ export class GitHubService {
     this.octokit = new Octokit({ auth: accessToken });
   }
 
+  /** Every non-archived repo in the org (paginated; the org has > 100). */
   async listOrgRepos(org: string): Promise<Repo[]> {
-    const { data } = await this.octokit.repos.listForOrg({
-      org,
-      sort: "updated",
-      per_page: 100,
-      type: "all",
-    });
-
-    return data.map((r) => ({
-      id: r.id,
-      name: r.name,
-      fullName: r.full_name,
-      url: r.html_url,
-      language: r.language ?? null,
-      defaultBranch: r.default_branch ?? "main",
-      updatedAt: r.updated_at ?? "",
-      private: r.private,
-    }));
+    const data = await this.octokit.paginate(this.octokit.repos.listForOrg, { org, sort: "pushed", per_page: 100, type: "all" });
+    return data
+      .filter((r) => !r.archived && !r.disabled)
+      .map((r) => ({
+        id: r.id,
+        name: r.name,
+        fullName: r.full_name,
+        url: r.html_url,
+        language: r.language ?? null,
+        defaultBranch: r.default_branch ?? "main",
+        updatedAt: r.updated_at ?? "",
+        pushedAt: r.pushed_at ?? r.updated_at ?? "",
+        private: r.private,
+      }));
   }
 
-  async listBranches(owner: string, repo: string): Promise<Branch[]> {
-    const { data } = await this.octokit.repos.listBranches({
-      owner,
-      repo,
-      per_page: 100,
-    });
-
-    return data.map((b) => ({
-      name: b.name,
-      sha: b.commit.sha,
-    }));
+  /** Branches, paginated, optionally filtered by a case-insensitive substring
+   * and capped. Exact matches sort first so a typed name is always visible. */
+  async listBranches(owner: string, repo: string, opts: { q?: string; limit?: number } = {}): Promise<Branch[]> {
+    const limit = Math.max(1, Math.min(opts.limit ?? 500, 2000));
+    const q = opts.q?.trim().toLowerCase();
+    const out: Branch[] = [];
+    for await (const page of this.octokit.paginate.iterator(this.octokit.repos.listBranches, { owner, repo, per_page: 100 })) {
+      for (const b of page.data) {
+        if (q && !b.name.toLowerCase().includes(q)) continue;
+        out.push({ name: b.name, sha: b.commit.sha, protected: b.protected });
+      }
+      if (!q && out.length >= limit) break;
+    }
+    if (q) out.sort((a, b) => Number(b.name.toLowerCase() === q) - Number(a.name.toLowerCase() === q) || a.name.localeCompare(b.name));
+    return out.slice(0, limit);
   }
 
+  /** The commit a branch points at right now (pinned by the spin-up flow). */
+  async getBranchHead(owner: string, repo: string, branch: string): Promise<BranchHead> {
+    const { data } = await this.octokit.repos.getBranch({ owner, repo, branch });
+    return {
+      sha: data.commit.sha,
+      committedAt: data.commit.commit.committer?.date ?? data.commit.commit.author?.date ?? null,
+      message: (data.commit.commit.message ?? "").split("\n")[0].slice(0, 200),
+      author: data.commit.author?.login ?? data.commit.commit.author?.name ?? null,
+    };
+  }
+
+  /** Recursive tree at a commit, without vendored/build dirs and binaries.
+   * `truncated` is GitHub's own flag (very large repos) OR our cap. */
+  async listTree(owner: string, repo: string, sha: string, opts: { maxEntries?: number } = {}): Promise<{ entries: TreeEntry[]; truncated: boolean }> {
+    const max = opts.maxEntries ?? 3000;
+    const { data } = await this.octokit.git.getTree({ owner, repo, tree_sha: sha, recursive: "1" });
+    const entries: TreeEntry[] = [];
+    for (const e of data.tree) {
+      if (!e.path || (e.type !== "blob" && e.type !== "tree")) continue;
+      if (TREE_SKIP_RE.test(e.path)) continue;
+      if (e.type === "blob" && BINARY_EXT_RE.test(e.path)) continue;
+      entries.push({ path: e.path, type: e.type, ...(e.size != null ? { size: e.size } : {}) });
+      if (entries.length >= max) break;
+    }
+    return { entries, truncated: !!data.truncated || entries.length >= max };
+  }
+
+  /** File text at a ref, or null when absent / not a file / over the cap. */
   async getFileContent(owner: string, repo: string, path: string, ref: string): Promise<string | null> {
     try {
-      const { data } = await this.octokit.repos.getContent({
-        owner,
-        repo,
-        path,
-        ref,
-      });
-
-      if ("content" in data && data.encoding === "base64") {
-        return Buffer.from(data.content, "base64").toString("utf-8");
-      }
+      const { data } = await this.octokit.repos.getContent({ owner, repo, path, ref });
+      if (Array.isArray(data) || data.type !== "file") return null;
+      if (data.size > FILE_CONTENT_CAP) return null;
+      if (data.encoding === "base64") return Buffer.from(data.content, "base64").toString("utf-8");
+      // >1 MB files come back with encoding "none"; capped above anyway
       return null;
     } catch {
       return null;

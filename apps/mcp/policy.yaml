@@ -55,6 +55,9 @@ write_tools:
   # ── Build-on-provision envs (docs/NEBULA.md §N3.7): any twizz-app repo/ref ──
   # Secret names, ECR repos and image tags are derived from repo/sha in code.
   # global_deny *prod* also rejects repos/refs whose names contain "prod" (intended).
+  # The dashboard folds branch creation + the config PR into this ONE gate
+  # (one human confirm); `newBranch` is the branch it would create (or "").
+  # Secret VALUES are never fields — their sorted NAMES are; files/env ride as hashes.
   create_env_from_repo:
     allow:
       repo: ["twizz-app/*"]
@@ -65,6 +68,7 @@ write_tools:
     deny:
       name: ["*prod*", "*staging*", "shared", "dev", "nebula", "argocd"]
       service: ["nebula", "argocd", "shared", "kube-*", "default"]
+      newBranch: ["main", "master", "*staging*"]
 
   open_config_pr:
     allow:

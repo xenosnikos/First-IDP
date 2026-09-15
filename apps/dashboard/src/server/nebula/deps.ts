@@ -5,6 +5,7 @@ import { SecretsManagerClient } from "@aws-sdk/client-secrets-manager";
 import { ECRClient } from "@aws-sdk/client-ecr";
 import {
   EcrRegistry,
+  GithubBuilds,
   GithubGitops,
   PrismaNonceStore,
   SecretsManagerStore,
@@ -48,10 +49,13 @@ export function octokit(): Octokit {
 /** Named-env ports. AWS uses the default credential chain — IRSA in-cluster,
  * AWS_PROFILE locally. No static keys in the app. */
 export function namedEnvDeps() {
+  const gh = octokit();
   return {
-    gitops: new GithubGitops(octokit()),
+    gitops: new GithubGitops(gh),
     secrets: new SecretsManagerStore(new SecretsManagerClient({ region })),
     images: new EcrRegistry(new ECRClient({ region })),
+    // the central builder (workflow_dispatch needs the platform token's `workflow` scope)
+    builds: new GithubBuilds(gh),
     maxNamedEnvs: Number(process.env.NEBULA_MAX_NAMED_ENVS) || undefined,
   };
 }

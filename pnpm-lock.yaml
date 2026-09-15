@@ -80,6 +80,9 @@ importers:
       superjson:
         specifier: ^2.2.0
         version: 2.2.6
+      yaml:
+        specifier: ^2.6.0
+        version: 2.9.0
       zod:
         specifier: ^3.24.0
         version: 3.25.76
@@ -299,6 +302,12 @@ importers:
       '@anthropic-ai/sdk':
         specifier: ^0.124.0
         version: 0.124.0(zod@3.25.76)
+      '@twizz-idp/shared':
+        specifier: workspace:*
+        version: link:../shared
+      yaml:
+        specifier: ^2.6.0
+        version: 2.9.0
       zod:
         specifier: ^3.25.0
         version: 3.25.76

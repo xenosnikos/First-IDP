@@ -5,11 +5,16 @@ at `nebula.prv.twizz.com` (root Dockerfile `dashboard` target: `output: "standal
 `/api/health` is the probe.
 
 ## Write policy (deliberate exception to "dashboard is read-only")
-The ONLY writes are the Nebula named-env actions in `src/server/routers/actions.ts`
-(`createNamedEnv`, `teardownNamedEnv`, `cloneStagingDb`, `extendNamedEnv`). Each goes
-`protectedProcedure` → operator allowlist (`NEBULA_OPERATORS`, `src/lib/nebula/operators.ts`)
-→ `@twizz-idp/actions` `createGate` (policy.yaml → `PrismaNonceStore` two-step confirm →
-action → `AuditLog` row). Never add a mutation that bypasses that gate. No kube API writes.
+The ONLY writes are the Nebula named-env actions in `src/server/routers/actions.ts`.
+Who may: `createNamedEnv` (release image) and `cloneStagingDb` need the operator allowlist
+(`NEBULA_OPERATORS`, `src/lib/nebula/operators.ts`); `createEnvFromRepo` (build-on-provision,
+docs/NEBULA.md §N3.7) is self-service for any signed-in user; `teardownNamedEnv`,
+`extendNamedEnv`, `setEnvVars`, `rebuildFromRef` are owner-or-operator (`ownedEnv()`, denial
+audited). Every one then goes through `@twizz-idp/actions` `createGate` (policy.yaml →
+`PrismaNonceStore` two-step confirm → action → `AuditLog` row). Secret VALUES never enter
+gate fields, summaries, audit rows, results or git — `createEnvFromRepo` refuses them on the
+request call and accepts them only with the nonce. Never add a mutation that bypasses the
+gate. No kube API writes. The Configurator (`/api/configurator`) is read-only and audited.
 Policy file: `apps/mcp/policy.yaml`, resolved by `src/server/nebula/deps.ts` and traced
 into the standalone image by `next.config.ts`.
 
@@ -26,12 +31,14 @@ for the ingress); `src/lib/auth.ts` adds org-membership RBAC + AuditLog. Session
 `login` (GitHub) — the actor for every audit row.
 
 ## Routes
-`/environments` Nebula grid (preview cards + spin-up drawer), `/environments/topology`
-the pre-Nebula introspection map, `/projects`, `/pipelines` (read-only, unchanged).
+`/environments` Nebula grid (preview/pending cards, "Spin up from a repo" drawer for everyone,
+release-image drawer for operators), `/environments/topology` the pre-Nebula introspection
+map, `/projects` (kind column + "Spin up"), `/clusters` (Observer), `/pipelines`.
 
 ## Tests
 `pnpm --filter @twizz-idp/dashboard test` (vitest): status-word mapping, operator
-allowlist, policy wiring.
+allowlist, policy wiring, spin-up helpers, and `create-env-from-repo.test.ts` — the gated
+create path against fake ports (secret values only ever land in the secret store).
 
 ## Gotchas
 - tsconfig `declaration: false` — re-enabling resurrects TS2742 from next-auth/trpc

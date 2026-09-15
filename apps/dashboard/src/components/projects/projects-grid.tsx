@@ -4,8 +4,11 @@ import Link from "next/link";
 import { useState } from "react";
 import { trpc } from "@/lib/trpc-client";
 import { Pill } from "@/components/nebula/pill";
+import { Button } from "@/components/nebula/button";
 import { PageHeader, Row } from "@/components/nebula/plate";
 import type { StatusWord } from "@/lib/nebula/status";
+import { RepoSpinUpDrawer } from "@/components/environments/repo-spin-up-drawer";
+import type { RepoPick } from "@/components/environments/repo-spin-up/pickers";
 
 type Word = "DEPLOYED" | "PREVIEWABLE" | "REGISTERED" | "UNONBOARDED";
 const WORDS: Word[] = ["DEPLOYED", "PREVIEWABLE", "REGISTERED", "UNONBOARDED"];
@@ -22,7 +25,11 @@ const BLURB: Record<Word, string> = {
 export function ProjectsGrid() {
   const q = trpc.nebula.listProjects.useQuery(undefined, { staleTime: 60_000, retry: false });
   const [filter, setFilter] = useState<Word | "ALL">("ALL");
+  const [spin, setSpin] = useState<RepoPick | null>(null);
   const list = (q.data?.projects ?? []).filter((p) => filter === "ALL" || p.words.includes(filter));
+  // twizz.yaml kind per org repo (default branch), 50 at a time, cached server-side
+  const orgRepos = (q.data?.projects ?? []).filter((p) => p.slug.toLowerCase().startsWith(`${(q.data?.org ?? "twizz-app").toLowerCase()}/`) && p.defaultBranch).slice(0, 50).map((p) => ({ name: p.name, defaultBranch: p.defaultBranch! }));
+  const configs = trpc.project.twizzConfigs.useQuery({ repos: orgRepos }, { enabled: orgRepos.length > 0, staleTime: 10 * 60_000, retry: false });
   const counts = WORDS.reduce<Record<Word, number>>((acc, w) => ({ ...acc, [w]: (q.data?.projects ?? []).filter((p) => p.words.includes(w)).length }), {} as Record<Word, number>);
 
   return (
@@ -94,18 +101,23 @@ export function ProjectsGrid() {
                 ))}
               </Row>
               <Row label="nebula">
-                {p.registry ? (
-                  <>
-                    <span>{p.registry.kind}</span>
-                    <Pill word={p.registry.status} title={p.registry.status === "SHIPPED" ? "provisionable from the Environments page" : "in the registry; build-on-provision lands in N3 chunk 3"} />
-                  </>
-                ) : (
-                  <span style={{ color: "var(--n-ink-faint)" }}>not in the service registry</span>
-                )}
+                {(() => {
+                  const c = configs.data?.[p.name];
+                  if (c) return <><span>twizz.yaml · {c.kind} · v{c.version}</span>{!c.hasDockerfile && <span style={{ color: "var(--n-ink-faint)", fontSize: 10 }}>no Dockerfile</span>}</>;
+                  if (p.registry) return <><span>{p.registry.kind}</span><Pill word={p.registry.status} title={p.registry.status === "SHIPPED" ? "provisionable from a release image" : "in the registry"} /></>;
+                  if (configs.isLoading && p.defaultBranch) return <span style={{ color: "var(--n-ink-faint)" }}>reading twizz.yaml…</span>;
+                  if (p.language) return <span style={{ color: "var(--n-ink-faint)" }}>{p.language} · not configured — spin up to let Nebula write twizz.yaml</span>;
+                  return <span style={{ color: "var(--n-ink-faint)" }}>not configured — spin up to let Nebula write twizz.yaml</span>;
+                })()}
               </Row>
               <Row label="branch" last>
                 <span>{p.defaultBranch ?? "—"}</span>
                 {p.updatedAt && <span style={{ color: "var(--n-ink-faint)", fontSize: 10 }}>updated {new Date(p.updatedAt).toLocaleDateString()}</span>}
+                {p.defaultBranch && p.slug.toLowerCase().startsWith(`${(q.data?.org ?? "twizz-app").toLowerCase()}/`) && (
+                  <Button variant="ion" style={{ marginLeft: "auto", padding: "4px 8px", fontSize: 10 }} onClick={() => setSpin({ name: p.name, fullName: p.slug, defaultBranch: p.defaultBranch!, language: p.language ?? null, pushedAt: p.updatedAt ?? "", private: p.private === true })}>
+                    Spin up
+                  </Button>
+                )}
               </Row>
             </div>
           </article>
@@ -114,6 +126,7 @@ export function ProjectsGrid() {
       {q.data && list.length === 0 && (
         <div className="n-plate" style={{ padding: 24, color: "var(--n-ink-muted)" }}>no repos match this filter</div>
       )}
+      <RepoSpinUpDrawer open={!!spin} preselect={spin} onClose={() => setSpin(null)} onCreated={() => setSpin(null)} />
     </div>
   );
 }
