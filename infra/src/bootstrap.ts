@@ -12,6 +12,8 @@ export function bootstrapCluster(
     certManagerRoleArn: pulumi.Output<string>;
     /** release train (src/staging.ts): lets Argo CD deploy into the staging tier's namespace */
     argocdDeployerRoleArn: pulumi.Output<string>;
+    /** the staging cluster's API server URL (Argo cluster secret `server`) */
+    stagingServer: pulumi.Output<string>;
   },
   access: {
     privateSubnetIds: pulumi.Output<string>[]; // internal NLB lives here (VPN-only)
@@ -332,6 +334,33 @@ export function bootstrapCluster(
           params: { "server.insecure": true }, // TLS terminates at nginx (wildcard cert)
           cm: {
             url: `https://${ARGOCD_HOST}`,
+            // Release train: on the STAGING cluster Argo's grant is a namespace-scoped
+            // AmazonEKSAdminPolicy, which does not cover third-party CRDs there (the
+            // CloudWatch/Dynatrace/OTel operators). Argo's cluster cache lists every
+            // namespaced kind it discovers and fails closed on the first forbidden one,
+            // so track only the kinds the k8s `admin` role covers AND the chart renders
+            // (kind-explicit: the core group also holds PodTemplate etc., which admin
+            // may not list). Non-prod keeps everything (an inclusion list applies to
+            // every cluster once present).
+            "resource.inclusions": pulumi.interpolate`- apiGroups: ["*"]
+  kinds: ["*"]
+  clusters: ["https://kubernetes.default.svc"]
+- apiGroups: [""]
+  kinds: ["ConfigMap", "Secret", "Service", "ServiceAccount", "Pod", "Endpoints", "Event", "PersistentVolumeClaim", "ReplicationController", "ResourceQuota", "LimitRange"]
+  clusters: ["${roles.stagingServer}"]
+- apiGroups: ["apps"]
+  kinds: ["Deployment", "ReplicaSet", "StatefulSet", "DaemonSet", "ControllerRevision"]
+  clusters: ["${roles.stagingServer}"]
+- apiGroups: ["batch"]
+  kinds: ["Job", "CronJob"]
+  clusters: ["${roles.stagingServer}"]
+- apiGroups: ["autoscaling"]
+  kinds: ["HorizontalPodAutoscaler"]
+  clusters: ["${roles.stagingServer}"]
+- apiGroups: ["networking.k8s.io"]
+  kinds: ["Ingress", "NetworkPolicy"]
+  clusters: ["${roles.stagingServer}"]
+`,
             // Google Workspace SSO via Dex, restricted to the company domain.
             "dex.config": [
               "connectors:",

@@ -31,7 +31,7 @@ const stagingAccess = createStagingAccess({ oidcProviderArn: eks.oidcProviderArn
 
 const bootstrap = bootstrapCluster(
   eks.kubeconfig,
-  { esoRoleArn: iam.esoRoleArn, certManagerRoleArn: iam.certManagerRoleArn, argocdDeployerRoleArn: stagingAccess.argocdDeployerRoleArn },
+  { esoRoleArn: iam.esoRoleArn, certManagerRoleArn: iam.certManagerRoleArn, argocdDeployerRoleArn: stagingAccess.argocdDeployerRoleArn, stagingServer: stagingAccess.stagingEndpoint },
   {
     privateSubnetIds: networking.privateSubnetIds,
     googleDomain: cfg.get("googleDomain") ?? "twizz.com",

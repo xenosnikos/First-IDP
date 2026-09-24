@@ -14,7 +14,7 @@ import * as pulumi from "@pulumi/pulumi";
 //      clusterResources: false) — Argo will not even list cluster-scoped kinds
 //   4. an IRSA role on the STAGING cluster's OIDC provider for the sentinel pod
 //      (logs read, its own SM blob, Bedrock embeddings — no WAF/S3 until asked)
-//   5. DNS: <svc>.stg.prv.twizz.com → the staging ingress-nginx ELB
+//   5. DNS: <svc>.stg.prv.twizz.com -> the staging ingress-nginx ELB
 //
 // EKS-Moly-staging itself stays unmanaged by Pulumi (it predates this repo);
 // only account-level resources (IAM, access entries, Route53) are created here.
@@ -37,7 +37,7 @@ export function createStagingAccess(
   const argoSubjects = ["argocd-application-controller", "argocd-server", "argocd-applicationset-controller"].map((sa) => `system:serviceaccount:argocd:${sa}`);
   const argocdDeployerRole = new aws.iam.Role("twizz-argocd-staging-deployer", {
     name: "twizz-argocd-staging-deployer",
-    description: "Argo CD on EKS-Twizz-NonProd → EKS-Moly-staging, namespace sentinel only (release train)",
+    description: "Argo CD on EKS-Twizz-NonProd -> EKS-Moly-staging, namespace sentinel only (release train)",
     assumeRolePolicy: pulumi.all([nonprod.oidcProviderArn, nonprod.oidcProviderUrl]).apply(([arn, url]) => {
       const host = url.replace(/^https?:\/\//, "");
       return JSON.stringify({
