@@ -26,6 +26,8 @@ export const STATUS_WORDS = [
   "PREVIEWABLE",
   "REGISTERED",
   "UNONBOARDED",
+  // N4: release-train tier
+  "STAGING",
 ] as const;
 
 export type StatusWord = (typeof STATUS_WORDS)[number];
@@ -39,6 +41,7 @@ export function toneOf(word: StatusWord): Tone {
     case "DEPLOYABLE":
     case "NAMED":
     case "PREVIEWABLE":
+    case "STAGING":
       return "ion";
     case "DEPLOYED":
       return "pass";

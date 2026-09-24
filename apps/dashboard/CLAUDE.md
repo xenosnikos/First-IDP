@@ -10,7 +10,8 @@ Who may: `createNamedEnv` (release image) and `cloneStagingDb` need the operator
 (`NEBULA_OPERATORS`, `src/lib/nebula/operators.ts`); `createEnvFromRepo` (build-on-provision,
 docs/NEBULA.md §N3.7) is self-service for any signed-in user; `teardownNamedEnv`,
 `extendNamedEnv`, `setEnvVars`, `rebuildFromRef` are owner-or-operator (`ownedEnv()`, denial
-audited). Every one then goes through `@twizz-idp/actions` `createGate` (policy.yaml →
+audited); `promoteRelease` / `mergePromotion` (release train, docs/NEBULA.md §N4: a gitops PR
+to the staging tier, then a sha-guarded merge) are operator-only. Every one then goes through `@twizz-idp/actions` `createGate` (policy.yaml →
 `PrismaNonceStore` two-step confirm → action → `AuditLog` row). Secret VALUES never enter
 gate fields, summaries, audit rows, results or git — `createEnvFromRepo` refuses them on the
 request call and accepts them only with the nonce. Never add a mutation that bypasses the
@@ -28,12 +29,16 @@ only `STATUS_WORDS` from `src/lib/nebula/status.ts`), `EmberButton` (human gate 
 ## Auth
 Auth.js v5. `src/lib/auth.config.ts` is edge-safe (middleware; no Prisma; `trustHost`
 for the ingress); `src/lib/auth.ts` adds org-membership RBAC + AuditLog. Session carries
-`login` (GitHub) — the actor for every audit row.
+`login` (GitHub) — the actor for every audit row — and `accessToken`, refreshed in the jwt
+callback (`src/lib/github-token.ts`; GitHub App tokens expire in 8 h). GitHub reads use
+`server/nebula/github-session.ts` `withGithub()`: session token first, the platform token on
+a 401. Never build a `GitHubService` from `session.accessToken` directly.
 
 ## Routes
 `/environments` Nebula grid (preview/pending cards, "Spin up from a repo" drawer for everyone,
-release-image drawer for operators), `/environments/topology` the pre-Nebula introspection
-map, `/projects` (kind column + "Spin up"), `/clusters` (Observer), `/pipelines`.
+release-image drawer for operators; non-prod tier only), `/environments/topology` the pre-Nebula
+introspection map, `/projects` (kind column + "Spin up"), `/clusters` (Observer), `/pipelines`,
+`/releases` the release train (`components/releases/release-train.tsx`).
 
 ## Tests
 `pnpm --filter @twizz-idp/dashboard test` (vitest): status-word mapping, operator

@@ -18,6 +18,7 @@ import {
   type ImageRegistry,
   type SecretStore,
 } from "./named-envs";
+import type { PromotionPr, PromotionRepo } from "./promote";
 
 /** GitHub Contents API over TwizzyNicky/twizz-gitops. Each put/delete is one
  * commit on `main` — Argo CD's git generator picks it up on its next poll. */
@@ -204,5 +205,90 @@ export class EcrRegistry implements ImageRegistry {
       }
     }
     return out;
+  }
+}
+
+/** Promotion PRs on TwizzyNicky/twizz-gitops (docs/NEBULA.md §N4): a
+ * branch off `main` carrying the values bump, a PR into `main`, a sha-guarded
+ * squash merge. Reads use the default branch; the platform token does the writes. */
+export class GithubPromotions implements PromotionRepo {
+  constructor(private readonly gh: Octokit, private readonly repo = GITOPS) {}
+
+  private toPr(p: { number: number; html_url: string; title: string; head: { ref: string; sha: string }; user: { login: string } | null; created_at: string; state: string; merged_at?: string | null }): PromotionPr {
+    return {
+      number: p.number,
+      url: p.html_url,
+      title: p.title,
+      branch: p.head.ref,
+      headSha: p.head.sha,
+      author: p.user?.login ?? "unknown",
+      createdAt: p.created_at,
+      state: p.merged_at ? "merged" : p.state === "open" ? "open" : "closed",
+    };
+  }
+
+  async readFile(path: string) {
+    try {
+      const { data } = await this.gh.repos.getContent({ owner: this.repo.owner, repo: this.repo.repo, path, ref: this.repo.branch });
+      if (Array.isArray(data) || data.type !== "file") return null;
+      return { content: Buffer.from(data.content, "base64").toString("utf8"), sha: data.sha };
+    } catch (e) {
+      if ((e as { status?: number }).status === 404) return null;
+      throw e;
+    }
+  }
+
+  async openPr(input: { branch: string; files: Record<string, string>; title: string; body: string }) {
+    const { owner, repo, branch: base } = this.repo;
+    const { data: baseRef } = await this.gh.git.getRef({ owner, repo, ref: `heads/${base}` });
+    let parentSha = baseRef.object.sha;
+    let exists = false;
+    try {
+      const { data: r } = await this.gh.git.getRef({ owner, repo, ref: `heads/${input.branch}` });
+      parentSha = r.object.sha;
+      exists = true;
+    } catch (e) {
+      if ((e as { status?: number }).status !== 404) throw e;
+    }
+    const tree = await Promise.all(
+      Object.entries(input.files).map(async ([path, content]) => ({
+        path,
+        mode: "100644" as const,
+        type: "blob" as const,
+        sha: (await this.gh.git.createBlob({ owner, repo, content, encoding: "utf-8" })).data.sha,
+      })),
+    );
+    const { data: newTree } = await this.gh.git.createTree({ owner, repo, base_tree: parentSha, tree });
+    const { data: commit } = await this.gh.git.createCommit({ owner, repo, message: input.title, tree: newTree.sha, parents: [parentSha] });
+    if (exists) await this.gh.git.updateRef({ owner, repo, ref: `heads/${input.branch}`, sha: commit.sha, force: true });
+    else await this.gh.git.createRef({ owner, repo, ref: `refs/heads/${input.branch}`, sha: commit.sha });
+    const { data: pr } = await this.gh.pulls.create({ owner, repo, title: input.title, head: input.branch, base, body: input.body });
+    return { number: pr.number, url: pr.html_url, headSha: commit.sha };
+  }
+
+  async listOpenPrs(branchPrefix: string) {
+    const { owner, repo, branch: base } = this.repo;
+    const { data } = await this.gh.pulls.list({ owner, repo, state: "open", base, per_page: 100 });
+    return data.filter((p) => p.head.ref.startsWith(branchPrefix)).map((p) => this.toPr(p));
+  }
+
+  async getPr(number: number) {
+    try {
+      const { data } = await this.gh.pulls.get({ owner: this.repo.owner, repo: this.repo.repo, pull_number: number });
+      return this.toPr(data);
+    } catch (e) {
+      if ((e as { status?: number }).status === 404) return null;
+      throw e;
+    }
+  }
+
+  async mergePr(number: number, opts: { title: string; sha: string }) {
+    const { owner, repo } = this.repo;
+    const { data: pr } = await this.gh.pulls.get({ owner, repo, pull_number: number });
+    const { data } = await this.gh.pulls.merge({ owner, repo, pull_number: number, merge_method: "squash", sha: opts.sha, commit_title: opts.title });
+    if (!data.merged) throw new Error(`GitHub refused the merge of #${number}: ${data.message}`);
+    // best effort: the branch has no further use
+    await this.gh.git.deleteRef({ owner, repo, ref: `heads/${pr.head.ref}` }).catch(() => {});
+    return { sha: data.sha };
   }
 }

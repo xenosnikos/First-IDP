@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buildAppViews, buildProjectViews, classifyApp, isPlatformApp, isProjectRepo, prLink, type LiveApp } from "@/server/nebula/classify";
+import { IN_CLUSTER, buildAppViews, buildProjectViews, classifyApp, isPlatformApp, isProjectRepo, prLink, tierOf, type LiveApp } from "@/server/nebula/classify";
 import { podWord } from "@/lib/nebula/status";
 
 const GITOPS = "https://github.com/TwizzyNicky/twizz-gitops";
@@ -93,5 +93,21 @@ describe("podWord", () => {
     expect(podWord("Pending").word).toBe("PENDING");
     expect(podWord("Failed").word).toBe("FAIL");
     expect(podWord(undefined).word).toBe("UNKNOWN");
+  });
+});
+
+describe("tierOf (release train, §N4)", () => {
+  it("in-cluster and unlabelled → nonprod; the staging label OR a foreign destination → staging", () => {
+    expect(tierOf(app({}))).toBe("nonprod");
+    expect(tierOf(app({ destination: IN_CLUSTER }))).toBe("nonprod");
+    expect(tierOf(app({ labels: { "twizz-idp/tier": "staging" }, destination: IN_CLUSTER }))).toBe("staging");
+    expect(tierOf(app({ destination: "https://2B5C374652A4DAE99EB938A93BABA3F2.sk1.eu-west-1.eks.amazonaws.com" }))).toBe("staging");
+    expect(tierOf(app({ destination: "cluster:eks-moly-staging" }))).toBe("staging");
+  });
+  it("buildAppViews carries the tier so the Environments grid can keep non-prod only", () => {
+    const staging = app({ name: "staging-twizz-sentinel", namespace: "sentinel", project: "staging", labels: { "twizz-idp/tier": "staging", "twizz-idp/service": "twizz-sentinel" }, destination: "https://staging.example" });
+    const views = buildAppViews([staging, LIVE[3]], [], [], APPSETS);
+    expect(views.find((v) => v.name === "staging-twizz-sentinel")).toMatchObject({ tier: "staging", origin: "GITOPS APP", service: "twizz-sentinel" });
+    expect(views.find((v) => v.name === "twizz-admin-pr-139")?.tier).toBe("nonprod");
   });
 });

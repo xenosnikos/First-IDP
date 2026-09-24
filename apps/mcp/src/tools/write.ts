@@ -10,6 +10,10 @@ import { Octokit } from "@octokit/rest";
 import {
   EcrRegistry,
   GithubGitops,
+  GithubPromotions,
+  PROMOTABLE_NAMES,
+  PROMOTABLE_TAG_RE,
+  RELEASE_TARGETS,
   SecretsManagerStore,
   SERVICES,
   SERVICE_NAMES,
@@ -17,6 +21,11 @@ import {
   cloneStagingDb,
   createNamedEnv,
   extendNamedEnv,
+  mergePromotion,
+  parsePromotionBranch,
+  promoteRelease,
+  readTargetState,
+  releaseTarget,
   teardownNamedEnv,
   type GateResult,
 } from "@twizz-idp/actions";
@@ -73,7 +82,62 @@ const serviceSchema = z.enum(SERVICE_NAMES as [string, ...string[]]);
 
 const ttlSchema = z.number().int().min(TTL_HOURS.min).max(TTL_HOURS.max).default(TTL_HOURS.default);
 
+// ── Release train (docs/NEBULA.md §N4) ────────────────────────────────
+const promotableSchema = z.enum(PROMOTABLE_NAMES as [string, ...string[]]).describe("service on the release train (twizz-sentinel, twizz-admin)");
+const targetSchema = z.enum(RELEASE_TARGETS).describe("promotion target; only staging exists, prod is globally denied");
+const promotableTag = z.string().regex(PROMOTABLE_TAG_RE, "immutable ECR tag (build-*/nb-*/main-<sha>/pr-<n>-<sha>)").describe("immutable image tag from release_train candidates; aliases (main/dev/latest) are refused");
+
+/** Release-train ports: ECR reads on session-tagged operator creds, gitops PRs on the platform token. */
+async function releaseDeps(tool: string, resource: string) {
+  const creds = await operatorCreds(tool, resource, actor);
+  const gh = octokit();
+  return { images: new EcrRegistry(new ECRClient({ region, credentials: creds })), promotions: new GithubPromotions(gh) };
+}
+
 export function registerWriteTools(server: McpServer) {
+  server.tool(
+    "promote_release",
+    "Release train gate 1: open a twizz-gitops PR bumping apps/<service>/values-<target>.yaml image.tag to an immutable ECR tag. Nothing deploys until merge_promotion. Operators; two-step confirm.",
+    { service: promotableSchema, target: targetSchema, imageTag: promotableTag, confirm: confirmSchema },
+    async ({ service, target, imageTag, confirm }) => {
+      const t = releaseTarget(service, target);
+      if (!t) throw new Error(`${service} has no ${target} target`);
+      const fields = { service, target, imageTag };
+      const deps = await releaseDeps("promote_release", `${service}:${target}`);
+      const current = await readTargetState(deps, service, target).catch(() => null);
+      const summary = [
+        `Promote ${service} to ${target}: ${t.service.ecrRepo}:${imageTag}${current?.imageTag ? ` (replacing ${current.imageTag})` : ""}`,
+        `- open a PR on twizz-gitops bumping ${t.valuesFile} image.tag`,
+        `- nothing deploys until that PR is merged (merge_promotion); then Argo app ${t.argoApp} on ${t.cluster} rolls it out to https://${t.host}`,
+      ].join("\n");
+      return gated("promote_release", fields, confirm, summary, () => promoteRelease(deps, { service, target, imageTag, actor }));
+    },
+  );
+
+  server.tool(
+    "merge_promotion",
+    "Release train gate 2: squash-merge an open promotion PR (sha-guarded; refused if the PR does not promote exactly service/target/imageTag). Argo CD then syncs staging. Operators; two-step confirm.",
+    { pr: z.number().int().positive().describe("twizz-gitops PR number from release_train"), service: promotableSchema, target: targetSchema, imageTag: promotableTag, confirm: confirmSchema },
+    async ({ pr, service, target, imageTag, confirm }) => {
+      const t = releaseTarget(service, target);
+      if (!t) throw new Error(`${service} has no ${target} target`);
+      const deps = await releaseDeps("merge_promotion", `${service}:${target}#${pr}`);
+      const found = await deps.promotions.getPr(pr);
+      if (!found) throw new Error(`twizz-gitops PR #${pr} does not exist`);
+      const parsed = parsePromotionBranch(found.branch);
+      if (!parsed || parsed.service !== service || parsed.target !== target || parsed.tag !== imageTag) {
+        throw new Error(`PR #${pr} (${found.branch}) is not the promotion ${service} ${target} → ${imageTag}`);
+      }
+      const fields = { pr: String(pr), service, target, imageTag };
+      const summary = [
+        `Merge twizz-gitops PR #${pr} "${found.title}" (head ${found.headSha.slice(0, 7)}, by ${found.author})`,
+        `- squash-merge into main; refused by GitHub if the branch moves first`,
+        `- Argo app ${t.argoApp} on ${t.cluster} then rolls ${service} to ${imageTag} at https://${t.host}`,
+      ].join("\n");
+      return gated("merge_promotion", fields, confirm, summary, () => mergePromotion(deps, { prNumber: pr, service, target, imageTag, actor }));
+    },
+  );
+
   server.tool(
     "delete_preview",
     "Tear down a PR preview environment by removing its `preview` label — GitOps prunes the namespace. Two-step confirm.",

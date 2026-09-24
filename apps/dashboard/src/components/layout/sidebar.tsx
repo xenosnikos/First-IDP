@@ -14,11 +14,12 @@ const NAV: { href: string; label: string; word: StatusWord; blurb: string }[] = 
   { href: "/projects", label: "Projects", word: "SHIPPED", blurb: "repos & what the platform knows about them" },
   { href: "/pipelines", label: "Pipelines", word: "SHIPPED", blurb: "CI runs" },
   { href: "/clusters", label: "Clusters", word: "SHIPPED", blurb: "pods + logs across all three clusters (observe-only for staging/prod)" },
+  { href: "/releases", label: "Release train", word: "SHIPPED", blurb: "promote sentinel + admin from previews to staging by gitops PR (operators)" },
 ];
 
 const NORTH_STAR: { label: string; word: StatusWord }[] = [
   { label: "Agents", word: "STUB" },
-  { label: "Release train", word: "PLANNED" },
+  { label: "Prod promotion", word: "PLANNED" },
   { label: "Audit viewer", word: "PLANNED" },
 ];
 

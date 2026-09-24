@@ -10,6 +10,8 @@ export function bootstrapCluster(
   roles: {
     esoRoleArn: pulumi.Output<string>;
     certManagerRoleArn: pulumi.Output<string>;
+    /** release train (src/staging.ts): lets Argo CD deploy into the staging tier's namespace */
+    argocdDeployerRoleArn: pulumi.Output<string>;
   },
   access: {
     privateSubnetIds: pulumi.Output<string>[]; // internal NLB lives here (VPN-only)
@@ -350,7 +352,13 @@ export function bootstrapCluster(
             scopes: "[email]",
           },
         },
+        // IRSA for the release train: the controller (sync), server (UI diff/tree)
+        // and applicationset controller present this role to EKS-Moly-staging,
+        // whose access entry confines it to namespace `sentinel` (src/staging.ts).
+        controller: { serviceAccount: { annotations: { "eks.amazonaws.com/role-arn": roles.argocdDeployerRoleArn } } },
+        applicationSet: { serviceAccount: { annotations: { "eks.amazonaws.com/role-arn": roles.argocdDeployerRoleArn } } },
         server: {
+          serviceAccount: { annotations: { "eks.amazonaws.com/role-arn": roles.argocdDeployerRoleArn } },
           ingress: {
             enabled: true,
             ingressClassName: "nginx",

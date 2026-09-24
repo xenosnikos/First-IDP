@@ -7,6 +7,17 @@ import {
   NAME_RE,
   IMAGE_TAG_RE,
   ORG,
+  PROMOTABLE,
+  PROMOTABLE_NAMES,
+  PROMOTABLE_TAG_RE,
+  RELEASE_TARGETS,
+  listPromotions,
+  listReleaseCandidates,
+  mergePromotion,
+  parsePromotionBranch,
+  promoteRelease,
+  readTargetState,
+  releaseTarget,
   cloneStagingDb,
   createBranch,
   createEnvFromRepo,
@@ -39,7 +50,7 @@ import { router, protectedProcedure } from "../trpc";
 import { isOperator } from "@/lib/nebula/operators";
 import { argoWord, ttlWord } from "@/lib/nebula/status";
 import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
-import { argoStatusFor, readArgoApplications } from "../nebula/argo";
+import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
 
 // The Nebula write path (docs/NEBULA.md §4.2, §4.7, §N3.7). Every mutation here:
 //   protectedProcedure (signed-in org member)
@@ -103,6 +114,11 @@ function shape(r: GateResult): GateResult {
 
 const CONFIG_FILE = "twizz.yaml";
 const FILE_CAP = 64 * 1024;
+
+// ── Release train (docs/NEBULA.md §N4) ────────────────────────────────
+const promotableSchema = z.enum(PROMOTABLE_NAMES as [string, ...string[]]);
+const targetSchema = z.enum(RELEASE_TARGETS);
+const promotableTag = z.string().regex(PROMOTABLE_TAG_RE, "immutable ECR tag (build-*/nb-*/main-<sha>/pr-<n>-<sha>); aliases are never promoted");
 
 export const actionsRouter = router({
   /** Who am I to Nebula: read-only or operator. */
@@ -253,6 +269,99 @@ export const actionsRouter = router({
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
       return shape(await gate("rebuild_env", fields, confirm, summary, () => rebuildEnv(namedEnvDeps(), { name, sha: head, actor: ctx.login })));
+    }),
+
+  // ── Release train: previews → staging by gitops PR (§N4) ──────────────
+
+  /** Everything the Release train page shows: per promotable service the
+   * immutable candidates in ECR, what gitops says staging is on, the live
+   * Argo status of the staging Application, and the open promotion PRs. */
+  listReleaseTrain: protectedProcedure.query(async () => {
+    const deps = namedEnvDeps();
+    const [argo, promotions] = await Promise.all([
+      readArgoApplications(STAGING_LABEL),
+      listPromotions(deps).catch((e) => ({ error: String((e as Error).message ?? e) })),
+    ]);
+    const services = await Promise.all(
+      PROMOTABLE.map(async (entry) => {
+        const t = releaseTarget(entry.name, "staging")!;
+        const [candidates, state] = await Promise.all([
+          listReleaseCandidates(deps, entry.name, 15).catch((e) => ({ error: String((e as Error).message ?? e) })),
+          readTargetState(deps, entry.name, "staging").catch((e) => ({ error: String((e as Error).message ?? e) })),
+        ]);
+        const status = argoStatusFor(argo, t.argoApp);
+        return {
+          service: entry.name,
+          kind: entry.kind,
+          repo: entry.repo,
+          ecrRepo: entry.ecrRepo,
+          target: "staging" as const,
+          cluster: t.cluster,
+          namespace: t.namespace,
+          argoApp: t.argoApp,
+          host: t.host,
+          url: `https://${t.host}`,
+          valuesFile: t.valuesFile,
+          candidates: "error" in candidates ? [] : candidates,
+          candidatesError: "error" in candidates ? candidates.error : undefined,
+          current: "error" in state ? null : state.imageTag,
+          bootstrapped: "error" in state ? false : state.present,
+          stateError: "error" in state ? state.error : undefined,
+          argo: { ...status, ...argoWord(status) },
+        };
+      }),
+    );
+    return {
+      argo: { reachable: argo.reachable, reason: argo.reason },
+      promotions: "error" in promotions ? [] : promotions,
+      promotionsError: "error" in promotions ? promotions.error : undefined,
+      services,
+    };
+  }),
+
+  /** Gate 1: open the promotion PR. Operators only; fields = what the PR
+   * will do, so the nonce is bound to (service, target, tag). */
+  promoteRelease: operatorProcedure
+    .input(z.object({ service: promotableSchema, target: targetSchema, imageTag: promotableTag, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { service, target, imageTag, confirm } = input;
+      const t = releaseTarget(service, target);
+      if (!t) throw new TRPCError({ code: "BAD_REQUEST", message: `${service} has no ${target} target` });
+      const fields = { service, target, imageTag };
+      const current = await readTargetState(namedEnvDeps(), service, target).catch(() => null);
+      const summary = [
+        `Promote ${service} to ${target}: ${t.service.ecrRepo}:${imageTag}${current?.imageTag ? ` (replacing ${current.imageTag})` : ""}`,
+        `- open a PR on twizz-gitops bumping ${t.valuesFile} image.tag (branch promote/${service}/${target}/…)`,
+        `- nothing deploys until that PR is merged (gate 2); then Argo app ${t.argoApp} on ${t.cluster} rolls it out to https://${t.host}`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("promote_release", fields, confirm, summary, () => promoteRelease(namedEnvDeps(), { service, target, imageTag, actor: ctx.login })));
+    }),
+
+  /** Gate 2: merge the promotion PR. The PR is re-read on both calls; the
+   * nonce binds (pr, service, target, tag) and the merge is pinned to the
+   * head sha, so a PR changed underneath is refused, never merged blind. */
+  mergePromotion: operatorProcedure
+    .input(z.object({ prNumber: z.number().int().positive(), service: promotableSchema, target: targetSchema, imageTag: promotableTag, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { prNumber, service, target, imageTag, confirm } = input;
+      const t = releaseTarget(service, target);
+      if (!t) throw new TRPCError({ code: "BAD_REQUEST", message: `${service} has no ${target} target` });
+      const deps = namedEnvDeps();
+      const pr = await deps.promotions.getPr(prNumber);
+      if (!pr) throw new TRPCError({ code: "NOT_FOUND", message: `twizz-gitops PR #${prNumber} does not exist` });
+      const parsed = parsePromotionBranch(pr.branch);
+      if (!parsed || parsed.service !== service || parsed.target !== target || parsed.tag !== imageTag) {
+        throw new TRPCError({ code: "BAD_REQUEST", message: `PR #${prNumber} (${pr.branch}) is not the promotion ${service} ${target} → ${imageTag}` });
+      }
+      const fields = { pr: String(prNumber), service, target, imageTag };
+      const summary = [
+        `Merge twizz-gitops PR #${prNumber} "${pr.title}" (head ${pr.headSha.slice(0, 7)}, by ${pr.author})`,
+        `- squash-merge into main; refused by GitHub if the branch moves first`,
+        `- Argo app ${t.argoApp} on ${t.cluster} then rolls ${service} to ${imageTag} at https://${t.host} (~3 min)`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("merge_promotion", fields, confirm, summary, () => mergePromotion(deps, { prNumber, service, target, imageTag, actor: ctx.login })));
     }),
 
   // ── Build-on-provision: any twizz-app repo/branch, self-service ───────

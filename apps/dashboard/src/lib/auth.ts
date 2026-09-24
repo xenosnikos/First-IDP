@@ -1,6 +1,7 @@
 import NextAuth from "next-auth";
 import { prisma } from "@twizz-idp/db";
 import { authConfig } from "./auth.config";
+import { needsRefresh, refreshGithubToken, type GithubTokenState } from "./github-token";
 
 // Orgs whose active members may sign in. Emergency/per-user fallback:
 // ALLOWED_GITHUB_LOGINS="alice,bob" for collaborators outside both orgs.
@@ -76,15 +77,32 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
     },
     async jwt({ token, account, profile }) {
       if (account) {
+        // Sign-in: keep the whole grant. GitHub App user tokens expire in 8 h
+        // and come with a refresh token; classic OAuth tokens have neither.
         token.accessToken = account.access_token;
+        token.refreshToken = account.refresh_token;
+        token.expiresAt = account.expires_at;
+        delete token.tokenError;
       }
       if (profile?.login) {
         token.login = (profile.login as string).toLowerCase();
+      }
+      const state = token as GithubTokenState;
+      if (needsRefresh(state)) {
+        // Refresh in place. On failure the access token is dropped (never
+        // kept dead) so readers fall back to the platform token honestly.
+        const next = await refreshGithubToken(state, { clientId: process.env.GITHUB_CLIENT_ID ?? "", clientSecret: process.env.GITHUB_CLIENT_SECRET ?? "" });
+        token.accessToken = next.accessToken;
+        token.refreshToken = next.refreshToken;
+        token.expiresAt = next.expiresAt;
+        if (next.tokenError) token.tokenError = next.tokenError;
+        else delete token.tokenError;
       }
       return token;
     },
     async session({ session, token }) {
       (session as any).accessToken = token.accessToken;
+      (session as any).tokenError = token.tokenError;
       (session as any).login = token.login;
       return session;
     },

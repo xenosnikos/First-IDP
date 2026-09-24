@@ -90,3 +90,23 @@ write_tools:
   rebuild_env:
     allow:
       name: ["*"]
+
+  # ── Release train (docs/NEBULA.md §N4): previews → staging by gitops PR ──
+  # `target` is the only tier Nebula may write to; prod is caught by global_deny
+  # before this table is even consulted. Tags must be immutable (aliases such as
+  # main/dev/latest are refused in code too). The values file, Argo app and host
+  # are DERIVED from (service, target) through the registry — never inputs.
+  promote_release:
+    allow:
+      service: ["twizz-sentinel", "twizz-admin"]
+      target: ["staging"]
+      imageTag: ["build-*", "nb-*", "main-*", "pr-*"]
+    deny:
+      imageTag: ["main", "latest", "dev", "staging"]
+
+  merge_promotion:
+    allow:
+      service: ["twizz-sentinel", "twizz-admin"]
+      target: ["staging"]
+      imageTag: ["build-*", "nb-*", "main-*", "pr-*"]
+      pr: ["*"]

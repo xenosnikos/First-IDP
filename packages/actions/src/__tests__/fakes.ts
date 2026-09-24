@@ -111,3 +111,46 @@ export class FakeBuilds implements BuildDispatcher {
     return r;
   }
 }
+
+// ── release train ──────────────────────────────────────────────────────
+import type { PromotionPr, PromotionRepo } from "../promote";
+
+export class FakePromotions implements PromotionRepo {
+  /** files on main */
+  main = new Map<string, string>();
+  prs: Array<PromotionPr & { files: Record<string, string>; body: string }> = [];
+  merged: Array<{ number: number; sha: string; title: string }> = [];
+  private seq = 100;
+  private shaOf(s: string) {
+    return `sha-${s.length}-${s.slice(0, 6)}`;
+  }
+  async readFile(path: string) {
+    const c = this.main.get(path);
+    return c === undefined ? null : { content: c, sha: this.shaOf(c) };
+  }
+  async openPr(input: { branch: string; files: Record<string, string>; title: string; body: string }) {
+    const number = ++this.seq;
+    const headSha = this.shaOf(Object.values(input.files).join(""));
+    this.prs.push({ number, url: `https://github.com/TwizzyNicky/twizz-gitops/pull/${number}`, title: input.title, branch: input.branch, headSha, author: "nebula-bot", createdAt: new Date(2026, 8, 24, 0, number).toISOString(), state: "open", files: input.files, body: input.body });
+    return { number, url: `https://github.com/TwizzyNicky/twizz-gitops/pull/${number}`, headSha };
+  }
+  async listOpenPrs(prefix: string) {
+    return this.prs.filter((p) => p.state === "open" && p.branch.startsWith(prefix)).map(({ files: _f, body: _b, ...p }) => p);
+  }
+  async getPr(number: number) {
+    const p = this.prs.find((x) => x.number === number);
+    if (!p) return null;
+    const { files: _f, body: _b, ...rest } = p;
+    return rest;
+  }
+  async mergePr(number: number, opts: { title: string; sha: string }) {
+    const p = this.prs.find((x) => x.number === number);
+    if (!p || p.state !== "open") throw new Error(`PR ${number} not open`);
+    if (p.headSha !== opts.sha) throw new Error("Head branch was modified. Review and try the merge again. (405)");
+    p.state = "merged";
+    for (const [path, content] of Object.entries(p.files)) this.main.set(path, content);
+    const sha = `merge-${number}`;
+    this.merged.push({ number, sha, title: opts.title });
+    return { sha };
+  }
+}

@@ -2,7 +2,9 @@
 // Application (with owner + labels), ApplicationSets (PR generators), Ingress
 // hosts and Deployment images. Non-prod ONLY — this is the one cluster Nebula
 // has credentials for; staging/prod are observed through CloudWatch (clusters
-// router), never through the kube API. All calls are list/get; RBAC is the
+// router), never through the kube API. Release-train Applications (§N4) live
+// in this Argo too but deploy elsewhere: their destination is captured so the
+// Environments grid can leave them to the Release train page. All calls are list/get; RBAC is the
 // `nebula-dashboard-read` ClusterRole in twizz-gitops apps/nebula/dashboard.yaml.
 import { loadKubeConfig } from "./argo";
 import type { LiveApp, LiveAppSet, LiveDeployment, LiveIngress } from "./classify";
@@ -48,7 +50,7 @@ export async function readClusterSnapshot(): Promise<ClusterSnapshot> {
     ]);
 
     type AppItem = Obj & {
-      spec?: { project?: string; destination?: { namespace?: string }; source?: { repoURL?: string }; sources?: Array<{ repoURL?: string }> };
+      spec?: { project?: string; destination?: { namespace?: string; server?: string; name?: string }; source?: { repoURL?: string }; sources?: Array<{ repoURL?: string }> };
       status?: { sync?: { status?: string }; health?: { status?: string } };
     };
     const appItems = ((appRes as { body?: { items?: AppItem[] } }).body?.items ?? []) as AppItem[];
@@ -65,6 +67,8 @@ export async function readClusterSnapshot(): Promise<ClusterSnapshot> {
         sourceRepoUrls: [...new Set(urls)],
         sync: a.status?.sync?.status ?? "Unknown",
         health: a.status?.health?.status ?? "Unknown",
+        // a named destination (cluster secret `name`) is still "not in-cluster"
+        destination: a.spec?.destination?.server ?? (a.spec?.destination?.name ? `cluster:${a.spec.destination.name}` : undefined),
       };
     });
 

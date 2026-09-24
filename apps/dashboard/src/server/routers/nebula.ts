@@ -1,8 +1,8 @@
 import { GithubGitops, REGISTRY, listNamedEnvs, type NamedEnvManifest } from "@twizz-idp/actions";
-import { GitHubService } from "@twizz-idp/core";
 import { router, protectedProcedure } from "../trpc";
 import { argoWord, ttlWord } from "@/lib/nebula/status";
 import { octokit } from "../nebula/deps";
+import { withGithub } from "../nebula/github-session";
 import { readClusterSnapshot } from "../nebula/kube";
 import { buildAppViews, buildProjectViews, type RepoFact } from "../nebula/classify";
 
@@ -51,18 +51,17 @@ export const nebulaRouter = router({
       // manifests that did not parse — shown, never hidden
       broken: list.broken,
       // live NAMED apps whose manifest is gone (being pruned) still show, read-only
-      others: views.filter((v) => !(v.origin === "NAMED" && namedByApp.has(v.name))).map((v) => ({ ...v, ...argoWord({ sync: v.sync, health: v.health }) })),
+      // staging Applications (release train, §N4) are shown on /releases, not as non-prod environments
+      others: views.filter((v) => v.tier === "nonprod" && !(v.origin === "NAMED" && namedByApp.has(v.name))).map((v) => ({ ...v, ...argoWord({ sync: v.sync, health: v.health }) })),
     };
   }),
 
   /** Projects = repos & what the platform knows about them. */
   listProjects: protectedProcedure.query(async ({ ctx }) => {
-    const token = (ctx.session as { accessToken?: string }).accessToken ?? process.env.GITHUB_TOKEN;
     let orgRepos: RepoFact[] = [];
     let orgError: string | undefined;
     try {
-      if (!token) throw new Error("no GitHub token on the session or the server");
-      const repos = await new GitHubService(token).listOrgRepos(GITHUB_ORG);
+      const repos = await withGithub(ctx.session, (gh) => gh.listOrgRepos(GITHUB_ORG));
       orgRepos = repos.map((r) => ({ slug: r.fullName, name: r.name, private: r.private, language: r.language, defaultBranch: r.defaultBranch, updatedAt: r.updatedAt, url: r.url }));
     } catch (e) {
       orgError = String((e as Error).message ?? e);

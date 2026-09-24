@@ -1,6 +1,7 @@
 import { z } from "zod";
 import { router, protectedProcedure } from "../trpc";
-import { GitHubService, type ActionsRun } from "@twizz-idp/core";
+import type { ActionsRun } from "@twizz-idp/core";
+import { withGithub } from "../nebula/github-session";
 
 function parseRepoUrl(url: string): { owner: string; repo: string } | null {
   const m = url.match(/github\.com\/([^/]+)\/([^/]+?)(?:\.git)?$/);
@@ -23,16 +24,13 @@ export const pipelineRouter = router({
   listGithubRuns: protectedProcedure
     .input(z.object({ limit: z.number().int().min(1).max(50).default(30) }).optional())
     .query(async ({ ctx, input }) => {
-      const token = (ctx.session as any).accessToken as string;
-      const github = new GitHubService(token);
-
       const projects = await ctx.prisma.project.findMany({ select: { githubRepoUrl: true } });
       const repos = projects
         .map((p) => parseRepoUrl(p.githubRepoUrl))
         .filter((r): r is { owner: string; repo: string } => r !== null);
 
       const settled = await Promise.allSettled(
-        repos.map((r) => github.listWorkflowRuns(r.owner, r.repo, 15)),
+        repos.map((r) => withGithub(ctx.session, (github) => github.listWorkflowRuns(r.owner, r.repo, 15))),
       );
       const runs: ActionsRun[] = settled
         .filter((s): s is PromiseFulfilledResult<ActionsRun[]> => s.status === "fulfilled")
@@ -45,17 +43,13 @@ export const pipelineRouter = router({
   getGithubRun: protectedProcedure
     .input(z.object({ owner: z.string(), repo: z.string(), runId: z.number().int() }))
     .query(async ({ ctx, input }) => {
-      const token = (ctx.session as any).accessToken as string;
-      const github = new GitHubService(token);
-      return github.getWorkflowRun(input.owner, input.repo, input.runId);
+      return withGithub(ctx.session, (github) => github.getWorkflowRun(input.owner, input.repo, input.runId));
     }),
 
   getGithubJobLogs: protectedProcedure
     .input(z.object({ owner: z.string(), repo: z.string(), jobId: z.number().int() }))
     .query(async ({ ctx, input }) => {
-      const token = (ctx.session as any).accessToken as string;
-      const github = new GitHubService(token);
-      return { logs: await github.getJobLogs(input.owner, input.repo, input.jobId) };
+      return { logs: await withGithub(ctx.session, (github) => github.getJobLogs(input.owner, input.repo, input.jobId)) };
     }),
 
   listAll: protectedProcedure

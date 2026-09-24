@@ -16,9 +16,9 @@ export default async function Home() {
           an active member of the Twizz org.
         </p>
         <div style={{ display: "flex", gap: 8, marginBottom: 24, flexWrap: "wrap" }}>
-          <Pill word="SHIPPED" title="Environments grid + spin-up wizard + gate" />
+          <Pill word="SHIPPED" title="Environments grid + spin-up wizard + gate + release train to staging" />
           <Pill word="STUB" title="Planner / Coder / Reviewer / QA / Release / Observer agents" />
-          <Pill word="PLANNED" title="Release train, audit viewer" />
+          <Pill word="PLANNED" title="Prod promotion, audit viewer" />
         </div>
         <form
           action={async () => {

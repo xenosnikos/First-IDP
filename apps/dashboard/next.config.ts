@@ -13,6 +13,7 @@ const nextConfig: NextConfig = {
     "/**": ["../../node_modules/.pnpm/@prisma+client*/node_modules/.prisma/client/**"],
     "/api/trpc/[trpc]": ["../mcp/policy.yaml"],
     "/environments": ["../mcp/policy.yaml"],
+    "/releases": ["../mcp/policy.yaml"],
   },
   transpilePackages: ["@twizz-idp/db", "@twizz-idp/shared", "@twizz-idp/actions", "@twizz-idp/core", "@twizz-idp/observer"],
   // Node-only client with dynamic requires; keep it out of the webpack bundle.

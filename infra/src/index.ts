@@ -6,6 +6,7 @@ import { createDnsRecords } from "./dns";
 import { bootstrapCluster } from "./bootstrap";
 import { createNetbirdRouter } from "./netbird";
 import { createAdminGate } from "./admin-gate";
+import { createStagingAccess, registerStagingCluster } from "./staging";
 import * as pulumi from "@pulumi/pulumi";
 
 const tags = { Project: "twizz-idp" };
@@ -24,9 +25,13 @@ const iam = createIamRoles(eks.oidcProviderArn, eks.oidcProviderUrl, tags);
 
 const cfg = new pulumi.Config();
 
+// Release train (docs/NEBULA.md §N4): IAM + EKS access entry so Argo CD may
+// deploy the staging tier into ONE namespace on EKS-Moly-staging.
+const stagingAccess = createStagingAccess({ oidcProviderArn: eks.oidcProviderArn, oidcProviderUrl: eks.oidcProviderUrl }, tags);
+
 const bootstrap = bootstrapCluster(
   eks.kubeconfig,
-  { esoRoleArn: iam.esoRoleArn, certManagerRoleArn: iam.certManagerRoleArn },
+  { esoRoleArn: iam.esoRoleArn, certManagerRoleArn: iam.certManagerRoleArn, argocdDeployerRoleArn: stagingAccess.argocdDeployerRoleArn },
   {
     privateSubnetIds: networking.privateSubnetIds,
     googleDomain: cfg.get("googleDomain") ?? "twizz.com",
@@ -44,6 +49,11 @@ const adminGate = createAdminGate(
 const netbird = createNetbirdRouter(networking.vpcId, networking.privateSubnetIds[0], networking.vpcCidr, tags);
 
 const dns = createDnsRecords(bootstrap.ingressNlbDnsName, tags);
+
+// The staging cluster as an Argo CD destination (namespaced mode) + <svc>.stg.prv.twizz.com
+// → the staging ingress-nginx ELB (`stagingIngressHostname`; that cluster is not Pulumi-managed).
+const stagingIngress = cfg.get("stagingIngressHostname");
+const staging = stagingIngress ? registerStagingCluster(bootstrap.provider, stagingAccess, { zoneId: dns.zoneId, ingressHostname: stagingIngress }, bootstrap.argocd) : undefined;
 
 export const vpcId = networking.vpcId;
 export const eksClusterName = eks.clusterName;
@@ -63,3 +73,6 @@ export const netbirdRouterInstanceId = netbird.instanceId;
 export const netbirdAdvertisedCidr = netbird.advertisedCidr; // add as a NetBird network route via group "routers"
 export const ssoLoginUrl = "https://auth.prv.twizz.com/oauth2/start";
 export const adminAppUrls = adminGate.adminHosts;
+export const argocdStagingDeployerRoleArn = stagingAccess.argocdDeployerRoleArn;
+export const stagingSentinelRoleArn = stagingAccess.sentinelRoleArn;
+export const stagingHosts = staging?.hosts; // sentinel/admin .stg.prv.twizz.com

@@ -8,6 +8,7 @@ import { prisma } from "@twizz-idp/db";
 import { createObserverClient, runConfigurator, type ConfiguratorEvent } from "@twizz-idp/observer";
 import { auditConfiguratorRun, auditToolCalls, configuratorStatus, repoReaderFor } from "@/server/nebula/configurator";
 import { githubFor, orgRepo } from "@/server/routers/project";
+import { platformToken, sessionToken } from "@/server/nebula/github-session";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -52,13 +53,15 @@ export async function POST(req: Request): Promise<Response> {
   } catch (e) {
     return json(401, { word: "DENIED", message: String((e as Error).message ?? e) });
   }
-  const head = await gh.getBranchHead(target.owner, target.repo, ref).catch(() => null);
+  const head = await gh((g) => g.getBranchHead(target.owner, target.repo, ref)).catch(() => null);
   if (!head) return json(404, { word: "FAIL", message: `branch "${ref}" not found in ${target.slug} (or not readable with your GitHub grant)` });
   if (head.sha !== sha) return json(409, { word: "FAIL", message: `${ref} moved since you pinned it (${sha.slice(0, 7)} → ${head.sha.slice(0, 7)}); reload the branch and run again` });
 
   const client = createObserverClient();
   if (!client) return json(503, { word: "STUB", message: "ANTHROPIC_API_KEY is not configured on this Nebula" });
-  const token = (session as { accessToken?: string }).accessToken!;
+  // the Configurator reads with the human's grant; the org-scoped platform token only when that grant is gone
+  const token = sessionToken(session) ?? platformToken();
+  if (!token) return json(401, { word: "DENIED", message: "no GitHub token on the session and none on the server — sign in again" });
 
   const encoder = new TextEncoder();
   const controllerRef: { c?: ReadableStreamDefaultController<Uint8Array> } = {};

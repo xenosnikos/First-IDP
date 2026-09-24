@@ -7,6 +7,7 @@ import {
   EcrRegistry,
   GithubBuilds,
   GithubGitops,
+  GithubPromotions,
   PrismaNonceStore,
   SecretsManagerStore,
   createAudit,
@@ -56,6 +57,8 @@ export function namedEnvDeps() {
     images: new EcrRegistry(new ECRClient({ region })),
     // the central builder (workflow_dispatch needs the platform token's `workflow` scope)
     builds: new GithubBuilds(gh),
+    // release train (§N4): promotion PRs on twizz-gitops, merged sha-guarded
+    promotions: new GithubPromotions(gh),
     maxNamedEnvs: Number(process.env.NEBULA_MAX_NAMED_ENVS) || undefined,
   };
 }

@@ -32,7 +32,36 @@ export type ServiceEntry = {
   };
   /** How live Argo Applications map back to this entry (label values). */
   detect: { service?: string; repo?: string };
+  /** Release train (docs/NEBULA.md §N4): where a promoted image lands per
+   * target. Only entries with a target can be promoted; prod is never one. */
+  releaseTrain?: Partial<Record<ReleaseTarget, ReleaseTrainTarget>>;
 };
+
+/** Promotion targets Nebula may write to. Prod is deliberately absent AND
+ * globally denied by policy.yaml — a target is a gitops values file that an
+ * Argo Application on that cluster renders; nothing here touches a kube API. */
+export const RELEASE_TARGETS = ["staging"] as const;
+export type ReleaseTarget = (typeof RELEASE_TARGETS)[number];
+
+export type ReleaseTrainTarget = {
+  /** EKS cluster the Argo Application deploys to (registered in the non-prod Argo CD). */
+  cluster: string;
+  namespace: string;
+  /** Values file in twizz-gitops whose `image.tag` a promotion PR bumps. */
+  valuesFile: string;
+  /** Argo Application name (labels twizz-idp/tier=<target>, twizz-idp/service=<name>). */
+  argoApp: string;
+  /** Public host on that cluster's ingress. */
+  host: string;
+};
+
+const STAGING = (name: string, short: string): ReleaseTrainTarget => ({
+  cluster: "EKS-Moly-staging",
+  namespace: "sentinel",
+  valuesFile: `apps/${name}/values-staging.yaml`,
+  argoApp: `staging-${name}`,
+  host: `${short}.stg.prv.twizz.com`,
+});
 
 const GITOPS_VALUES = (name: string) => `apps/${name}/values.yaml`;
 
@@ -59,6 +88,9 @@ export const REGISTRY: readonly ServiceEntry[] = [
     valuesFile: GITOPS_VALUES("twizz-sentinel"),
     status: "PLANNED",
     detect: { service: "twizz-sentinel", repo: "twizz-sentinel" },
+    // Release train: PR previews on non-prod → staging (EKS-Moly-staging ns
+    // `sentinel`) by a gitops promotion PR. The admin frontend rides along.
+    releaseTrain: { staging: STAGING("twizz-sentinel", "sentinel") },
   },
   {
     // External to the org "while the concept is proven" (twizz-gitops
@@ -114,6 +146,9 @@ export const REGISTRY: readonly ServiceEntry[] = [
     status: "PLANNED",
     build: { workflow: "nebula-build.yml", framework: "next", apiEnvVar: "NEXT_PUBLIC_API_URL", serve: "next-standalone", notes: "Next 15; already previewed per PR by the joint appset" },
     detect: { service: "twizz-admin", repo: "twizz-admin" },
+    // Staging admin runs in-cluster next to the staging sentinel (same chart as
+    // the joint preview); production admin stays on Vercel.
+    releaseTrain: { staging: STAGING("twizz-admin", "admin") },
   },
 ];
 
@@ -123,6 +158,17 @@ export function getService(name: string): ServiceEntry | undefined {
 
 /** Entries that can be provisioned today (SHIPPED backends, in Phase 0). */
 export const PROVISIONABLE: readonly ServiceEntry[] = REGISTRY.filter((s) => s.status === "SHIPPED" && s.kind === "backend");
+
+/** Entries with at least one release-train target (promotable). */
+export const PROMOTABLE: readonly ServiceEntry[] = REGISTRY.filter((s) => !!s.releaseTrain && Object.keys(s.releaseTrain).length > 0);
+export const PROMOTABLE_NAMES = PROMOTABLE.map((s) => s.name);
+
+/** The target entry for (service, target), or undefined when not promotable there. */
+export function releaseTarget(service: string, target: ReleaseTarget): (ReleaseTrainTarget & { service: ServiceEntry }) | undefined {
+  const entry = getService(service);
+  const t = entry?.releaseTrain?.[target];
+  return entry && t ? { ...t, service: entry } : undefined;
+}
 
 /** Find the registry entry a live Argo Application belongs to, from the
  * labels the ApplicationSets stamp (`twizz-idp/service`, `twizz-idp/repo`)

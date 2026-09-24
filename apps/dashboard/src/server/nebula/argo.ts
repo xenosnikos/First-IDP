@@ -10,6 +10,8 @@ import type { ArgoStatus } from "@/lib/nebula/status";
 
 const ARGO_NS = process.env.ARGOCD_NAMESPACE ?? "argocd";
 const LABEL = "twizz-idp/named-env=true";
+/** Release-train Applications (§N4): `staging-<service>` in this Argo, deploying to the staging cluster. */
+export const STAGING_LABEL = "twizz-idp/tier=staging";
 const TIMEOUT_MS = 6_000;
 
 type AppItem = {
@@ -35,7 +37,7 @@ export async function loadKubeConfig() {
 
 /** One list call, label-selected, hard-timed. Returns per-Application
  * sync/health keyed by Application name (`env-<name>`). */
-export async function readArgoApplications(): Promise<ArgoStatusMap> {
+export async function readArgoApplications(label: string = LABEL): Promise<ArgoStatusMap> {
   let loaded: Awaited<ReturnType<typeof loadKubeConfig>>;
   try {
     loaded = await loadKubeConfig();
@@ -49,7 +51,7 @@ export async function readArgoApplications(): Promise<ArgoStatusMap> {
   const timeout = new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`argo list timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS));
   try {
     const res = await Promise.race([
-      api.listNamespacedCustomObject("argoproj.io", "v1alpha1", ARGO_NS, "applications", undefined, undefined, undefined, undefined, LABEL),
+      api.listNamespacedCustomObject("argoproj.io", "v1alpha1", ARGO_NS, "applications", undefined, undefined, undefined, undefined, label),
       timeout,
     ]);
     const items = ((res as { body?: { items?: AppItem[] } }).body?.items ?? []) as AppItem[];

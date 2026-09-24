@@ -1,6 +1,6 @@
 # TWIZZ-IDP - Project State
 
-Last updated: 2026-09-09
+Last updated: 2026-09-24
 
 ## Architecture stance (decided 2026-08-11)
 
@@ -19,7 +19,7 @@ Workflows/Events were deleted — never wired, 3 of 5 templates were fakes.
 | 3 | Backend preview loop (PR → namespace-per-PR on NonProd) | SCAFFOLDED — gitops repo pushed to `TwizzyNicky/twizz-gitops` (2026-08-21); next: SM `preview/*` secrets, apply root-app, Moly-backend enablement PR |
 | 4 | Vercel PR previews (frontend) + per-PR SAM stacks (Lambda) | TODO |
 | 5 | Repo onboarding CLI + org watcher | BUILT — `packages/onboard` (detect/plan/pr/protect), `.github/workflows/org-watch.yml`; needs a GITHUB_TOKEN with org membership |
-| 6 | Merge control + AI review + GitOps promotion | PARTIAL — `onboard protect` + ai-review template done; tag-bump promotion PRs TODO (needs gitops repo live) |
+| 6 | Merge control + AI review + GitOps promotion | STAGING SHIPPED (2026-09-24) — release train: `promote_release` PR + sha-guarded `merge_promotion`, /releases page, MCP tools, Argo → EKS-Moly-staging ns `sentinel` (docs/NEBULA.md §N4); prod promotion deliberately absent |
 | 7 | MCP server + skill (tiered authz) | BUILT — `apps/mcp` (10 tools, stdio, policy+nonce+session-tagged roles+audit), `.mcp.json`, `.claude/skills/twizz-platform`; write tools unverified until cluster is up |
 | 8 | Agentic sandboxes | PARKED |
 
@@ -432,6 +432,33 @@ has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not
   nebula env. `sentinel-smoke` from Phase A is still up (reaper dry-run).
 - Known: `global_deny *prod*` also refuses SECRET NAMES containing "prod" (e.g. `PRODUCT_KEY`)
   because names ride in gate fields; documented in NEBULA.md.
+
+## 2026-09-24 — Release train to staging + GitHub grant refresh (built, not yet deployed)
+
+- **Outage recap (2026-09-22):** nebula 503 for 3 days — ECR `twizz-idp` "keep last 20"
+  lifecycle rule expired the pinned `migrate-*`/`dashboard-*` tags; Argo stopped retrying after
+  5 failed syncs; node replacement then made the dashboard ImagePullBackOff. Fixed by rolling to
+  the git-desired tag + gitops `df89381` (migrate pin). TODO: loosen `infra/src/ecr.ts`.
+- **Bad credentials on spin-up:** GitHub App user tokens expire in 8 h; jwt callback now
+  refreshes (`lib/github-token.ts`, 7 tests) and reads fall back to the platform token on 401
+  (`server/nebula/github-session.ts`; project/nebula/pipeline routers + configurator route).
+- **Release train (docs/NEBULA.md §N4):** `packages/actions/src/promote.ts` + `GithubPromotions`
+  adapter + registry `releaseTrain` targets + policy; dashboard `actions.listReleaseTrain/
+  promoteRelease/mergePromotion`, `/releases` page, sidebar; Environments grid = non-prod tier
+  only; MCP `release_train/promote_release/merge_promotion`. gitops: `charts/twizz-service`
+  `existingSecret`, `apps/{twizz-sentinel,twizz-admin}/values-staging.yaml`,
+  `bootstrap/appproject-staging.yaml`, `bootstrap/apps-staging.yaml`, README. infra:
+  `src/staging.ts` (deployer IRSA role, EKS access entry ns-scoped, sentinel IRSA on the staging
+  OIDC, Argo cluster secret namespaced, Route53 `*.stg.prv.twizz.com`), Argo SA annotations in
+  `bootstrap.ts`, config `stagingIngressHostname`. `scripts/staging-sentinel-bootstrap.sh`
+  (SM `staging/twizz-sentinel` + `staging/twizz-admin`, ns `sentinel`, k8s Secret mirror).
+- **Staging facts:** API endpoint public (kubeconfig's socks `proxy-url` is stale — strip it),
+  auth mode API_AND_CONFIG_MAP, nodes v1.31 on a 1.34 control plane, ingress-nginx public
+  classic ELB, cert-manager 1.5.4 `letsencrypt-prod` HTTP-01, no ESO/Argo, workloads use k8s
+  `moly-secret` + `moly-cm`, SM `staging/moly/backend`.
+- **Go-live order:** `pulumi up` → restart argocd controller/server/appset (SA annotation) →
+  user runs the bootstrap script with `!` (SM writes are classifier-blocked) → push gitops →
+  push twizz-idp (dashboard image) → bump `apps/nebula/*.yaml` → verify /releases + a promotion.
 
 ## Verification
 

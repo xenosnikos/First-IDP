@@ -33,6 +33,7 @@ and the strictly-authorized MCP toolset. See STATE.md for phase status.
 | `/pipelines` | Recent pipeline runs |
 | `/pipelines/[runId]` | Step timeline + log viewer (points at GitHub Actions from Phase 3) |
 | `/clusters` | Pods + logs across all three clusters (observe-only for staging/prod); URL-addressable log queries; the Observer panel |
+| `/releases` | Release train (docs/NEBULA.md §N4): per service on the train, ECR candidates, what staging runs, open promotion PRs; Promote / Merge (operators, gated) |
 
 The deploy wizard and release board were removed (GitOps replaces both). The Nebula
 surfaces (`/environments` grid + spin-up drawer, `/projects`, `/clusters`) are the
@@ -70,11 +71,15 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
   AuditLog): release-image create + clone-staging-db (operators), `createEnvFromRepo`
   (any signed-in user; branch + config PR + pending manifest + central build in one confirm;
   secret values only with the nonce), `rebuildFromRef`/`setEnvVars`/teardown/extend
-  (owner-or-operator)
+  (owner-or-operator), `promoteRelease`/`mergePromotion` (operators; gitops PR to the staging
+  tier, §N4) + `listReleaseTrain` (read)
 
 ## Auth / RBAC
 
 - `lib/auth.config.ts` — edge-safe config (providers + `authorized`); imported by middleware. NO Prisma here.
+- GitHub App user tokens expire in 8 h: `lib/github-token.ts` refreshes them in the jwt
+  callback; reads go through `server/nebula/github-session.ts` `withGithub()` (session token,
+  platform token on 401). Writes use the platform token only (`nebula/deps.ts`).
 - `lib/auth.ts` — full config: `signIn` callback verifies **active GitHub org membership**
   (`ALLOWED_GITHUB_ORGS`, default `twizz-app`; unset in-cluster) with the user's own token,
   or the `ALLOWED_GITHUB_LOGINS` allowlist (what actually admits people today). Upserts
@@ -114,7 +119,7 @@ naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app he
 - `@twizz-idp/db` - Prisma client and schema
 - `@twizz-idp/shared` - Types, constants
 - `@twizz-idp/core` - External-API service layer (GitHub, AWS/CloudWatch, Vercel, Atlas)
-- `@twizz-idp/actions` - The write gate + named-env actions + service registry (dashboard and MCP)
+- `@twizz-idp/actions` - The write gate + named-env actions + service registry + release train (`promote.ts`) (dashboard and MCP)
 - `@twizz-idp/observer` - the agent harness (`agent.ts` generic loop over `@anthropic-ai/sdk`),
   the Observer log assistant (pure `./logs`, scope-locked tools, prompt) and the Configurator
   (`./configurator`: read-only repo tools + terminal `propose_config` → twizz.yaml/Dockerfile)
@@ -128,7 +133,9 @@ naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app he
 - **AWS Account**: 848281935985, region eu-west-1 (profile `twizz`)
 - **ECR**: 848281935985.dkr.ecr.eu-west-1.amazonaws.com
 - **EKS Prod**: EKS-Moly-Prod — **DO NOT MODIFY, EVER** (private API, SOCKS tunnel via bastion)
-- **EKS Staging**: EKS-Moly-staging (staging in default ns, dev in dev ns) — leave as-is
+- **EKS Staging**: EKS-Moly-staging (staging in default ns, dev in dev ns) — leave as-is,
+  EXCEPT namespace `sentinel`: the release-train tier, deployed by the non-prod Argo CD
+  through a namespace-scoped access entry (infra/src/staging.ts, docs/NEBULA.md §N4)
 - **EKS Non-Prod**: EKS-Twizz-NonProd — owned by this platform (Pulumi, Phase 2)
 - **GitHub orgs**: `twizz-app` (canonical, new repos), `MymTwo` (Moly-backend, frontend)
 - **GitHub sign-in**: GitHub App `twizz-nebula` (client `Iv23liulodACgG6rqlKr`) in-cluster; legacy OAuth app `Ov23lirMDHUPPYwRkz5A` for local dev

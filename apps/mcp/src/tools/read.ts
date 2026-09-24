@@ -6,9 +6,15 @@ import { ECRClient } from "@aws-sdk/client-ecr";
 import {
   EcrRegistry,
   GithubGitops,
+  GithubPromotions,
+  PROMOTABLE,
   SERVICE_NAMES,
   listNamedEnvs,
+  listPromotions,
+  listReleaseCandidates,
   listReleaseImages,
+  readTargetState,
+  releaseTarget,
 } from "@twizz-idp/actions";
 import { ensureReadonlyCreds, operatorCreds, region } from "../auth.js";
 import { actor } from "../gate.js";
@@ -26,6 +32,30 @@ async function core() {
 }
 
 export function registerReadTools(server: McpServer) {
+  server.tool(
+    "release_train",
+    "Release train (docs/NEBULA.md §N4): per promotable service, the immutable ECR candidates, what gitops says staging runs, and the open promotion PRs. Read-only.",
+    { service: z.string().optional().describe("limit to one service (twizz-sentinel | twizz-admin)") },
+    async ({ service }) => {
+      await ensureReadonlyCreds();
+      const gh = new Octokit({ auth: process.env.GITHUB_TOKEN });
+      const deps = { images: new EcrRegistry(new ECRClient({ region })), promotions: new GithubPromotions(gh) };
+      const entries = PROMOTABLE.filter((e) => !service || e.name === service);
+      if (entries.length === 0) return text({ error: `"${service}" is not on the release train`, promotable: PROMOTABLE.map((e) => e.name) });
+      const [promotions, services] = await Promise.all([
+        listPromotions(deps).catch((e) => ({ error: String(e) })),
+        Promise.all(
+          entries.map(async (e) => {
+            const t = releaseTarget(e.name, "staging")!;
+            const [candidates, state] = await Promise.all([listReleaseCandidates(deps, e.name, 15).catch((x) => ({ error: String(x) })), readTargetState(deps, e.name, "staging").catch((x) => ({ error: String(x) }))]);
+            return { service: e.name, kind: e.kind, target: "staging", cluster: t.cluster, namespace: t.namespace, argoApp: t.argoApp, url: `https://${t.host}`, valuesFile: t.valuesFile, current: "error" in state ? state : state.imageTag, bootstrapped: "error" in state ? false : state.present, candidates };
+          }),
+        ),
+      ]);
+      return text({ services, promotions, next: "promote_release (gate 1) → merge_promotion (gate 2); Argo CD syncs staging after the merge" });
+    },
+  );
+
   server.tool(
     "platform_status",
     "Live pod counts per cluster/namespace across all Twizz EKS clusters (read-only, CloudWatch Container Insights).",

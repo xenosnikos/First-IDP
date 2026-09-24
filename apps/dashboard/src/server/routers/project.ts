@@ -2,7 +2,8 @@ import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { router, protectedProcedure } from "../trpc";
 import { createProjectSchema, detectProjectSchema, parseTwizzObject } from "@twizz-idp/shared";
-import { GitHubService } from "@twizz-idp/core";
+import type { GitHubService } from "@twizz-idp/core";
+import { withGithub } from "../nebula/github-session";
 import { parse as parseYaml } from "yaml";
 
 const GITHUB_ORG = process.env.GITHUB_ORG ?? "twizz-app";
@@ -10,11 +11,11 @@ const REPO_NAME_RE = /^[A-Za-z0-9_.-]{1,100}$/;
 const BRANCH_RE = /^(?!\/)(?!.*\.\.)(?!.*\/\/)(?!.*@\{)[A-Za-z0-9._/-]{1,120}(?<!\/)(?<!\.lock)$/;
 
 /** GitHub reads use the SESSION token (the human's own GitHub App grant), so a
- * person only ever configures what they can already see on github.com. */
-export function githubFor(ctx: { session: unknown }): GitHubService {
-  const token = (ctx.session as { accessToken?: string } | null)?.accessToken;
-  if (!token) throw new TRPCError({ code: "UNAUTHORIZED", message: "no GitHub token on the session — sign in again" });
-  return new GitHubService(token);
+ * person only ever configures what they can already see on github.com; when
+ * that grant is gone (expired/revoked) the org-scoped platform token steps in
+ * (server/nebula/github-session.ts). */
+export function githubFor(ctx: { session: unknown }): <T>(fn: (gh: GitHubService) => Promise<T>) => Promise<T> {
+  return (fn) => withGithub(ctx.session, (gh) => fn(gh));
 }
 
 /** `owner/name` or bare `name` inside the org → { owner, repo }. Refuses
@@ -76,7 +77,7 @@ export const projectRouter = router({
   listGithubRepos: protectedProcedure.input(z.object({ q: z.string().max(100).optional(), limit: z.number().int().min(1).max(500).default(100) }).optional()).query(async ({ ctx, input }) => {
     const login = ((ctx.session as { login?: string }).login ?? "anon").toLowerCase();
     const gh = githubFor(ctx);
-    const repos = await cached(repoCache, login, REPO_TTL, () => gh.listOrgRepos(GITHUB_ORG));
+    const repos = await cached(repoCache, login, REPO_TTL, () => gh((g) => g.listOrgRepos(GITHUB_ORG)));
     const q = input?.q?.trim().toLowerCase();
     const list = q ? repos.filter((r) => r.name.toLowerCase().includes(q)) : repos;
     return { org: GITHUB_ORG, total: repos.length, repos: list.slice(0, input?.limit ?? 100) };
@@ -86,7 +87,7 @@ export const projectRouter = router({
     .input(z.object({ repo: z.string().max(200), q: z.string().max(120).optional(), limit: z.number().int().min(1).max(500).default(100) }))
     .query(async ({ ctx, input }) => {
       const { owner, repo } = orgRepo(input.repo);
-      return githubFor(ctx).listBranches(owner, repo, { q: input.q, limit: input.limit });
+      return githubFor(ctx)((g) => g.listBranches(owner, repo, { q: input.q, limit: input.limit }));
     }),
 
   /** The commit a branch points at right now. The spin-up flow pins it and
@@ -96,7 +97,7 @@ export const projectRouter = router({
     .query(async ({ ctx, input }) => {
       const { owner, repo } = orgRepo(input.repo);
       try {
-        return await githubFor(ctx).getBranchHead(owner, repo, input.branch);
+        return await githubFor(ctx)((g) => g.getBranchHead(owner, repo, input.branch));
       } catch (e) {
         const status = (e as { status?: number }).status;
         throw new TRPCError({ code: status === 404 ? "NOT_FOUND" : "BAD_GATEWAY", message: status === 404 ? `branch "${input.branch}" not found` : String((e as Error).message ?? e) });
@@ -110,7 +111,7 @@ export const projectRouter = router({
     .query(async ({ ctx, input }) => {
       const { owner, repo } = orgRepo(input.repo);
       const gh = githubFor(ctx);
-      const twizzYaml = await gh.getFileContent(owner, repo, "twizz.yaml", input.sha);
+      const twizzYaml = await gh((g) => g.getFileContent(owner, repo, "twizz.yaml", input.sha));
       let dockerfilePath = "Dockerfile";
       let parsed: ReturnType<typeof parseTwizzObject> | null = null;
       if (twizzYaml !== null) {
@@ -121,7 +122,7 @@ export const projectRouter = router({
           parsed = { ok: false, issues: ["twizz.yaml is not valid YAML"] };
         }
       }
-      const hasDockerfile = (await gh.getFileContent(owner, repo, dockerfilePath, input.sha)) !== null;
+      const hasDockerfile = (await gh((g) => g.getFileContent(owner, repo, dockerfilePath, input.sha))) !== null;
       return { twizzYaml, valid: parsed?.ok ?? false, legacy: parsed?.ok ? parsed.legacy : false, issues: parsed && !parsed.ok ? parsed.issues : [], dockerfilePath, hasDockerfile };
     }),
 
@@ -135,7 +136,7 @@ export const projectRouter = router({
       await Promise.all(
         input.repos.map(async (r) => {
           const key = `${GITHUB_ORG}/${r.name}@${r.defaultBranch}`;
-          out[r.name] = await cached(configCache, key, CONFIG_TTL, () => readTwizzSummary(gh, GITHUB_ORG, r.name, r.defaultBranch)).catch(() => null);
+          out[r.name] = await cached(configCache, key, CONFIG_TTL, () => gh((g) => readTwizzSummary(g, GITHUB_ORG, r.name, r.defaultBranch))).catch(() => null);
         }),
       );
       return out;
@@ -153,9 +154,8 @@ export const projectRouter = router({
   detectType: protectedProcedure
     .input(detectProjectSchema)
     .mutation(async ({ ctx, input }) => {
-      const github = githubFor(ctx);
       const [owner, repo] = input.repoUrl.replace("https://github.com/", "").split("/");
-      return github.detectProjectType(owner, repo, input.branch);
+      return githubFor(ctx)((g) => g.detectProjectType(owner, repo, input.branch));
     }),
 
   create: protectedProcedure

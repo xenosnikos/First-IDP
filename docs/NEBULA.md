@@ -561,3 +561,70 @@ Platform mechanics (`packages/actions`):
 - Known limits: `global_deny *prod*` also hits SECRET NAMES containing "prod" (e.g.
   `PRODUCT_KEY`) — rename or ask an operator; the Configurator reads with the human's grant,
   so a repo the App installation cannot see shows FAIL with GitHub's message.
+
+---
+
+## N4 — Release train: previews → staging (built 2026-09-24)
+
+_User ask: "we should be able to control the full release train for the service, in
+both the b-e cluster and the frontend (admin)". Decided: **staging only**, prod stays
+structurally out (no target, `global_deny *prod*`, no IAM path). Both halves of the
+feature — `twizz-sentinel` and the `twizz-admin` frontend — deploy in-cluster on
+EKS-Moly-staging by the same chart the joint preview uses; production admin stays on Vercel._
+
+**Shape.** A promotion is a **gitops pull request**, so Git stays the record and Argo CD
+stays the only deployer:
+
+1. `promote_release` (gate 1, operators) — opens PR `promote/<service>/staging/<tag>` on
+   `TwizzyNicky/twizz-gitops` bumping `apps/<service>/values-staging.yaml` `image.tag` to an
+   **existing immutable** ECR tag (`main-<sha>` / `pr-<n>-<sha>` from the repo's CI,
+   `nb-*` from Nebula's builder, `build-*`). Aliases (`main`/`dev`/`latest`) are refused in
+   policy and in code; the image must exist in ECR; the current tag is refused; an
+   identical open PR is returned instead of a duplicate. Comments in the values file survive
+   (YAML document surgery, one line changes).
+2. `merge_promotion` (gate 2, operators) — squash-merges that PR **pinned to its head sha**;
+   the confirmed `(pr, service, target, imageTag)` must equal what the branch name says, so a
+   PR edited or swapped between confirm and merge is refused. Argo syncs in ≤3 min.
+   Rollback = promote the previous tag.
+
+**Where it runs.** The non-prod Argo CD gets the staging cluster as an external destination
+in **namespaced mode** (`namespaces: sentinel`, `clusterResources: false`): IRSA role
+`twizz-argocd-staging-deployer` on the Argo controller/server/applicationset service
+accounts, an EKS **access entry** on EKS-Moly-staging scoped to namespace `sentinel`
+(`AmazonEKSAdminPolicy`, type namespace), cluster secret `cluster-eks-moly-staging`, all in
+`infra/src/staging.ts`. AppProject `staging` (`bootstrap/appproject-staging.yaml`) allows
+exactly that destination, no cluster-scoped kinds, no RBAC. Applications
+`staging-twizz-sentinel` / `staging-twizz-admin` (`bootstrap/apps-staging.yaml`, label
+`twizz-idp/tier=staging`) render `charts/twizz-service` with `values-staging.yaml`. Hosts
+`sentinel.stg.prv.twizz.com` / `admin.stg.prv.twizz.com` are Route53 CNAMEs to the staging
+ingress-nginx ELB (public; sentinel is API-key gated, admin has NextAuth), certs from that
+cluster's `letsencrypt-prod` (HTTP-01). The sentinel pod's IRSA role `twizz-staging-sentinel`
+(staging OIDC) reads the staging log group, `staging/twizz-sentinel`, and Bedrock Titan; WAF
+and S3 are absent because `SENTINEL_ACTIONS_ENABLED` / `ARCHIVE_ENABLED` are `"false"` on
+staging until asked. Admin secrets: no External Secrets on staging, so
+`scripts/staging-sentinel-bootstrap.sh` mirrors SM `staging/twizz-admin` into k8s Secret
+`sentinel/twizz-admin-secrets` (chart value `existingSecret`); the sentinel reads its own blob
+at boot. The staging cluster itself stays unmanaged by Pulumi; nothing outside `sentinel` is
+touched, and nothing in `default`/`dev` changes.
+
+**Code.** `packages/actions/src/promote.ts` (pure helpers + the two actions over an
+`ImageRegistry` and a `PromotionRepo` port; `adapters.ts GithubPromotions`), registry
+entries carry `releaseTrain.staging` (values file, Argo app, host — DERIVED from the
+service, never inputs), `policy.yaml promote_release` / `merge_promotion`. Dashboard:
+`actions.listReleaseTrain` (candidates from ECR, current tag from gitops, live Argo status via
+label `twizz-idp/tier=staging`, open promotion PRs), `actions.promoteRelease` /
+`actions.mergePromotion`, page **/releases** (`components/releases/release-train.tsx`), and
+the Environments grid now shows non-prod only (`tierOf()` in `classify.ts`). MCP:
+`release_train` (read), `promote_release`, `merge_promotion`. Tests: `promote.test.ts` (14),
+classify tier, 81 actions / 57 dashboard green.
+
+**GitHub grant fix (same day).** In-cluster sign-in is a GitHub App whose user tokens expire
+after 8 h; the JWT stored the token once, so every session-token read returned "Bad
+credentials" the next morning. `lib/github-token.ts` refreshes with the refresh token in the
+jwt callback (drops the token on failure, never keeps it dead); `server/nebula/github-session.ts`
+`withGithub()` runs reads on the session token and retries ONCE on the org-scoped platform
+token on a 401. Writes still use the platform token only.
+
+**Not done / decisions left.** Prod promotion (would need its own access entry + AppProject
+and a policy change — deliberately absent). WAF IP set + `SENTINEL_ACTIONS_ENABLED=true` on
+staging. Vercel promotion for the production admin. A `dev` tier on non-prod.

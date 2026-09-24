@@ -11,3 +11,4 @@ export * from "./twizz-yaml";
 export * from "./values";
 export * from "./env-from-repo";
 export * from "./fields";
+export * from "./promote";

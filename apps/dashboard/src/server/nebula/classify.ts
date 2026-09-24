@@ -14,12 +14,26 @@ export type LiveApp = {
   sourceRepoUrls: string[];
   sync: string;
   health: string;
+  /** spec.destination.server — in-cluster apps say https://kubernetes.default.svc */
+  destination?: string;
 };
 export type LiveIngress = { namespace: string; name: string; hosts: string[] };
 export type LiveDeployment = { namespace: string; name: string; images: string[]; ready: number; desired: number };
 export type LiveAppSet = { name: string; prRepo?: string; prOwner?: string };
 
 export type Origin = Extract<StatusWord, "NAMED" | "PR PREVIEW" | "GITOPS APP">;
+
+/** Which tier an Application deploys to. Non-prod is the in-cluster
+ * destination; a release-train Application (docs/NEBULA.md §N4) carries
+ * `twizz-idp/tier: staging` AND points at the registered staging cluster.
+ * Either signal is enough — a mislabelled app must never pass for non-prod. */
+export type Tier = "nonprod" | "staging";
+export const IN_CLUSTER = "https://kubernetes.default.svc";
+export function tierOf(app: Pick<LiveApp, "labels" | "destination">): Tier {
+  if (app.labels["twizz-idp/tier"] === "staging") return "staging";
+  if (app.destination && app.destination !== IN_CLUSTER) return "staging";
+  return "nonprod";
+}
 
 /** Applications that are platform plumbing, never "environments": the
  * app-of-apps root, Nebula itself, and the `shared-*` singletons (Moly
@@ -52,6 +66,7 @@ export function prLink(app: LiveApp, appsets: LiveAppSet[] = []): { repo: string
 export type AppView = {
   name: string;
   origin: Origin;
+  tier: Tier;
   namespace: string;
   project: string;
   sync: string;
@@ -69,6 +84,7 @@ export function buildAppViews(apps: LiveApp[], ingresses: LiveIngress[], deploym
     .map((a) => ({
       name: a.name,
       origin: classifyApp(a),
+      tier: tierOf(a),
       namespace: a.namespace,
       project: a.project,
       sync: a.sync,
