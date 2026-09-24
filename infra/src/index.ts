@@ -50,8 +50,8 @@ const netbird = createNetbirdRouter(networking.vpcId, networking.privateSubnetId
 
 const dns = createDnsRecords(bootstrap.ingressNlbDnsName, tags);
 
-// The staging cluster as an Argo CD destination (namespaced mode) + <svc>.stg.prv.twizz.com
-// → the staging ingress-nginx ELB (`stagingIngressHostname`; that cluster is not Pulumi-managed).
+// The staging cluster as an Argo CD destination (namespaced mode). Hosts stay on the
+// *.prv.twizz.com wildcard (VPN edge in gitops apps/nebula/staging-edge.yaml).
 const stagingIngress = cfg.get("stagingIngressHostname");
 const staging = stagingIngress ? registerStagingCluster(bootstrap.provider, stagingAccess, { zoneId: dns.zoneId, ingressHostname: stagingIngress }, bootstrap.argocd) : undefined;
 
@@ -75,4 +75,4 @@ export const ssoLoginUrl = "https://auth.prv.twizz.com/oauth2/start";
 export const adminAppUrls = adminGate.adminHosts;
 export const argocdStagingDeployerRoleArn = stagingAccess.argocdDeployerRoleArn;
 export const stagingSentinelRoleArn = stagingAccess.sentinelRoleArn;
-export const stagingHosts = staging?.hosts; // sentinel/admin .stg.prv.twizz.com
+export const stagingHosts = staging?.hosts; // sentinel-stg / admin-stg .prv.twizz.com (VPN edge)

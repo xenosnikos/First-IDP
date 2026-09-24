@@ -15,7 +15,7 @@ Vercel + Neon; cluster addons get installed via a Phase 2 `bootstrap.ts`.)
 - dns.ts: Route53 tier wildcards (`*.prv.twizz.com` et al) → ingress NLB
 - staging.ts: the release train's staging tier (docs/NEBULA.md §N4) — Argo deployer IRSA role,
   a NAMESPACE-scoped EKS access entry on EKS-Moly-staging (ns `sentinel`), the sentinel pod's
-  IRSA role on that cluster's OIDC, the Argo cluster secret (namespaced mode), `*.stg.prv.twizz.com`
+  IRSA role on that cluster's OIDC, the Argo cluster secret (namespaced mode), `*-stg.prv.twizz.com`
 
 ## Constraints
 - NEVER touches EKS-Moly-Prod. EKS-Moly-staging stays unmanaged too, with ONE exception:

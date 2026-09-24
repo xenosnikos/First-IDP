@@ -14,7 +14,7 @@ import * as pulumi from "@pulumi/pulumi";
 //      clusterResources: false) — Argo will not even list cluster-scoped kinds
 //   4. an IRSA role on the STAGING cluster's OIDC provider for the sentinel pod
 //      (logs read, its own SM blob, Bedrock embeddings — no WAF/S3 until asked)
-//   5. DNS: <svc>.stg.prv.twizz.com -> the staging ingress-nginx ELB
+//   5. hosts: <svc>-stg.prv.twizz.com via the non-prod VPN edge (see registerStagingCluster)
 //
 // EKS-Moly-staging itself stays unmanaged by Pulumi (it predates this repo);
 // only account-level resources (IAM, access entries, Route53) are created here.
@@ -139,7 +139,7 @@ export function createStagingAccess(
 export function registerStagingCluster(
   provider: k8s.Provider,
   access: ReturnType<typeof createStagingAccess>,
-  dns: { zoneId: pulumi.Output<string>; ingressHostname: string },
+  _dns: { zoneId: pulumi.Output<string>; ingressHostname: string },
   argocd: pulumi.Resource,
 ) {
   const clusterSecret = new k8s.core.v1.Secret(
@@ -169,16 +169,11 @@ export function registerStagingCluster(
     { provider, dependsOn: [argocd] },
   );
 
-  const hosts = ["sentinel", "admin"].map(
-    (short) =>
-      new aws.route53.Record(`staging-${short}-host`, {
-        zoneId: dns.zoneId,
-        name: `${short}.stg.prv.twizz.com`,
-        type: "CNAME",
-        ttl: 300,
-        records: [dns.ingressHostname],
-      }),
-  );
+  // DNS: NO records here on purpose. The staging classic ELB terminates TLS with a
+  // single-name ACM cert and has no port 80, so these hosts stay on the
+  // *.prv.twizz.com wildcard (non-prod NLB: VPN + SSO + wildcard cert) and the
+  // non-prod ingress proxies to the ELB (twizz-gitops apps/nebula/staging-edge.yaml).
+  const hosts = ["sentinel", "admin"].map((short) => `${short}-stg.prv.twizz.com`);
 
-  return { clusterSecretName: clusterSecret.metadata.name, hosts: hosts.map((h) => h.fqdn) };
+  return { clusterSecretName: clusterSecret.metadata.name, hosts };
 }

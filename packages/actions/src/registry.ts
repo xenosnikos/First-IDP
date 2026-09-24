@@ -60,7 +60,7 @@ const STAGING = (name: string, short: string): ReleaseTrainTarget => ({
   namespace: "sentinel",
   valuesFile: `apps/${name}/values-staging.yaml`,
   argoApp: `staging-${name}`,
-  host: `${short}.stg.prv.twizz.com`,
+  host: `${short}-stg.prv.twizz.com`,
 });
 
 const GITOPS_VALUES = (name: string) => `apps/${name}/values.yaml`;

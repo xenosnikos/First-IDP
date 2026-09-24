@@ -449,16 +449,24 @@ has no backups (audit trail also lives in gitops history); Vercel/Atlas keys not
   `existingSecret`, `apps/{twizz-sentinel,twizz-admin}/values-staging.yaml`,
   `bootstrap/appproject-staging.yaml`, `bootstrap/apps-staging.yaml`, README. infra:
   `src/staging.ts` (deployer IRSA role, EKS access entry ns-scoped, sentinel IRSA on the staging
-  OIDC, Argo cluster secret namespaced, Route53 `*.stg.prv.twizz.com`), Argo SA annotations in
+  OIDC, Argo cluster secret namespaced, Route53 `*-stg.prv.twizz.com`), Argo SA annotations in
   `bootstrap.ts`, config `stagingIngressHostname`. `scripts/staging-sentinel-bootstrap.sh`
   (SM `staging/twizz-sentinel` + `staging/twizz-admin`, ns `sentinel`, k8s Secret mirror).
 - **Staging facts:** API endpoint public (kubeconfig's socks `proxy-url` is stale — strip it),
   auth mode API_AND_CONFIG_MAP, nodes v1.31 on a 1.34 control plane, ingress-nginx public
   classic ELB, cert-manager 1.5.4 `letsencrypt-prod` HTTP-01, no ESO/Argo, workloads use k8s
   `moly-secret` + `moly-cm`, SM `staging/moly/backend`.
-- **Go-live order:** `pulumi up` → restart argocd controller/server/appset (SA annotation) →
-  user runs the bootstrap script with `!` (SM writes are classifier-blocked) → push gitops →
-  push twizz-idp (dashboard image) → bump `apps/nebula/*.yaml` → verify /releases + a promotion.
+- **LIVE 2026-09-24 14:30 EEST:** `pulumi up` ×5 (fixes: ASCII IAM description; Argo
+  `resource.inclusions` kind list for the staging cluster; CNAMEs removed again), argocd pods
+  restarted, bootstrap script run, gitops `b7bbbe2`/`81b7fb4`/`c48e977`, twizz-idp `39940c9`
+  deployed to nebula. Argo `staging-twizz-sentinel`/`staging-twizz-admin` Synced+Healthy:
+  sentinel 2 pods (ingestion leader elected, reading the staging log group via IRSA), admin 1
+  pod Ready (its `pr-139` build logs a `window is not defined` from the settings page — app
+  bug, pre-existing). Hosts: the staging classic ELB terminates TLS with a single-name ACM
+  cert and has no port 80 → hosts moved to the non-prod VPN edge
+  (`apps/nebula/staging-edge.yaml`); staging ingresses carry no tls block.
+- **Not exercised yet:** a real promotion through /releases (the classifier refused an
+  end-to-end script; the UI is the intended path — operators: promote, then merge).
 
 ## Verification
 

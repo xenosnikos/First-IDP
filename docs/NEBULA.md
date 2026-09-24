@@ -596,9 +596,14 @@ accounts, an EKS **access entry** on EKS-Moly-staging scoped to namespace `senti
 exactly that destination, no cluster-scoped kinds, no RBAC. Applications
 `staging-twizz-sentinel` / `staging-twizz-admin` (`bootstrap/apps-staging.yaml`, label
 `twizz-idp/tier=staging`) render `charts/twizz-service` with `values-staging.yaml`. Hosts
-`sentinel.stg.prv.twizz.com` / `admin.stg.prv.twizz.com` are Route53 CNAMEs to the staging
-ingress-nginx ELB (public; sentinel is API-key gated, admin has NextAuth), certs from that
-cluster's `letsencrypt-prod` (HTTP-01). The sentinel pod's IRSA role `twizz-staging-sentinel`
+`sentinel-stg.prv.twizz.com` / `admin-stg.prv.twizz.com` are **VPN-only**: they stay on the
+`*.prv.twizz.com` wildcard (non-prod NLB, SSO gate, wildcard cert) and
+`apps/nebula/staging-edge.yaml` proxies them to the staging classic ELB with the original
+Host. That ELB terminates TLS itself with a single-name ACM cert (`apistg.twizz.com`) and
+has no port 80, so no certificate for these names can be served from staging, and the
+staging ingresses carry no tls block (a tls block there only 308-loops). The sentinel edge
+skips the SSO gate (`enable-global-auth: "false"`) because the API is key-gated and Slack
+links/scripts hit it. The sentinel pod's IRSA role `twizz-staging-sentinel`
 (staging OIDC) reads the staging log group, `staging/twizz-sentinel`, and Bedrock Titan; WAF
 and S3 are absent because `SENTINEL_ACTIONS_ENABLED` / `ARCHIVE_ENABLED` are `"false"` on
 staging until asked. Admin secrets: no External Secrets on staging, so
@@ -624,6 +629,15 @@ credentials" the next morning. `lib/github-token.ts` refreshes with the refresh 
 jwt callback (drops the token on failure, never keeps it dead); `server/nebula/github-session.ts`
 `withGithub()` runs reads on the session token and retries ONCE on the org-scoped platform
 token on a 401. Writes still use the platform token only.
+
+**Argo on the staging cluster — two gotchas.** (1) IAM refuses non-ASCII role
+descriptions. (2) Argo's cluster cache lists every namespaced kind it discovers and fails
+closed on the first forbidden one; the namespace-scoped `AmazonEKSAdminPolicy` does not
+cover third-party CRDs (CloudWatch/Dynatrace/OTel operators) nor `PodTemplate`, so
+`argocd-cm resource.inclusions` names the exact kinds tracked on that cluster (with a
+catch-all entry for non-prod — an inclusion list applies to every cluster once present).
+Both live in `infra/src/bootstrap.ts`. After `pulumi up` the argocd controller/server/appset
+pods need a restart to pick up the IRSA annotation.
 
 **Not done / decisions left.** Prod promotion (would need its own access entry + AppProject
 and a policy change — deliberately absent). WAF IP set + `SENTINEL_ACTIONS_ENABLED=true` on

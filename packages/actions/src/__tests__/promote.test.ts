@@ -53,8 +53,8 @@ function deps(over: { images?: Record<string, Array<{ tags: string[]; pushedAt: 
 describe("registry: release train", () => {
   it("only sentinel + admin are promotable, and only to staging", () => {
     expect(PROMOTABLE_NAMES.sort()).toEqual(["twizz-admin", "twizz-sentinel"]);
-    expect(releaseTarget("twizz-sentinel", "staging")).toMatchObject({ cluster: "EKS-Moly-staging", namespace: "sentinel", valuesFile: "apps/twizz-sentinel/values-staging.yaml", argoApp: "staging-twizz-sentinel", host: "sentinel.stg.prv.twizz.com" });
-    expect(releaseTarget("twizz-admin", "staging")?.host).toBe("admin.stg.prv.twizz.com");
+    expect(releaseTarget("twizz-sentinel", "staging")).toMatchObject({ cluster: "EKS-Moly-staging", namespace: "sentinel", valuesFile: "apps/twizz-sentinel/values-staging.yaml", argoApp: "staging-twizz-sentinel", host: "sentinel-stg.prv.twizz.com" });
+    expect(releaseTarget("twizz-admin", "staging")?.host).toBe("admin-stg.prv.twizz.com");
     expect(releaseTarget("moly-backend", "staging")).toBeUndefined();
   });
 });
@@ -114,7 +114,7 @@ describe("promoteRelease", () => {
   it("opens ONE PR that bumps only image.tag, with a body naming from/to/app/host/actor", async () => {
     const d = deps();
     const r = await promoteRelease(d, { service: "twizz-sentinel", target: "staging", imageTag: MAIN_TAG, actor: "nick" });
-    expect(r).toMatchObject({ service: "twizz-sentinel", target: "staging", from: "main-0000000000000000000000000000000000000000", to: MAIN_TAG, existing: false, argoApp: "staging-twizz-sentinel", host: "sentinel.stg.prv.twizz.com", branch: `promote/twizz-sentinel/staging/${MAIN_TAG}` });
+    expect(r).toMatchObject({ service: "twizz-sentinel", target: "staging", from: "main-0000000000000000000000000000000000000000", to: MAIN_TAG, existing: false, argoApp: "staging-twizz-sentinel", host: "sentinel-stg.prv.twizz.com", branch: `promote/twizz-sentinel/staging/${MAIN_TAG}` });
     expect(r.image).toEqual({ tag: MAIN_TAG, aliases: ["main"], pushedAt: "2026-09-05T06:09:40.000Z" });
     expect(d.promotions.prs).toHaveLength(1);
     const pr = d.promotions.prs[0];
@@ -122,7 +122,7 @@ describe("promoteRelease", () => {
     expect(Object.keys(pr.files)).toEqual(["apps/twizz-sentinel/values-staging.yaml"]);
     expect(readImageTag(pr.files["apps/twizz-sentinel/values-staging.yaml"])).toBe(MAIN_TAG);
     expect(pr.body).toContain("staging-twizz-sentinel");
-    expect(pr.body).toContain("https://sentinel.stg.prv.twizz.com");
+    expect(pr.body).toContain("https://sentinel-stg.prv.twizz.com");
     expect(pr.body).toContain("Requested by: nick");
     expect(pr.body).toContain("Replaces: `main-0000000000000000000000000000000000000000`");
     // main is untouched until the merge
@@ -157,7 +157,7 @@ describe("listPromotions + mergePromotion", () => {
     await d.promotions.openPr({ branch: "chore/unrelated", files: { "README.md": "x" }, title: "chore", body: "" });
     const list = await listPromotions(d);
     expect(list).toHaveLength(1);
-    expect(list[0]).toMatchObject({ service: "twizz-sentinel", target: "staging", imageTag: MAIN_TAG, argoApp: "staging-twizz-sentinel", host: "sentinel.stg.prv.twizz.com", state: "open" });
+    expect(list[0]).toMatchObject({ service: "twizz-sentinel", target: "staging", imageTag: MAIN_TAG, argoApp: "staging-twizz-sentinel", host: "sentinel-stg.prv.twizz.com", state: "open" });
   });
 
   it("merges the PR pinned to its head sha and main then carries the new tag", async () => {
