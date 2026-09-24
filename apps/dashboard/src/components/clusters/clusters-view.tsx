@@ -1,6 +1,6 @@
 "use client";
 
-import { Suspense, useEffect, useMemo, useRef, useState } from "react";
+import { Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { usePathname, useRouter, useSearchParams } from "next/navigation";
 import { trpc } from "@/lib/trpc-client";
 import { Pill } from "@/components/nebula/pill";
@@ -15,6 +15,13 @@ import type { AppliedQuery, Cluster, ClusterName, Selection } from "./types";
 // Clusters = pods + logs across all three clusters (docs/NEBULA.md §N3.4).
 // Non-prod is DEPLOYABLE; staging/QA and prod are OBSERVE ONLY — a structural
 // fact (read-only IAM, no kube path), shown here as the pill on every panel.
+//
+// Two views on one route:
+//   overview — the three cluster plates (page scrolls as usual)
+//   logs     — a full-height workspace: breadcrumb › query bar › log viewer;
+//              the only scroller is the log text itself (plus the Observer
+//              drawer's own transcript). Clicking "logs" anywhere on the
+//              overview applies a query straight away and opens this view.
 // The applied log query lives in the URL (?c=&ns=&pod=&w=&q=&err=) so a view
 // can be shared; keystrokes never touch history, only the Query button does.
 
@@ -26,6 +33,8 @@ export function ClustersView() {
   );
 }
 
+type View = "overview" | "logs";
+
 function ClustersViewInner() {
   const overview = trpc.clusters.overview.useQuery(undefined, { refetchInterval: 60_000, retry: false });
   const params = useSearchParams();
@@ -34,6 +43,7 @@ function ClustersViewInner() {
   const initial = useMemo(() => decodeLogsState(params.toString(), CLUSTER_NAMES), [params]);
   const [sel, setSel] = useState<Selection | null>(() => (initial ? { cluster: initial.cluster as ClusterName, namespace: initial.namespace, pod: initial.pod } : null));
   const [applied, setApplied] = useState<AppliedQuery | null>(() => (initial ? { ...initial, cluster: initial.cluster as ClusterName } : null));
+  const [view, setView] = useState<View>(() => (initial ? "logs" : "overview"));
   const lastUrl = useRef<string>(params.toString());
 
   useEffect(() => {
@@ -44,9 +54,40 @@ function ClustersViewInner() {
     router.replace(`${pathname}?${next}`, { scroll: false });
   }, [applied, pathname, router]);
 
+  // "logs" on a namespace or pod: select it, run it with the current window /
+  // filter (or the defaults), and go straight to the workspace. No scrolling.
+  const openLogs = useCallback(
+    (cluster: ClusterName, namespace: string, pod?: string) => {
+      const s: Selection = { cluster, namespace, pod };
+      setSel(s);
+      setApplied({ ...s, minutesBack: applied?.minutesBack ?? 30, filter: applied?.filter ?? "", errorsOnly: applied?.errorsOnly ?? false });
+      setView("logs");
+    },
+    [applied],
+  );
+
+  const clusters = overview.data?.clusters ?? [];
+
+  if (view === "logs") {
+    return (
+      <div style={{ height: "100%", display: "flex", flexDirection: "column", minHeight: 0, overflow: "hidden" }}>
+        <Breadcrumb selection={sel} onBack={() => setView("overview")} />
+        <LogsPanel clusters={clusters} clustersLoading={overview.isLoading} selection={sel} onSelect={setSel} applied={applied} onApply={setApplied} initial={initial} />
+      </div>
+    );
+  }
+
   return (
     <div style={{ padding: 28, maxWidth: 1600 }}>
-      <PageHeader title="Clusters" kicker="pods + logs across all three clusters · observe-only for staging/QA and prod" />
+      <PageHeader title="Clusters" kicker="pods + logs across all three clusters · observe-only for staging/QA and prod">
+        <Button
+          variant={applied ? "ion" : "quiet"}
+          onClick={() => setView("logs")}
+          title={applied ? `back to the applied query: ${applied.cluster} / ${applied.namespace}${applied.pod ? ` / ${applied.pod}` : ""}` : "open the log workspace and compose a query"}
+        >
+          {applied ? "logs ›" : "query logs ›"}
+        </Button>
+      </PageHeader>
 
       {overview.error && (
         <div className="n-plate" style={{ padding: 16, marginBottom: 18, borderColor: "color-mix(in oklab, var(--n-fail) 50%, transparent)" }}>
@@ -59,14 +100,41 @@ function ClustersViewInner() {
         </div>
       )}
 
-      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 16, marginBottom: 24 }}>
-        {(overview.data?.clusters ?? []).map((c) => (
-          <ClusterPanel key={c.name} cluster={c} selected={sel} onPick={(namespace, pod) => setSel({ cluster: c.name, namespace, pod })} />
+      <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 16 }}>
+        {clusters.map((c) => (
+          <ClusterPanel key={c.name} cluster={c} selected={sel} onPick={(namespace, pod) => openLogs(c.name, namespace, pod)} />
         ))}
       </div>
-
-      <LogsPanel clusters={overview.data?.clusters ?? []} selection={sel} onSelect={setSel} applied={applied} onApply={setApplied} initial={initial} />
     </div>
+  );
+}
+
+/** Clusters › cluster › namespace › pod — the way back is the first crumb. */
+function Breadcrumb({ selection, onBack }: { selection: Selection | null; onBack: () => void }) {
+  const crumbs = [selection?.cluster, selection?.namespace, selection?.pod].filter((c): c is string => !!c);
+  return (
+    <nav aria-label="breadcrumb" style={{ flexShrink: 0, display: "flex", alignItems: "center", gap: 8, padding: "12px 20px", borderBottom: "1px solid var(--n-hairline)", fontSize: 12, minWidth: 0 }}>
+      <button
+        type="button"
+        onClick={onBack}
+        title="back to the cluster overview (the applied query is kept)"
+        style={{ background: "none", border: "none", padding: 0, cursor: "pointer", fontFamily: "inherit", fontSize: 12, color: "var(--n-ion-soft)", display: "inline-flex", alignItems: "center", gap: 6 }}
+      >
+        <span aria-hidden>‹</span> Clusters
+      </button>
+      {crumbs.length === 0 && (
+        <>
+          <span style={{ color: "var(--n-ink-faint)" }}>/</span>
+          <span style={{ color: "var(--n-ink-muted)" }}>logs</span>
+        </>
+      )}
+      {crumbs.map((c, i) => (
+        <span key={i} style={{ display: "inline-flex", alignItems: "center", gap: 8, minWidth: 0 }}>
+          <span style={{ color: "var(--n-ink-faint)" }}>/</span>
+          <span style={{ color: i === crumbs.length - 1 ? "var(--n-ink)" : "var(--n-ink-muted)", overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{c}</span>
+        </span>
+      ))}
+    </nav>
   );
 }
 
@@ -123,7 +191,7 @@ function ClusterPanel({ cluster: c, selected, onPick }: { cluster: Cluster; sele
                     <Pill word={w as StatusWord} /> {n}
                   </span>
                 ))}
-                <Button onClick={() => onPick(ns.namespace)} style={{ padding: "3px 8px", fontSize: 9, borderColor: active ? "var(--n-ion)" : undefined }}>
+                <Button onClick={() => onPick(ns.namespace)} style={{ padding: "3px 8px", fontSize: 9, borderColor: active ? "var(--n-ion)" : undefined }} title="query the last 30 min of this namespace">
                   logs
                 </Button>
               </div>
@@ -136,7 +204,7 @@ function ClusterPanel({ cluster: c, selected, onPick }: { cluster: Cluster; sele
                       <span style={{ color: "var(--n-ink-faint)" }}> / {p.containerName}</span>
                     </span>
                     <span style={{ color: "var(--n-ink-faint)", fontSize: 10 }} title="restarts">{p.restarts > 0 ? `↻ ${p.restarts}` : ""}</span>
-                    <button type="button" onClick={() => onPick(ns.namespace, p.podName)} style={{ background: "none", border: "none", color: "var(--n-ion-soft)", fontFamily: "inherit", fontSize: 10, cursor: "pointer" }}>
+                    <button type="button" onClick={() => onPick(ns.namespace, p.podName)} style={{ background: "none", border: "none", color: "var(--n-ion-soft)", fontFamily: "inherit", fontSize: 10, cursor: "pointer" }} title="query the last 30 min of this pod">
                       logs
                     </button>
                   </div>

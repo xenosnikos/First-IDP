@@ -1,16 +1,25 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type CSSProperties, type ReactNode } from "react";
 import { trpc } from "@/lib/trpc-client";
 import { Pill } from "@/components/nebula/pill";
 import { Button } from "@/components/nebula/button";
-import { Field, inputStyle } from "@/components/nebula/plate";
+import { inputStyle } from "@/components/nebula/plate";
 import { WINDOW_OPTIONS, type LogsUrlState } from "@/lib/nebula/logs-url";
 import { groupPodsByDeployment } from "@/lib/nebula/pods";
 import { assignDisplayLevels, isErrorLevel, normalizeLine, podShort, type Level } from "@twizz-idp/observer/logs";
 import { LogHistogram } from "./log-histogram";
 import { ObserverPanel } from "./observer-panel";
 import type { AppliedQuery, Cluster, ClusterName, LogLine, Selection } from "./types";
+
+// The log workspace. It fills whatever height it is given (the parent is a
+// column flex box the height of <main>) and never scrolls as a whole:
+//   query bar (one row)        — fixed
+//   status + histogram         — fixed
+//   log text                   — the ONE scroller, takes the rest
+//   Observer drawer (optional) — full height on the right, its own scroller
+// So the query is always reachable, the log always has the room, and the
+// Observer never steals height from the text it talks about.
 
 const LEVEL_COLOR: Record<Level, string> = {
   FATAL: "var(--n-fail)",
@@ -22,10 +31,25 @@ const LEVEL_COLOR: Record<Level, string> = {
   VERBOSE: "var(--n-ink-faint)",
 };
 
+const OBSERVER_WIDTH = 440;
+
 const dedupKey = (l: LogLine) => `${l.timestamp}|${l.podName}|${l.message}`;
+
+const compactInput: CSSProperties = { ...inputStyle, padding: "6px 8px", fontSize: 11 };
+
+/** A labelled control for the one-row query bar (no bottom margin, unlike <Field>). */
+function Ctl({ label, children, style }: { label: string; children: ReactNode; style?: CSSProperties }) {
+  return (
+    <label style={{ display: "block", minWidth: 0, ...style }}>
+      <div className="n-label" style={{ marginBottom: 4, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}>{label}</div>
+      {children}
+    </label>
+  );
+}
 
 export function LogsPanel({
   clusters,
+  clustersLoading,
   selection,
   onSelect,
   applied,
@@ -33,15 +57,25 @@ export function LogsPanel({
   initial,
 }: {
   clusters: Cluster[];
+  clustersLoading: boolean;
   selection: Selection | null;
   onSelect: (s: Selection) => void;
   applied: AppliedQuery | null;
   onApply: (q: AppliedQuery) => void;
   initial: LogsUrlState | null;
 }) {
-  const [minutesBack, setMinutesBack] = useState(initial?.minutesBack ?? 30);
-  const [filter, setFilter] = useState(initial?.filter ?? "");
-  const [errorsOnly, setErrorsOnly] = useState(initial?.errorsOnly ?? false);
+  // The draft (what the bar shows) follows the applied query whenever one is
+  // applied from outside — e.g. "logs" on the overview — so the bar never lies.
+  const [minutesBack, setMinutesBack] = useState(applied?.minutesBack ?? initial?.minutesBack ?? 30);
+  const [filter, setFilter] = useState(applied?.filter ?? initial?.filter ?? "");
+  const [errorsOnly, setErrorsOnly] = useState(applied?.errorsOnly ?? initial?.errorsOnly ?? false);
+  useEffect(() => {
+    if (!applied) return;
+    setMinutesBack(applied.minutesBack);
+    setFilter(applied.filter);
+    setErrorsOnly(applied.errorsOnly);
+  }, [applied]);
+
   const [observerOpen, setObserverOpen] = useState(false);
   const [selectionText, setSelectionText] = useState("");
   const preRef = useRef<HTMLPreElement>(null);
@@ -110,133 +144,145 @@ export function LogsPanel({
   const scope = applied && logs.data ? { cluster: applied.cluster, namespace: applied.namespace, pod: applied.pod, from: logs.data.from, to: logs.data.to } : null;
 
   return (
-    <section className="n-plate" style={{ padding: 16 }}>
-      <header style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 12, marginBottom: 12, flexWrap: "wrap" }}>
-        <div className="n-display" style={{ fontSize: 20 }}>Logs</div>
-        <div style={{ display: "flex", gap: 12, alignItems: "center", flexWrap: "wrap" }}>
-          <span style={{ fontSize: 11, color: "var(--n-ink-muted)" }}>CloudWatch Container Insights · /aws/containerinsights/&lt;cluster&gt;/application · one place for all three clusters</span>
-          <Button onClick={() => setObserverOpen((o) => !o)} style={{ borderColor: observerOpen ? "var(--n-ion)" : undefined }} title="Observer: read-only log assistant">
-            {observerOpen ? "hide observer" : "observer"}
-          </Button>
+    <div style={{ flex: 1, minHeight: 0, display: "flex", minWidth: 0 }}>
+      {/* ── left: the log column ─────────────────────────────────────── */}
+      <div style={{ flex: 1, minWidth: 0, minHeight: 0, display: "flex", flexDirection: "column" }}>
+        {/* query bar — one row, always in view */}
+        <div style={{ flexShrink: 0, padding: "12px 20px 10px", borderBottom: "1px solid var(--n-hairline)" }}>
+          <div style={{ display: "grid", gridTemplateColumns: "minmax(150px, 1.1fr) minmax(120px, 1fr) minmax(160px, 1.4fr) 88px minmax(160px, 1.3fr) auto auto", gap: 10, alignItems: "end" }}>
+            <Ctl label="cluster">
+              <select value={selection?.cluster ?? ""} onChange={(e) => onSelect({ cluster: e.target.value as ClusterName, namespace: "" })} style={compactInput}>
+                <option value="" disabled>{clustersLoading ? "loading clusters…" : "pick a cluster"}</option>
+                {clusters.map((c) => (
+                  <option key={c.name} value={c.name}>{c.name} — {c.role}</option>
+                ))}
+                {selection?.cluster && !clusters.some((c) => c.name === selection.cluster) && <option value={selection.cluster}>{selection.cluster}</option>}
+              </select>
+            </Ctl>
+            <Ctl label="namespace">
+              <select value={selection?.namespace ?? ""} onChange={(e) => selection && onSelect({ cluster: selection.cluster, namespace: e.target.value })} style={compactInput} disabled={!selection?.cluster}>
+                <option value="" disabled>{cluster ? "pick a namespace" : "—"}</option>
+                {namespaces.map((n) => <option key={n} value={n}>{n}</option>)}
+                {selection?.namespace && !namespaces.includes(selection.namespace) && <option value={selection.namespace}>{selection.namespace}</option>}
+              </select>
+            </Ctl>
+            <Ctl label="pod (optional)">
+              <select value={selection?.pod ?? ""} onChange={(e) => selection && onSelect({ ...selection, pod: e.target.value || undefined })} style={compactInput} disabled={!selection?.namespace}>
+                <option value="">all pods in namespace</option>
+                {podGroups.map((g) => (
+                  <optgroup key={g.deployment} label={g.deployment}>
+                    {g.pods.length > 1 && <option value={g.deployment}>all replicas of {g.deployment}</option>}
+                    {g.pods.map((p) => <option key={p.podName} value={p.podName}>{p.podName}</option>)}
+                  </optgroup>
+                ))}
+                {selection?.pod && !podGroups.some((g) => g.deployment === selection.pod || g.pods.some((p) => p.podName === selection.pod)) && <option value={selection.pod}>{selection.pod}</option>}
+              </select>
+            </Ctl>
+            <Ctl label="window">
+              <select value={minutesBack} onChange={(e) => setMinutesBack(Number(e.target.value))} style={compactInput}>
+                {WINDOW_OPTIONS.map((w) => (
+                  <option key={w} value={w}>{w < 60 ? `${w} min` : `${w / 60} h`}</option>
+                ))}
+              </select>
+            </Ctl>
+            <Ctl label="filter (regex on text or pod)">
+              <input value={filter} onChange={(e) => setFilter(e.target.value)} onKeyDown={(e) => e.key === "Enter" && canRun && run()} placeholder="ERROR|timeout or email-service" style={compactInput} />
+            </Ctl>
+            <Button variant="ion" disabled={!canRun} onClick={run} style={{ padding: "7px 14px" }}>
+              Query
+            </Button>
+            <Button onClick={() => setObserverOpen((o) => !o)} style={{ padding: "7px 12px", borderColor: observerOpen ? "var(--n-ion)" : undefined }} title="Observer: read-only log assistant (full-height drawer)">
+              {observerOpen ? "observer ▸" : "◂ observer"}
+            </Button>
+          </div>
         </div>
-      </header>
 
-      <div style={{ display: "grid", gridTemplateColumns: "1.2fr 1fr 1.4fr 0.7fr 1.2fr auto", gap: 10, alignItems: "end" }}>
-        <Field label="cluster">
-          <select value={selection?.cluster ?? ""} onChange={(e) => onSelect({ cluster: e.target.value as ClusterName, namespace: "" })} style={inputStyle}>
-            <option value="" disabled>pick a cluster</option>
-            {clusters.map((c) => (
-              <option key={c.name} value={c.name}>{c.name} — {c.role}</option>
+        {/* status line + histogram — fixed */}
+        <div style={{ flexShrink: 0, padding: "8px 20px 0", fontSize: 11, color: "var(--n-ink-muted)" }}>
+          <div style={{ display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap", minHeight: 22 }}>
+            {!applied && <span>pick a namespace (or a pod), then Query. Reading is the same for every cluster; writing exists only for non-prod, and only through the gate.</span>}
+            {logs.isFetching && <span><Pill word="RUNNING" /> Logs Insights query in flight (up to ~22 s)…</span>}
+            {logs.error && <span style={{ color: "var(--n-fail)" }}><Pill word="FAIL" /> {logs.error.message}</span>}
+            {logs.data && !logs.isFetching && (
+              <span>
+                {allLines.length} lines{rows.length !== allLines.length ? ` (${rows.length} shown)` : ""} · {logs.data.from.slice(11, 19)} → {logs.data.to.slice(11, 19)} UTC
+                {logs.data.status === "timeout" && <> — <Pill word="UNKNOWN" /> Logs Insights timed out after ~22 s: narrow the window, pod or filter (this is not &quot;no logs&quot;)</>}
+                {logs.data.status === "failed" && <> — <Pill word="FAIL" /> Logs Insights query failed</>}
+                {logs.data.status === "complete" && logs.data.count === 0 && <> — <Pill word="UNKNOWN" /> nothing matched (no pods logging, or the window/filter is too narrow)</>}
+              </span>
+            )}
+            {logs.data && (
+              <>
+                <Button disabled={!canLoadOlder} onClick={loadOlder} style={{ padding: "3px 8px", fontSize: 9 }} title="Re-query with to = oldest loaded line (newest 300 older lines)">
+                  load older
+                </Button>
+                {olderStatus === "loading" && <span><Pill word="RUNNING" /> loading older lines…</span>}
+                {olderStatus === "timeout" && <span><Pill word="UNKNOWN" /> older page timed out</span>}
+                {olderStatus === "failed" && <span><Pill word="FAIL" /> older page failed</span>}
+                {olderStatus === "idle" && older.length > 0 && <span>reached the start of the window</span>}
+                {logs.data.status === "complete" && logs.data.count < 300 && older.length === 0 && <span>all lines in the window loaded</span>}
+              </>
+            )}
+            <span style={{ marginLeft: "auto", display: "inline-flex", gap: 14, alignItems: "center" }}>
+              {selectionText && <span title="what “Explain this trace” will send to the Observer">selection: {selectionText.split("\n").length} lines</span>}
+              <label style={{ display: "inline-flex", gap: 6, alignItems: "center", cursor: "pointer" }} title="Show ERROR/FATAL/WARN records and their stack frames from the loaded lines. For older errors, add ERROR to the filter.">
+                <input type="checkbox" checked={errorsOnly} onChange={(e) => { setErrorsOnly(e.target.checked); if (applied) onApply({ ...applied, errorsOnly: e.target.checked }); }} />
+                errors only
+              </label>
+            </span>
+          </div>
+          {applied && <LogHistogram bins={histogram.data?.bins ?? []} binMinutes={15} status={histogram.data?.status} isFetching={histogram.isFetching} />}
+        </div>
+
+        {/* the log text — the one scroller, takes all remaining height */}
+        <div style={{ flex: 1, minHeight: 0, padding: "8px 20px 16px", display: "flex" }}>
+          <pre
+            ref={preRef}
+            onMouseUp={captureSelection}
+            style={{
+              flex: 1,
+              minWidth: 0,
+              minHeight: 0,
+              margin: 0,
+              padding: 12,
+              overflow: "auto",
+              fontSize: 11,
+              lineHeight: 1.5,
+              background: "var(--n-surface)",
+              border: "1px solid var(--n-hairline)",
+              borderRadius: "var(--n-radius)",
+              whiteSpace: "pre-wrap",
+              wordBreak: "break-word",
+            }}
+          >
+            {rows.length === 0 && (
+              <span style={{ color: "var(--n-ink-faint)" }}>
+                {!applied ? "no query applied" : logs.isFetching ? "…" : logs.data ? (errorsOnly && allLines.length > 0 ? "no ERROR/WARN lines among the loaded lines — untick “errors only” or add ERROR to the filter" : "no lines") : ""}
+              </span>
+            )}
+            {rows.map(({ n, raw }, i) => (
+              <div key={i} style={{ paddingLeft: n.continuation ? 18 : 0 }}>
+                {!n.continuation && (
+                  <>
+                    <span style={{ color: "var(--n-ink-faint)" }}>{raw.timestamp.replace("T", " ").slice(0, 23)}</span>{" "}
+                    <span style={{ color: "var(--n-ion-soft)" }}>{podShort(raw.podName)}</span>{" "}
+                    {n.level !== "UNKNOWN" && <span style={{ color: LEVEL_COLOR[n.level], fontSize: 9, letterSpacing: "0.08em" }}>{n.level}</span>}{n.level !== "UNKNOWN" ? " " : ""}
+                    {n.context && <span style={{ color: "var(--n-ink-faint)" }}>[{n.context}] </span>}
+                  </>
+                )}
+                <span style={{ color: LEVEL_COLOR[n.effectiveLevel] }}>{n.continuation ? n.display : n.text}</span>
+              </div>
             ))}
-          </select>
-        </Field>
-        <Field label="namespace">
-          <select value={selection?.namespace ?? ""} onChange={(e) => selection && onSelect({ cluster: selection.cluster, namespace: e.target.value })} style={inputStyle} disabled={!selection?.cluster}>
-            <option value="" disabled>{cluster ? "pick a namespace" : "—"}</option>
-            {namespaces.map((n) => <option key={n} value={n}>{n}</option>)}
-            {selection?.namespace && !namespaces.includes(selection.namespace) && <option value={selection.namespace}>{selection.namespace}</option>}
-          </select>
-        </Field>
-        <Field label="pod (optional)">
-          <select value={selection?.pod ?? ""} onChange={(e) => selection && onSelect({ ...selection, pod: e.target.value || undefined })} style={inputStyle} disabled={!selection?.namespace}>
-            <option value="">all pods in namespace</option>
-            {podGroups.map((g) => (
-              <optgroup key={g.deployment} label={g.deployment}>
-                {g.pods.length > 1 && <option value={g.deployment}>all replicas of {g.deployment}</option>}
-                {g.pods.map((p) => <option key={p.podName} value={p.podName}>{p.podName}</option>)}
-              </optgroup>
-            ))}
-            {selection?.pod && !podGroups.some((g) => g.deployment === selection.pod || g.pods.some((p) => p.podName === selection.pod)) && <option value={selection.pod}>{selection.pod}</option>}
-          </select>
-        </Field>
-        <Field label="window">
-          <select value={minutesBack} onChange={(e) => setMinutesBack(Number(e.target.value))} style={inputStyle}>
-            {WINDOW_OPTIONS.map((w) => (
-              <option key={w} value={w}>{w < 60 ? `${w} min` : `${w / 60} h`}</option>
-            ))}
-          </select>
-        </Field>
-        <Field label="filter (regex on text or pod name)">
-          <input value={filter} onChange={(e) => setFilter(e.target.value)} onKeyDown={(e) => e.key === "Enter" && canRun && run()} placeholder="ERROR|timeout or email-service" style={inputStyle} />
-        </Field>
-        <div style={{ marginBottom: 14 }}>
-          <Button variant="ion" disabled={!canRun} onClick={run}>
-            Query
-          </Button>
+          </pre>
         </div>
       </div>
 
-      <div style={{ fontSize: 11, color: "var(--n-ink-muted)", marginBottom: 8, display: "flex", gap: 10, alignItems: "center", flexWrap: "wrap" }}>
-        {!applied && <span>pick a namespace (or a pod) above, then Query. Reading is the same for every cluster; writing exists only for non-prod, and only through the gate.</span>}
-        {logs.isFetching && <span><Pill word="RUNNING" /> Logs Insights query in flight (up to ~22 s)…</span>}
-        {logs.error && <span style={{ color: "var(--n-fail)" }}><Pill word="FAIL" /> {logs.error.message}</span>}
-        {logs.data && !logs.isFetching && (
-          <span>
-            {allLines.length} lines{rows.length !== allLines.length ? ` (${rows.length} shown)` : ""} · {logs.data.cluster} / {logs.data.namespace}{applied?.pod ? ` / ${applied.pod}` : ""} · {logs.data.from.slice(11, 19)} → {logs.data.to.slice(11, 19)} UTC
-            {logs.data.status === "timeout" && <> — <Pill word="UNKNOWN" /> Logs Insights timed out after ~22 s: narrow the window, pod or filter (this is not &quot;no logs&quot;)</>}
-            {logs.data.status === "failed" && <> — <Pill word="FAIL" /> Logs Insights query failed</>}
-            {logs.data.status === "complete" && logs.data.count === 0 && <> — <Pill word="UNKNOWN" /> nothing matched (no pods logging, or the window/filter is too narrow)</>}
-          </span>
-        )}
-        <label style={{ display: "inline-flex", gap: 6, alignItems: "center", cursor: "pointer", marginLeft: "auto" }} title="Show ERROR/FATAL/WARN records and their stack frames from the loaded lines. For older errors, add ERROR to the filter.">
-          <input type="checkbox" checked={errorsOnly} onChange={(e) => { setErrorsOnly(e.target.checked); if (applied) onApply({ ...applied, errorsOnly: e.target.checked }); }} />
-          errors only
-        </label>
-      </div>
-
-      {applied && <LogHistogram bins={histogram.data?.bins ?? []} binMinutes={15} status={histogram.data?.status} isFetching={histogram.isFetching} />}
-
-      <div style={{ display: "grid", gridTemplateColumns: observerOpen ? "minmax(0, 1fr) 420px" : "1fr", gap: 12, alignItems: "start" }}>
-        <div style={{ minWidth: 0 }}>
-          {logs.data && (
-            <div style={{ display: "flex", gap: 10, alignItems: "center", fontSize: 11, color: "var(--n-ink-muted)", marginBottom: 6 }}>
-              <Button disabled={!canLoadOlder} onClick={loadOlder} style={{ padding: "3px 8px", fontSize: 9 }} title="Re-query with to = oldest loaded line (newest 300 older lines)">
-                load older
-              </Button>
-              {olderStatus === "loading" && <span><Pill word="RUNNING" /> loading older lines…</span>}
-              {olderStatus === "timeout" && <span><Pill word="UNKNOWN" /> older page timed out</span>}
-              {olderStatus === "failed" && <span><Pill word="FAIL" /> older page failed</span>}
-              {olderStatus === "idle" && older.length > 0 && <span>reached the start of the window</span>}
-              {logs.data.status === "complete" && logs.data.count < 300 && older.length === 0 && <span>all lines in the window loaded</span>}
-              {selectionText && <span style={{ marginLeft: "auto" }}>selection: {selectionText.split("\n").length} lines</span>}
-            </div>
-          )}
-          {rows.length > 0 && (
-            <pre
-              ref={preRef}
-              onMouseUp={captureSelection}
-              style={{
-                margin: 0,
-                padding: 12,
-                maxHeight: 560,
-                overflow: "auto",
-                fontSize: 11,
-                lineHeight: 1.5,
-                background: "var(--n-surface)",
-                border: "1px solid var(--n-hairline)",
-                borderRadius: "var(--n-radius)",
-                whiteSpace: "pre-wrap",
-                wordBreak: "break-word",
-              }}
-            >
-              {rows.map(({ n, raw }, i) => (
-                <div key={i} style={{ paddingLeft: n.continuation ? 18 : 0 }}>
-                  {!n.continuation && (
-                    <>
-                      <span style={{ color: "var(--n-ink-faint)" }}>{raw.timestamp.replace("T", " ").slice(0, 23)}</span>{" "}
-                      <span style={{ color: "var(--n-ion-soft)" }}>{podShort(raw.podName)}</span>{" "}
-                      {n.level !== "UNKNOWN" && <span style={{ color: LEVEL_COLOR[n.level], fontSize: 9, letterSpacing: "0.08em" }}>{n.level}</span>}{n.level !== "UNKNOWN" ? " " : ""}
-                      {n.context && <span style={{ color: "var(--n-ink-faint)" }}>[{n.context}] </span>}
-                    </>
-                  )}
-                  <span style={{ color: LEVEL_COLOR[n.effectiveLevel] }}>{n.continuation ? n.display : n.text}</span>
-                </div>
-              ))}
-            </pre>
-          )}
+      {/* ── right: the Observer drawer, full height ───────────────────── */}
+      {observerOpen && (
+        <div style={{ width: OBSERVER_WIDTH, flexShrink: 0, minHeight: 0, borderLeft: "1px solid var(--n-hairline)", display: "flex" }}>
+          <ObserverPanel scope={scope} selection={selectionText} onClose={() => setObserverOpen(false)} />
         </div>
-        {observerOpen && <ObserverPanel scope={scope} selection={selectionText} />}
-      </div>
-    </section>
+      )}
+    </div>
   );
 }

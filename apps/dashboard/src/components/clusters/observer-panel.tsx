@@ -16,7 +16,7 @@ import type { ObserverEvent, ObserverKind } from "@twizz-idp/observer"; // type-
 type Scope = { cluster: string; namespace: string; pod?: string; from: string; to: string };
 type Turn = { role: "user" | "assistant"; content: string; kind?: ObserverKind; tools?: string[] };
 
-export function ObserverPanel({ scope, selection }: { scope: Scope | null; selection: string }) {
+export function ObserverPanel({ scope, selection, onClose }: { scope: Scope | null; selection: string; onClose?: () => void }) {
   const status = trpc.observer.status.useQuery(undefined, { refetchInterval: 60_000, retry: false });
   const [turns, setTurns] = useState<Turn[]>([]);
   const [live, setLive] = useState<{ text: string; tools: string[] } | null>(null);
@@ -24,11 +24,22 @@ export function ObserverPanel({ scope, selection }: { scope: Scope | null; selec
   const [note, setNote] = useState<string>("");
   const [question, setQuestion] = useState("");
   const abortRef = useRef<AbortController | null>(null);
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<HTMLDivElement>(null);
+
+  // Pin the transcript to its end as it streams — by scrolling the transcript
+  // element itself. scrollIntoView() would also scroll every ancestor (the
+  // page), which is what made the old layout jump on every token.
+  useEffect(() => {
+    const el = transcriptRef.current;
+    if (el) el.scrollTop = el.scrollHeight;
+  }, [turns, live]);
 
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [turns, live]);
+    if (!onClose) return;
+    const onKey = (e: KeyboardEvent) => e.key === "Escape" && onClose();
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, [onClose]);
 
   const configured = status.data?.configured ?? false;
   const denied = status.data?.word === "DENIED";
@@ -119,10 +130,17 @@ export function ObserverPanel({ scope, selection }: { scope: Scope | null; selec
   const headerWord = busy ? "RUNNING" : (status.data?.word ?? "PENDING");
 
   return (
-    <aside className="n-plate" style={{ padding: 12, display: "flex", flexDirection: "column", gap: 10, maxHeight: 640, minWidth: 0 }}>
-      <header style={{ display: "flex", alignItems: "baseline", justifyContent: "space-between", gap: 8 }}>
+    <aside aria-label="Observer" style={{ flex: 1, minWidth: 0, minHeight: 0, padding: "12px 16px 16px", display: "flex", flexDirection: "column", gap: 10, background: "var(--n-surface)" }}>
+      <header style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: 8 }}>
         <div className="n-display" style={{ fontSize: 18 }}>Observer</div>
-        <Pill word={headerWord} title={status.data?.reason} />
+        <span style={{ display: "inline-flex", alignItems: "center", gap: 8 }}>
+          <Pill word={headerWord} title={status.data?.reason} />
+          {onClose && (
+            <button type="button" onClick={onClose} aria-label="Close observer" title="close (esc)" style={{ background: "none", border: "1px solid var(--n-hairline-strong)", color: "var(--n-ink-muted)", borderRadius: 3, padding: "2px 8px", cursor: "pointer", fontFamily: "inherit", fontSize: 10 }}>
+              esc
+            </button>
+          )}
+        </span>
       </header>
       <div style={{ fontSize: 10, color: "var(--n-ink-muted)", lineHeight: 1.5 }}>
         read-only log analyst · scope = the applied query · every run is audited
@@ -141,7 +159,7 @@ export function ObserverPanel({ scope, selection }: { scope: Scope | null; selec
         {busy && <Button variant="danger" onClick={() => abortRef.current?.abort()} style={{ padding: "5px 9px", fontSize: 10, marginLeft: "auto" }}>Stop</Button>}
       </div>
 
-      <div style={{ flex: 1, minHeight: 120, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, fontSize: 11, lineHeight: 1.55 }}>
+      <div ref={transcriptRef} style={{ flex: 1, minHeight: 0, overflowY: "auto", display: "flex", flexDirection: "column", gap: 8, fontSize: 11, lineHeight: 1.55 }}>
         {turns.map((t, i) => (
           <div key={i} style={{ background: t.role === "user" ? "var(--n-raised)" : "var(--n-surface)", border: "1px solid var(--n-hairline)", borderRadius: "var(--n-radius)", padding: "8px 10px" }}>
             {t.role === "user" ? (
@@ -160,7 +178,6 @@ export function ObserverPanel({ scope, selection }: { scope: Scope | null; selec
             <div style={{ whiteSpace: "pre-wrap", wordBreak: "break-word", color: "var(--n-ink)" }}>{live.text || <span style={{ color: "var(--n-ink-muted)" }}>{note || "thinking…"}</span>}</div>
           </div>
         )}
-        <div ref={bottomRef} />
       </div>
 
       {note && !busy && <div style={{ fontSize: 10, color: "var(--n-ink-faint)" }}>{note}</div>}
