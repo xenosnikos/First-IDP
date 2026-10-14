@@ -22,11 +22,14 @@ type Choice = { mode: "preset"; name: string } | { mode: "custom"; size: TierSiz
 type CapAction =
   | { kind: "apply"; tier: WritableTier; label: string; preset?: string; custom?: TierSize }
   | { kind: "merge"; tier: WritableTier; label: string; prNumber: number; headSha: string }
-  | { kind: "atlas"; size: AtlasSize };
+  | { kind: "atlas"; size: AtlasSize }
+  | { kind: "live"; tier: LiveTier; label: string; preset?: string; custom?: TierSize; planHash: string };
+type LiveTier = "staging" | "production";
 
 type ApplyResult = { prNumber: number; prUrl: string; existing: boolean; files: string[]; branch: string };
 type MergeResult = { prNumber: number; mergedSha: string; tier: string; label: string };
 type AtlasResult = { cluster: string; from: string; to: string; state: string };
+type LiveResult = { cluster: string; applied: string[]; failed?: string };
 
 const TIERS: CapacityTier[] = ["preview", "staging", "production"];
 const isWritable = (t: CapacityTier): t is WritableTier => t !== "production";
@@ -80,16 +83,18 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
   const apply = trpc.actions.applyCapacityPreset.useMutation();
   const merge = trpc.actions.mergeCapacityPr.useMutation();
   const atlas = trpc.actions.setAtlasTier.useMutation();
+  const liveApply = trpc.actions.applyLiveCapacity.useMutation();
   const run = useCallback(
     async (args: { action: CapAction; confirm?: string }): Promise<GateResult> => {
       const { action: a, confirm } = args;
       if (a.kind === "apply") return (await apply.mutateAsync({ tier: a.tier, preset: a.preset, custom: a.custom, confirm })) as GateResult;
       if (a.kind === "merge") return (await merge.mutateAsync({ tier: a.tier, label: a.label, prNumber: a.prNumber, headSha: a.headSha, confirm })) as GateResult;
+      if (a.kind === "live") return (await liveApply.mutateAsync({ tier: a.tier, preset: a.preset, custom: a.custom, planHash: a.planHash, confirm })) as GateResult;
       return (await atlas.mutateAsync({ tier: "preview", size: a.size, confirm })) as GateResult;
     },
-    [apply, merge, atlas],
+    [apply, merge, atlas, liveApply],
   );
-  const gated = useGatedAction<{ action: CapAction }, ApplyResult | MergeResult | AtlasResult>(run);
+  const gated = useGatedAction<{ action: CapAction }, ApplyResult | MergeResult | AtlasResult | LiveResult>(run);
   const start = (a: CapAction) => {
     setAction(a);
     void gated.request({ action: a });
@@ -113,7 +118,16 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
   const plan = planQ.data;
   const writable = isWritable(tier) && !!tierQ.data?.writable;
   const title =
-    action?.kind === "apply" ? `Apply "${action.label}" to ${CAPACITY_TIER_LABEL[action.tier]}` : action?.kind === "merge" ? `Merge capacity PR #${action.prNumber}` : action ? `Resize NonProd Atlas → ${action.size.instanceSize}` : "";
+    action?.kind === "apply"
+      ? `Apply "${action.label}" to ${CAPACITY_TIER_LABEL[action.tier]}`
+      : action?.kind === "merge"
+        ? `Merge capacity PR #${action.prNumber}`
+        : action?.kind === "live"
+          ? `Resize ${CAPACITY_TIER_LABEL[action.tier]} live → "${action.label}"`
+          : action
+            ? `Resize NonProd Atlas → ${action.size.instanceSize}`
+            : "";
+  const liveTier = tier === "staging" || tier === "production" ? (tier as LiveTier) : null;
 
   return (
     <div style={{ padding: 28, maxWidth: 1500 }}>
@@ -128,8 +142,8 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
           </Button>
         ))}
         <span style={{ flex: 1 }} />
-        {tierQ.data && <Pill word={tierQ.data.writable ? "DEPLOYABLE" : "OBSERVE ONLY"} title={tierQ.data.writable ? `${tierQ.data.cluster}: Nebula opens capacity PRs` : `${tierQ.data.cluster}: plan + export only — Nebula never writes here`} />}
-        {tier === "staging" && <Pill word="STAGING" title="writes reach ns sentinel only; moly-backend and nodes are plan-only" />}
+        {tierQ.data && <Pill word="DEPLOYABLE" title={liveTier ? `${tierQ.data.cluster}: workloads (ns default/jobs) + node groups resized live, gated` : `${tierQ.data.cluster}: Nebula opens capacity PRs`} />}
+        {tier === "staging" && <Pill word="STAGING" title="ns default/jobs + node group live; ns sentinel by gitops PR" />}
       </nav>
 
       {[overview.error, tierQ.error, overview.data?.presetsError, overview.data?.prsError].filter(Boolean).map((e, i) => (
@@ -188,6 +202,15 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
           </Button>
           {estimateQ.error && <div style={{ marginTop: 10, color: "var(--n-fail)", fontSize: 11 }}><Pill word="FAIL" /> {estimateQ.error.message}</div>}
           {estimateQ.data && <EstimateBox e={estimateQ.data} onUse={(size) => setChoice({ mode: "custom", size })} onPreset={(name) => setChoice({ mode: "preset", name })} />}
+
+          {liveTier && tierQ.data?.live && "baseline" in tierQ.data.live && (
+            <LiveEditor
+              key={`${tier}-${choice?.mode === "preset" ? choice.name : "live"}`}
+              live={tierQ.data.live}
+              seed={(choice?.mode === "preset" ? presets.find((p) => p.name === choice.name)?.tiers[tier]?.live : undefined) ?? tierQ.data.live.baseline}
+              onPlan={(live) => setChoice({ mode: "custom", size: { services: {}, live } })}
+            />
+          )}
         </Section>
 
         <Section
@@ -198,6 +221,7 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
           {planQ.isLoading && choice && <span style={{ color: "var(--n-ink-muted)" }}>planning…</span>}
           {planQ.error && <div style={{ color: "var(--n-fail)", fontSize: 11 }}><Pill word="FAIL" /> {planQ.error.message}</div>}
           {plan && <PlanBody plan={plan} />}
+          {plan?.live && <LivePlanBody live={plan.live} />}
           {plan && (
             <footer style={{ display: "flex", gap: 8, flexWrap: "wrap", marginTop: 14 }}>
               {writable && isWritable(tier) && (
@@ -215,6 +239,16 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
                   Apply Atlas tier
                 </Button>
               )}
+              {liveTier && plan.live && "ops" in plan.live && (
+                <Button
+                  variant="ion"
+                  disabled={!operator || plan.live.ops.length === 0 || plan.live.violations.length > 0}
+                  title={!operator ? "operators only" : plan.live.violations.length ? "refused — see the plan" : plan.live.ops.length === 0 ? "the cluster already matches" : `${plan.live.ops.length} change(s) on ${plan.live.cluster}, two-step confirm`}
+                  onClick={() => plan.live && "planHash" in plan.live && start({ kind: "live", tier: liveTier, label: plan.label, ...(choice?.mode === "preset" ? { preset: choice.name } : { custom: plan.size }), planHash: plan.live.planHash })}
+                >
+                  Apply to {tierQ.data?.cluster ?? "cluster"}
+                </Button>
+              )}
               <Button onClick={() => download(`capacity-${tier}-${plan.label}.yaml`, plan.exportYaml)} title="the whole plan as YAML — the hand-off for tiers Nebula does not write">
                 Export YAML
               </Button>
@@ -223,7 +257,7 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
         </Section>
       </div>
 
-      <GateDialog<ApplyResult | MergeResult | AtlasResult>
+      <GateDialog<ApplyResult | MergeResult | AtlasResult | LiveResult>
         title={title}
         phase={gated.phase}
         onConfirm={gated.confirm}
@@ -238,6 +272,14 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
               <Row label="files" last>{r.files.join(", ")}</Row>
               <p style={{ margin: "12px 0 0", color: "var(--n-ink-muted)", lineHeight: 1.6 }}>Nothing has changed yet. Merge the PR (here or on GitHub) and Argo CD resizes the tier.</p>
             </div>
+          ) : "applied" in r ? (
+            <div style={{ marginBottom: 14, fontSize: 12, lineHeight: 1.6 }}>
+              {r.applied.map((x) => (
+                <div key={x}>✓ {x}</div>
+              ))}
+              {r.failed && <div style={{ color: "var(--n-fail)" }}>✗ {r.failed} — stopped here; nothing after it ran</div>}
+              <p style={{ margin: "10px 0 0", color: "var(--n-ink-muted)" }}>{r.cluster}: applied live. Node groups take a few minutes to add or drain nodes.</p>
+            </div>
           ) : "mergedSha" in r ? (
             <p style={{ marginBottom: 14, color: "var(--n-ink-muted)", lineHeight: 1.6 }}>Merged #{r.prNumber} ({r.mergedSha.slice(0, 7)}). Argo CD applies {r.label} to {r.tier} within ~3 minutes.</p>
           ) : (
@@ -249,11 +291,145 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
   );
 }
 
+type LiveView = NonNullable<TierView["live"]>;
+type LiveOk = Extract<LiveView, { baseline: unknown }>;
+type LiveSize = NonNullable<TierSize["live"]>;
+
+function LiveCurrent({ live }: { live: LiveView }) {
+  if (!("baseline" in live)) return <div style={{ fontSize: 11, color: "var(--n-fail)", margin: "6px 0" }}><Pill word="UNKNOWN" /> live cluster not readable: {live.error}</div>;
+  return (
+    <div style={{ marginBottom: 10 }}>
+      <div style={{ ...label, margin: "6px 0 4px" }}>live · {live.cluster} · read {new Date(live.readAt).toLocaleTimeString()}</div>
+      {live.workloads.map((w) => (
+        <div key={`${w.namespace}/${w.name}`} style={{ display: "flex", gap: 8, fontSize: 12, padding: "2px 0" }}>
+          <span style={{ flex: 1, minWidth: 0, overflow: "hidden", textOverflow: "ellipsis" }} title={`${w.namespace}/${w.name}`}>
+            {(live.pair as readonly string[]).includes(w.name) ? "⇆ " : ""}{w.name.replace(/-deployment$/, "")}
+          </span>
+          <span style={{ whiteSpace: "nowrap" }}>{w.ready}/{w.replicas}{w.hpa ? ` · HPA ${w.hpa.min}–${w.hpa.max}` : ""}</span>
+          <span style={{ color: "var(--n-ink-faint)", whiteSpace: "nowrap", fontSize: 11 }}>{w.resources.requests?.cpu || w.resources.limits?.cpu ? `${w.resources.requests?.cpu ?? "–"}/${w.resources.limits?.memory ?? "–"}` : "no requests"}</span>
+        </div>
+      ))}
+      <div style={{ ...label, margin: "10px 0 4px" }}>node groups · {live.nodes.length} nodes · {live.nodes.reduce((a, n) => a + n.cpuCores, 0)} vCPU · metrics-server {live.metricsServer ? "yes" : "no"}</div>
+      {live.nodegroups.map((n) => (
+        <div key={n.name} style={{ fontSize: 12 }}>
+          {n.name}: {n.min}/{n.desired}/{n.max} <span style={{ color: "var(--n-ink-faint)" }}>(min/desired/max · {n.instanceTypes.join(",")} · {n.status})</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+/** Edit the live sizing directly: the pair moves together; everything else defaults to what runs. */
+function LiveEditor({ live, seed, onPlan }: { live: LiveOk; seed: LiveSize; onPlan: (s: LiveSize) => void }) {
+  const pair = live.pair as readonly string[];
+  const init = () => {
+    const w: Record<string, { replicas: string; hpa: boolean; min: string; max: string }> = {};
+    for (const x of live.workloads) {
+      const s = seed.workloads[x.name] ?? live.baseline.workloads[x.name];
+      w[x.name] = { replicas: String(s?.replicas ?? x.replicas), hpa: !!s?.autoscaling?.enabled, min: String(s?.autoscaling?.minReplicas ?? x.replicas), max: String(s?.autoscaling?.maxReplicas ?? x.replicas * 2) };
+    }
+    const n: Record<string, { min: string; desired: string; max: string }> = {};
+    for (const g of live.nodegroups) {
+      const s = seed.nodegroups[g.name] ?? { min: g.min, desired: g.desired, max: g.max };
+      n[g.name] = { min: String(s.min), desired: String(s.desired), max: String(s.max) };
+    }
+    return { w, n };
+  };
+  const [st, setSt] = useState(init);
+  const setW = (name: string, patch: Partial<(typeof st.w)[string]>) =>
+    setSt((p) => {
+      const w = { ...p.w, [name]: { ...p.w[name], ...patch } };
+      // the pair always moves together
+      if (pair.includes(name)) for (const other of pair) if (other !== name && w[other]) w[other] = { ...w[name] };
+      return { ...p, w };
+    });
+  const build = (): LiveSize => {
+    const workloads: LiveSize["workloads"] = {};
+    for (const [name, v] of Object.entries(st.w)) {
+      workloads[name] = v.hpa
+        ? { replicas: Number(v.min), autoscaling: { enabled: true, minReplicas: Number(v.min), maxReplicas: Number(v.max), targetCPUUtilizationPercentage: 70 } }
+        : { replicas: Number(v.replicas) };
+    }
+    const nodegroups: LiveSize["nodegroups"] = {};
+    for (const [name, v] of Object.entries(st.n)) nodegroups[name] = { min: Number(v.min), desired: Number(v.desired), max: Number(v.max) };
+    return { workloads, nodegroups };
+  };
+  const num: CSSProperties = { ...inputStyle, width: 64, padding: "4px 6px" };
+  return (
+    <div style={{ marginTop: 18 }}>
+      <div style={{ ...label, margin: "0 0 8px" }}>live sizing · {live.cluster} · ⇆ = scales as a pair</div>
+      {Object.entries(st.w).map(([name, v]) => (
+        <div key={name} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 4, flexWrap: "wrap" }}>
+          <span style={{ flex: 1, minWidth: 140 }}>{pair.includes(name) ? "⇆ " : ""}{name.replace(/-deployment$/, "")}</span>
+          {v.hpa ? (
+            <>
+              <input style={num} aria-label={`${name} HPA min`} value={v.min} onChange={(e) => setW(name, { min: e.target.value })} />–
+              <input style={num} aria-label={`${name} HPA max`} value={v.max} onChange={(e) => setW(name, { max: e.target.value })} />
+            </>
+          ) : (
+            <input style={num} aria-label={`${name} replicas`} value={v.replicas} onChange={(e) => setW(name, { replicas: e.target.value })} />
+          )}
+          <label style={{ fontSize: 11, color: "var(--n-ink-muted)" }} title={live.metricsServer ? "CPU HPA at 70%" : "no metrics-server on this cluster"}>
+            <input type="checkbox" disabled={!live.metricsServer} checked={v.hpa} onChange={(e) => setW(name, { hpa: e.target.checked })} /> HPA
+          </label>
+        </div>
+      ))}
+      {Object.entries(st.n).map(([name, v]) => (
+        <div key={name} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 4, flexWrap: "wrap" }}>
+          <span style={{ flex: 1, minWidth: 140 }} title={name}>nodes {name.replace(/^eks-/, "")}</span>
+          <input style={num} aria-label={`${name} min`} value={v.min} onChange={(e) => setSt((p) => ({ ...p, n: { ...p.n, [name]: { ...v, min: e.target.value } } }))} />/
+          <input style={num} aria-label={`${name} desired`} value={v.desired} onChange={(e) => setSt((p) => ({ ...p, n: { ...p.n, [name]: { ...v, desired: e.target.value } } }))} />/
+          <input style={num} aria-label={`${name} max`} value={v.max} onChange={(e) => setSt((p) => ({ ...p, n: { ...p.n, [name]: { ...v, max: e.target.value } } }))} />
+        </div>
+      ))}
+      <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
+        <Button variant="ion" onClick={() => onPlan(build())}>Plan these values</Button>
+        <Button onClick={() => setSt(init())}>Reset</Button>
+      </div>
+    </div>
+  );
+}
+
+type LivePlanView = NonNullable<PlanView["live"]>;
+
+function LivePlanBody({ live }: { live: LivePlanView }) {
+  if (!("ops" in live)) return <div style={{ fontSize: 11, color: "var(--n-fail)", marginTop: 8 }}><Pill word="FAIL" /> live cluster not readable: {live.error}</div>;
+  return (
+    <div style={{ marginTop: 12 }}>
+      <div style={{ ...label, margin: "0 0 6px" }}>live · {live.cluster} · {live.ops.length} change(s)</div>
+      {live.violations.map((v) => (
+        <div key={v} style={{ fontSize: 11, color: "var(--n-fail)", marginBottom: 4 }}><Pill word="DENIED" /> {v}</div>
+      ))}
+      {live.rows.map((r) => (
+        <div key={r.workload} style={{ display: "flex", gap: 8, fontSize: 12, padding: "2px 0", color: r.changes.length ? "var(--n-ink)" : "var(--n-ink-faint)" }}>
+          <span style={{ flex: 1, minWidth: 0 }}>{r.pair ? "⇆ " : ""}{r.workload.replace(/-deployment$/, "")}</span>
+          <span style={{ textAlign: "right" }}>{r.changes.length ? r.changes.join("; ") : r.after}</span>
+        </div>
+      ))}
+      {live.nodegroupRows.map((r) => (
+        <div key={r.name} style={{ display: "flex", gap: 8, fontSize: 12, padding: "2px 0", color: r.changes.length ? "var(--n-ink)" : "var(--n-ink-faint)" }}>
+          <span style={{ flex: 1, minWidth: 0 }}>nodes {r.name.replace(/^eks-/, "")}</span>
+          <span>{r.changes.length ? r.changes.join("; ") : r.after}</span>
+        </div>
+      ))}
+      {live.warnings.map((w) => (
+        <div key={w} style={{ fontSize: 11, color: "var(--n-pending)", marginTop: 4 }}>⚠ {w}</div>
+      ))}
+      {live.opsText.length > 0 && (
+        <div style={{ fontSize: 11, color: "var(--n-ink-muted)", marginTop: 8 }}>
+          order: {live.opsText.map((t, i) => <div key={i}>{i + 1}. {t}</div>)}
+        </div>
+      )}
+    </div>
+  );
+}
+
 function CurrentPane({ data, loading }: { data?: TierView; loading: boolean }) {
   if (!data) return <Section title="Current">{loading ? <span style={{ color: "var(--n-ink-muted)" }}>reading gitops, CloudWatch{" "}and Atlas…</span> : null}</Section>;
   const o = data.observed;
   return (
     <Section title="Current" right={<span style={{ fontSize: 11, color: "var(--n-ink-muted)" }}>{data.cluster}</span>}>
+      {data.live && <LiveCurrent live={data.live} />}
       {o.podsError && <div style={{ fontSize: 11, color: "var(--n-ink-muted)", marginBottom: 6 }}><Pill word="UNKNOWN" /> pods: {o.podsError}</div>}
       {data.targets.map((t, i) => {
         const declared = data.declared.services[t.name];
@@ -285,6 +461,16 @@ function CurrentPane({ data, loading }: { data?: TierView; loading: boolean }) {
       {!data.nodesManaged && data.tier !== "preview" && <div style={{ fontSize: 11, color: "var(--n-ink-faint)", marginTop: 2 }}>node pools here are not Nebula-managed: recommendations only</div>}
       {o.nodes.kubeError && <div style={{ fontSize: 11, color: "var(--n-ink-faint)", marginTop: 2 }}>kube: {o.nodes.kubeError}</div>}
       <div style={{ ...label, margin: "14px 0 4px" }}>atlas</div>
+      {data.prodAtlas &&
+        ("clusters" in data.prodAtlas ? (
+          data.prodAtlas.clusters.map((c) => (
+            <div key={c.name} style={{ fontSize: 12 }}>
+              {c.name}: {c.instanceSize}{c.autoScaling ? ` (auto ${c.autoScaling.min}–${c.autoScaling.max})` : ""} <span style={{ color: "var(--n-ink-faint)" }}>{c.state}</span>
+            </div>
+          ))
+        ) : (
+          <div style={{ fontSize: 12, color: "var(--n-ink-muted)" }}><Pill word="UNKNOWN" /> {data.prodAtlas.error}</div>
+        ))}
       <div style={{ fontSize: 12 }}>
         {data.atlas.current ? `${data.atlas.cluster}: ${data.atlas.current.instanceSize}${data.atlas.current.autoScaling ? ` (auto ${data.atlas.current.autoScaling.min}–${data.atlas.current.autoScaling.max})` : ""}` : <span style={{ color: "var(--n-ink-muted)" }}><Pill word="UNKNOWN" /> {data.atlas.error ?? "not read"}</span>}
       </div>

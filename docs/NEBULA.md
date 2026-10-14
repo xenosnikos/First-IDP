@@ -653,8 +653,8 @@ what is actually running, with a rough ≈ $/month cost delta.
 | Tier (key) | Cluster | What Nebula may write |
 |---|---|---|
 | NonProd (`preview`) | EKS-Twizz-NonProd | Shared services `apps/shared/*.yaml`, spot NodePool ceiling + warm capacity, and the Atlas tier of `NonProd-Twizz` |
-| Staging (`staging`) | EKS-Moly-staging | ns `sentinel` only (`apps/<svc>/values-staging.yaml`). moly-backend, nodes and Atlas are plan/export only. |
-| Prod (`production`) | EKS-Moly-Prod | **Nothing.** This tier is a config pane: plan and Export YAML for the prod release process. |
+| Staging (`staging`) | EKS-Moly-staging | ns `sentinel` by gitops PR; ns default/jobs + the node group **live** (§N5.2); Atlas = NonProd-Twizz (shared, read-only here) |
+| Prod (`production`) | EKS-Moly-Prod | Workloads in ns default/jobs + the managed node groups, **live** (§N5.2) |
 
 **Source of truth.** All of these live in twizz-gitops and are edited by PR:
 - `capacity/presets.yaml`: per tier, per service: replicas, requests/limits and an optional HPA. `nodes` holds the NodePool ceiling plus warm vCPU/GiB; `atlas` holds instanceSize plus auto-scaling bounds.
@@ -679,9 +679,36 @@ what is actually running, with a rough ≈ $/month cost delta.
 - On NonProd, the managed `spot` pool is an OVERFLOW pool: most workloads land on `private-egress` (owned by the twizz-support app, 16 vCPU) and the built-in `general-purpose` pool is uncapped. The page lists every pool; only `spot` is managed. This needs the extra get/list rules in `nebula-dashboard-read`.
 - The Atlas tier is read through `AtlasTierService`. Staging and prod Atlas are read only when `NEBULA_ATLAS_CLUSTER_STAGING` / `NEBULA_ATLAS_CLUSTER_PRODUCTION` name a cluster in the configured project.
 
-**Prod stays untouchable.** `production` has no write tool or mutation and is not in any input enum. Every value containing `prod` also hits the global `*prod*` deny. Tier keys are chosen so that the writable tiers never contain "prod".
+**Prod is writable through ONE tool.** `apply_live_capacity` is the only write that may name `tier: production` (`exempt_global_deny: [tier]` in policy.yaml, that tool and field only; every other tool still hits the global `*prod*` deny — tested).
 
 **Not yet:**
 - Atlas storage, IOPS and node counts.
 - Staging node pools: Argo is namespace-scoped there.
 - Moving `scale_shared_service` (a direct kube patch that Argo selfHeal reverts) onto capacity PRs.
+
+### N5.2 — Live capacity on EKS-Moly-staging + EKS-Moly-Prod (2026-10-14)
+
+Platform-owner decision: prod capacity is adjusted from Nebula. The Moly clusters have no gitops
+source for sizing (their CodeBuild pipelines only `rollout restart` `:latest`; repo
+`deployment.yaml`s say 2 replicas while prod runs 24), so **the live cluster is the truth**: the
+Current pane reads it on every load, every plan is a diff against a fresh read, and apply re-reads
+and refuses unless the plan is byte-identical to the one confirmed (`planHash` binds the nonce).
+
+- **Access** (applied 2026-10-14): EKS access entries map `twizz-nebula-dashboard` to group
+  `nebula-capacity` (infra/src/capacity-access.ts); RBAC infra/k8s/nebula-capacity-rbac.yaml — read
+  nodes; in ns default + jobs read pods, patch deployments + deployments/scale, create/patch HPAs.
+  `can-i`-verified on both clusters: no secrets/configmaps, no kube-system, no create/delete.
+  Node groups: eks:UpdateNodegroupConfig on those two clusters only. Prod API allowlist = bastion +
+  Nebula NAT `108.133.39.9/32`. Tokens: SigV4-presigned STS (core `eks-auth.ts`, node:crypto).
+- **Rules** (`packages/actions/src/live-capacity.ts`): moly-backend + lolygram-discovery are a pair
+  (same replicas/HPA, or refused); unnamed workloads stay at their live baseline; one apply ≤ ×3 and
+  ≥ ×0.5 per workload / node group; caps (prod 120 replicas, 20 nodes/group; staging 20 / 6); never
+  deletes (no HPA removal, no zero); HPAs only where metrics.k8s.io is served; resources merge onto
+  the live container (floors + OOM warning); node groups grow first, shrink last; stop at first failure.
+- **UI**: /capacity → Staging / Prod show the live workloads + node groups, a live sizing editor
+  (pair inputs move together), the plan in apply order, and **Apply to <cluster>** (operators,
+  two-step confirm, AuditLog `nebula.apply_live_capacity`).
+- **Presets** (`live:` in capacity/presets.yaml) are calibrated to 2026-10-14: prod pair 24 on
+  m5-2x-extra 3/3/5 + m5-2xlarge 2/2/4 = "normal" (no-op); quiet 16, campaign 36 (+2 nodes), peak 48 (+4).
+- **Atlas**: staging uses NonProd-Twizz (shared). Prod is moly-prod + prod-shift4 in another Atlas
+  account — read once `ATLAS_PROD_*` exist (`scripts/nebula-set-atlas-keys.sh --prod`).

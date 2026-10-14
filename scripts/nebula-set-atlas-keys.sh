@@ -8,6 +8,8 @@
 # Project Cluster Manager on the project to change the NonProd-Twizz tier.
 #
 #   AWS_PROFILE=twizz bash scripts/nebula-set-atlas-keys.sh
+#   # prod (another Atlas account; read on /capacity → Prod):
+#   ATLAS_PUBLIC_KEY=… ATLAS_PRIVATE_KEY=… ATLAS_PROJECT_ID=… AWS_PROFILE=twizz bash scripts/nebula-set-atlas-keys.sh --prod
 #
 # Then resync + restart (the pod reads env at start):
 #   kubectl --kubeconfig ~/.kube/twizz-nonprod.yaml -n nebula annotate externalsecret nebula-env force-sync=$(date +%s) --overwrite
@@ -19,6 +21,11 @@ umask 077
 REGION=eu-west-1
 SECRET=preview/nebula
 ENV_FILE="$(dirname "$0")/../apps/dashboard/.env.local"
+PREFIX=ATLAS_
+if [ "${1:-}" = "--prod" ]; then
+  PREFIX=ATLAS_PROD_
+  : "${ATLAS_PUBLIC_KEY:?--prod reads the prod key pair from ATLAS_PUBLIC_KEY / ATLAS_PRIVATE_KEY / ATLAS_PROJECT_ID}"
+fi
 
 if [ -z "${ATLAS_PUBLIC_KEY:-}" ] && [ -f "$ENV_FILE" ]; then
   set -a
@@ -37,7 +44,7 @@ T=$(mktemp)
 trap 'rm -f "$T"' EXIT
 aws secretsmanager get-secret-value --secret-id "$SECRET" --region "$REGION" --query SecretString --output text \
   | jq --arg pub "$ATLAS_PUBLIC_KEY" --arg priv "$ATLAS_PRIVATE_KEY" --arg pid "$ATLAS_PROJECT_ID" \
-      '.ATLAS_PUBLIC_KEY = $pub | .ATLAS_PRIVATE_KEY = $priv | .ATLAS_PROJECT_ID = $pid' > "$T"
+      --arg p "$PREFIX" '.[$p+"PUBLIC_KEY"] = $pub | .[$p+"PRIVATE_KEY"] = $priv | .[$p+"PROJECT_ID"] = $pid' > "$T"
 aws secretsmanager put-secret-value --secret-id "$SECRET" --region "$REGION" \
   --secret-string "file://$T" --query VersionId --output text | xargs echo "$SECRET new version:"
 aws secretsmanager get-secret-value --secret-id "$SECRET" --region "$REGION" --query SecretString --output text \

@@ -48,6 +48,10 @@ import {
   mergeCapacityPr,
   parseCapacityBranch,
   setAtlasTier,
+  LIVE_TARGETS,
+  applyLive,
+  describeLiveOp,
+  planLive,
   type GateResult,
   type NamedEnvManifest,
 } from "@twizz-idp/actions";
@@ -58,7 +62,8 @@ import { isOperator } from "@/lib/nebula/operators";
 import { argoWord, ttlWord } from "@/lib/nebula/status";
 import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
-import { atlasPort, nodePoolUsedCpu, readAtlas, targetFor } from "../nebula/capacity";
+import { atlasPort, nodePoolUsedCpu, readAtlas, readLive, targetFor } from "../nebula/capacity";
+import { liveClusterPort } from "../nebula/live-cluster";
 import { resolveSize } from "./capacity";
 
 // The Nebula write path (docs/NEBULA.md §4.2, §4.7, §N3.7). Every mutation here:
@@ -445,6 +450,35 @@ export const actionsRouter = router({
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
       return shape(await gate("set_atlas_tier", fields, confirm, summary, () => setAtlasTier({ atlas: atlasPort() }, { tier, size, actor: ctx.login })));
+    }),
+
+  /** Live capacity (§N5.2): resize workloads + node groups ON EKS-Moly-staging
+   * (ns default/jobs) or EKS-Moly-Prod. Operators only. Both calls re-read the
+   * cluster and re-plan; the nonce binds `planHash` (the ops + the live values
+   * they came from), and applyLive re-checks it, so a cluster that moved after
+   * review is refused, never resized blind. */
+  applyLiveCapacity: operatorProcedure
+    .input(z.object({ tier: z.enum(["staging", "production"]), preset: z.string().max(24).optional(), custom: TierSize.optional(), planHash: z.string().regex(/^[0-9a-f]{64}$/), confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { tier, planHash, confirm } = input;
+      const { label, size } = await resolveSize(tier, input);
+      if (!size.live) throw new TRPCError({ code: "BAD_REQUEST", message: `"${label}" has no live sizing for ${tier}` });
+      const t = LIVE_TARGETS[tier];
+      const r = await readLive(tier);
+      if ("error" in r) throw new TRPCError({ code: "PRECONDITION_FAILED", message: `${t.cluster} not readable: ${r.error}` });
+      const plan = planLive(t, r.state, size.live);
+      if (plan.planHash !== planHash) throw new TRPCError({ code: "CONFLICT", message: `${t.cluster} changed since you reviewed the plan — reload it` });
+      if (plan.violations.length) throw new TRPCError({ code: "BAD_REQUEST", message: plan.violations.join("\n") });
+      if (!plan.ops.length) throw new TRPCError({ code: "BAD_REQUEST", message: `${t.cluster} already matches "${label}"` });
+      const fields = { tier, preset: label, planHash };
+      const summary = [
+        `Resize ${t.cluster}${tier === "production" ? " (PRODUCTION)" : ""} to "${label}" — ${plan.ops.length} change(s), in this order:`,
+        ...plan.ops.map((o) => `- ${describeLiveOp(o)}`),
+        ...plan.warnings.map((w) => `! ${w}`),
+        `- applied live on the cluster (no PR); refused if anything moves before you confirm; stops at the first failure`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("apply_live_capacity", fields, confirm, summary, () => applyLive(liveClusterPort(t), t, size.live!, planHash)));
     }),
 
   // ── Build-on-provision: any twizz-app repo/branch, self-service ───────

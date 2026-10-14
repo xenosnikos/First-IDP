@@ -33,7 +33,10 @@ export function digestAuthorization(o: { user: string; pass: string; method: str
   ].join(", ");
 }
 
-async function atlasFetch(path: string, options: RequestInit = {}) {
+export type AtlasCreds = { publicKey: string; privateKey: string; projectId: string };
+const DEFAULT_CREDS: AtlasCreds = { publicKey: ATLAS_PUBLIC_KEY, privateKey: ATLAS_PRIVATE_KEY, projectId: ATLAS_PROJECT_ID };
+
+async function atlasFetch(path: string, options: RequestInit = {}, creds: AtlasCreds = DEFAULT_CREDS) {
   const url = `${ATLAS_API}${path}`;
   const headers = {
     "Content-Type": "application/json",
@@ -46,8 +49,8 @@ async function atlasFetch(path: string, options: RequestInit = {}) {
   if (challenge && /^Digest/i.test(challenge)) {
     await res.text();
     const authorization = digestAuthorization({
-      user: ATLAS_PUBLIC_KEY,
-      pass: ATLAS_PRIVATE_KEY,
+      user: creds.publicKey,
+      pass: creds.privateKey,
       method: (options.method ?? "GET").toUpperCase(),
       uri: new URL(url).pathname + new URL(url).search,
       challenge: parseDigestChallenge(challenge),
@@ -179,9 +182,18 @@ export function tierPatch(c: any, size: { instanceSize: string; autoScaling?: { 
 }
 
 export class AtlasTierService {
+  /** default: the ATLAS_* project (NonProd); prod lives in another Atlas account (ATLAS_PROD_*) */
+  constructor(private readonly creds: AtlasCreds = DEFAULT_CREDS) {}
+
+  /** every cluster in the project (prod has more than one) */
+  async listClusterTiers(): Promise<AtlasClusterTier[]> {
+    const data = await atlasFetch(`/groups/${this.creds.projectId}/clusters`, {}, this.creds);
+    return (data.results ?? []).map(tierOf);
+  }
+
   async getClusterTier(clusterName: string): Promise<AtlasClusterTier | null> {
     try {
-      return tierOf(await atlasFetch(`/groups/${ATLAS_PROJECT_ID}/clusters/${encodeURIComponent(clusterName)}`));
+      return tierOf(await atlasFetch(`/groups/${this.creds.projectId}/clusters/${encodeURIComponent(clusterName)}`, {}, this.creds));
     } catch (e) {
       if (/Atlas API 404/.test(String((e as Error).message))) return null;
       throw e;
@@ -190,13 +202,19 @@ export class AtlasTierService {
 
   /** Resize a DEDICATED cluster. Callers gate this (policy + nonce + audit). */
   async updateClusterTier(clusterName: string, size: { instanceSize: string; autoScaling?: { min: string; max: string } }): Promise<{ state: string }> {
-    const path = `/groups/${ATLAS_PROJECT_ID}/clusters/${encodeURIComponent(clusterName)}`;
-    const current = await atlasFetch(path);
+    const path = `/groups/${this.creds.projectId}/clusters/${encodeURIComponent(clusterName)}`;
+    const current = await atlasFetch(path, {}, this.creds);
     if (!/^M\d+$/.test(tierOf(current).instanceSize)) throw new Error(`${clusterName} is a shared/flex tier (${tierOf(current).instanceSize}) — upgrade it to a dedicated tier in the Atlas UI first`);
-    const updated = await atlasFetch(path, { method: "PATCH", body: JSON.stringify(tierPatch(current, size)) });
+    const updated = await atlasFetch(path, { method: "PATCH", body: JSON.stringify(tierPatch(current, size)) }, this.creds);
     return { state: updated.stateName ?? "UPDATING" };
   }
 }
 
 export const atlasService = new AtlasService();
 export const atlasTierService = new AtlasTierService();
+
+/** Prod Atlas (another Atlas account): null until ATLAS_PROD_* are configured. */
+export function prodAtlasTierService(): AtlasTierService | null {
+  const c = { publicKey: process.env.ATLAS_PROD_PUBLIC_KEY ?? "", privateKey: process.env.ATLAS_PROD_PRIVATE_KEY ?? "", projectId: process.env.ATLAS_PROD_PROJECT_ID ?? "" };
+  return c.publicKey && c.privateKey && c.projectId ? new AtlasTierService(c) : null;
+}
