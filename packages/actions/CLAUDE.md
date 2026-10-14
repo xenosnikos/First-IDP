@@ -11,6 +11,7 @@ Kubernetes API anywhere in here: every write is a GitHub Contents-API commit to
 - `audit.ts` — `createAudit()`: `AuditLog` row when a Prisma client is supplied, `~/.twizz-mcp-audit.jsonl` otherwise
 - `named-envs.ts` — pure helpers (Mongo URI rewrite, manifest (de)serialisation, validation) + the four actions over injected `GitopsRepo` / `SecretStore` / `ImageRegistry` ports
 - `promote.ts` — the release train (docs/NEBULA.md §N4): `promoteRelease` (gitops PR bumping `apps/<svc>/values-staging.yaml`), `mergePromotion` (sha-guarded squash), `listReleaseCandidates`, `listPromotions`, `readTargetState`; targets come from `registry.ts releaseTrain`
+- `capacity.ts` — capacity templates (docs/NEBULA.md §N5): `CAPACITY_TARGETS` (per-tier services, files, caps; prod never writable), comment-preserving values/NodePool surgery, `planCapacity`, `estimateTier`, `applyCapacity` (one gitops PR), `mergeCapacityPr`, `setAtlasTier` over the `AtlasClusters` port; prices in `capacity-prices.ts`
 - `adapters.ts` — the real ports: Octokit (`GithubGitops`, `GithubBuilds`, `GithubPromotions`), `@aws-sdk/client-secrets-manager`, `@aws-sdk/client-ecr`
 
 Tests: `pnpm --filter @twizz-idp/actions test` (vitest, pure pieces + fake ports).

@@ -41,16 +41,25 @@ import {
   setEnvVars,
   teardownNamedEnv,
   toLabelValue,
+  applyCapacity,
+  capViolations,
+  fmtAtlas,
+  hashSize,
+  mergeCapacityPr,
+  parseCapacityBranch,
+  setAtlasTier,
   type GateResult,
   type NamedEnvManifest,
 } from "@twizz-idp/actions";
-import { ENV_KEY_RE, SECRET_SHAPE_RE } from "@twizz-idp/shared";
+import { AtlasSize, ENV_KEY_RE, SECRET_SHAPE_RE, TierSize } from "@twizz-idp/shared";
 import type { PrismaClient } from "@twizz-idp/db";
 import { router, protectedProcedure } from "../trpc";
 import { isOperator } from "@/lib/nebula/operators";
 import { argoWord, ttlWord } from "@/lib/nebula/status";
 import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
+import { atlasPort, nodePoolUsedCpu, readAtlas, targetFor } from "../nebula/capacity";
+import { resolveSize } from "./capacity";
 
 // The Nebula write path (docs/NEBULA.md §4.2, §4.7, §N3.7). Every mutation here:
 //   protectedProcedure (signed-in org member)
@@ -362,6 +371,80 @@ export const actionsRouter = router({
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
       return shape(await gate("merge_promotion", fields, confirm, summary, () => mergePromotion(deps, { prNumber, service, target, imageTag, actor: ctx.login })));
+    }),
+
+  // ── Capacity (docs/NEBULA.md §N5): operators, writable tiers only ──────
+  // `production` is not even in the input enum (and policy's *prod* deny
+  // would refuse it anyway): prod is a plan/export pane.
+
+  /** Gate 1: open ONE gitops PR resizing a tier. A named preset is re-read
+   * from gitops server-side; the nonce binds (tier, label, sizeHash). */
+  applyCapacityPreset: operatorProcedure
+    .input(z.object({ tier: z.enum(["preview", "staging"]), preset: z.string().max(24).optional(), custom: TierSize.optional(), confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { tier, confirm } = input;
+      const { label, size } = await resolveSize(tier, input);
+      const t = targetFor(tier);
+      const violations = capViolations(t, size);
+      if (violations.length) throw new TRPCError({ code: "BAD_REQUEST", message: `over the ${tier} caps:\n${violations.join("\n")}` });
+      const sizeHash = hashSize(size);
+      const fields = { tier, preset: label, sizeHash };
+      const rows = Object.entries(size.services)
+        .filter(([name]) => t.services.some((x) => x.name === name && x.valuesFile))
+        .map(([name, s]) => `- ${name}: ${s.autoscaling?.enabled ? `HPA ${s.autoscaling.minReplicas}–${s.autoscaling.maxReplicas}` : `${s.replicas} replica(s)`}, ${s.requests.cpu}/${s.requests.memory} (limit ${s.limits.cpu}/${s.limits.memory})`);
+      const summary = [
+        `Apply capacity "${label}" to ${tier} (${t.cluster}) — sizes ${sizeHash.slice(0, 8)}`,
+        ...rows,
+        ...(size.nodes && t.nodes ? [`- nodes: NodePool ceiling ${size.nodes.maxCpu} vCPU/${size.nodes.maxMemoryGi}Gi, warm ${size.nodes.warmCpu} vCPU`] : []),
+        `- opens ONE PR on twizz-gitops; nothing changes until it is merged (gate 2), then Argo CD syncs`,
+        ...(size.atlas ? [`- the Atlas tier is NOT part of this PR (apply it separately)`] : []),
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(
+        await gate("apply_capacity_preset", fields, confirm, summary, async () =>
+          applyCapacity(namedEnvDeps(), { tier, label, size, actor: ctx.login, nodePoolUsedCpu: tier === "preview" ? await nodePoolUsedCpu() : undefined }),
+        ),
+      );
+    }),
+
+  /** Gate 2: merge a capacity PR, pinned to the head sha. */
+  mergeCapacityPr: operatorProcedure
+    .input(z.object({ prNumber: z.number().int().positive(), tier: z.enum(["preview", "staging"]), label: z.string().max(24), headSha: shaSchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { prNumber, tier, label, headSha, confirm } = input;
+      const deps = namedEnvDeps();
+      const pr = await deps.promotions.getPr(prNumber);
+      if (!pr) throw new TRPCError({ code: "NOT_FOUND", message: `twizz-gitops PR #${prNumber} does not exist` });
+      const parsed = parseCapacityBranch(pr.branch);
+      if (!parsed || parsed.tier !== tier || parsed.label !== label) throw new TRPCError({ code: "BAD_REQUEST", message: `PR #${prNumber} (${pr.branch}) is not the capacity PR ${label} → ${tier}` });
+      if (pr.headSha !== headSha) throw new TRPCError({ code: "CONFLICT", message: `PR #${prNumber} moved to ${pr.headSha.slice(0, 7)} — reload and review it again` });
+      // the nonce binds the exact head the human saw; mergeCapacityPr re-checks it
+      const fields = { pr: String(prNumber), tier, preset: label, headSha };
+      const summary = [
+        `Merge twizz-gitops PR #${prNumber} "${pr.title}" (head ${pr.headSha.slice(0, 7)}, by ${pr.author})`,
+        `- refused if it touches files outside the ${tier} capacity set, or if main changed those files since it was opened`,
+        `- squash-merge into main; refused by GitHub if the branch moves first`,
+        `- Argo CD then resizes ${tier} (${targetFor(tier).cluster}) within ~3 min`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("merge_capacity_pr", fields, confirm, summary, () => mergeCapacityPr(deps, { prNumber, tier, label, headSha, actor: ctx.login })));
+    }),
+
+  /** Resize the NonProd Atlas cluster (the only Atlas cluster Nebula writes). */
+  setAtlasTier: operatorProcedure
+    .input(z.object({ tier: z.literal("preview"), size: AtlasSize, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { tier, size, confirm } = input;
+      const t = targetFor(tier);
+      const current = await readAtlas(t);
+      const fields = { tier, instanceSize: size.instanceSize, autoScaling: size.autoScaling ? `${size.autoScaling.min}-${size.autoScaling.max}` : "off" };
+      const summary = [
+        `Resize Atlas cluster ${t.atlas.cluster}: ${current.size ? fmtAtlas(current.size) : "?"} → ${fmtAtlas(size)}`,
+        `- Atlas rolls the change node by node (no downtime on a replica set; expect a few minutes of UPDATING)`,
+        `- shared by every preview and named env on NonProd`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("set_atlas_tier", fields, confirm, summary, () => setAtlasTier({ atlas: atlasPort() }, { tier, size, actor: ctx.login })));
     }),
 
   // ── Build-on-provision: any twizz-app repo/branch, self-service ───────

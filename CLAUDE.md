@@ -33,6 +33,7 @@ and the strictly-authorized MCP toolset. See STATE.md for phase status.
 | `/pipelines` | Recent pipeline runs |
 | `/pipelines/[runId]` | Step timeline + log viewer (points at GitHub Actions from Phase 3) |
 | `/clusters` | Pods + logs across all three clusters (observe-only for staging/prod); URL-addressable log queries; the Observer panel |
+| `/capacity` | Capacity (docs/NEBULA.md §N5): per tier (NonProd/Staging/Prod) presets + traffic calculator → diff, cost, export; Open PR / Merge / Atlas tier (operators, gated; prod plan-only) |
 | `/releases` | Release train (docs/NEBULA.md §N4): per service on the train, ECR candidates, what staging runs, open promotion PRs; Promote / Merge (operators, gated) |
 
 The deploy wizard and release board were removed (GitOps replaces both). The Nebula
@@ -72,7 +73,9 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
   (any signed-in user; branch + config PR + pending manifest + central build in one confirm;
   secret values only with the nonce), `rebuildFromRef`/`setEnvVars`/teardown/extend
   (owner-or-operator), `promoteRelease`/`mergePromotion` (operators; gitops PR to the staging
-  tier, §N4) + `listReleaseTrain` (read)
+  tier, §N4) + `listReleaseTrain` (read), `applyCapacityPreset`/`mergeCapacityPr`/`setAtlasTier`
+  (operators; capacity PR on gitops, NonProd Atlas tier, §N5)
+- `capacity` - overview, tier, plan, estimate (queries; presets/profiles from twizz-gitops `capacity/`)
 
 ## Auth / RBAC
 
@@ -119,7 +122,8 @@ naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app he
 - `@twizz-idp/db` - Prisma client and schema
 - `@twizz-idp/shared` - Types, constants
 - `@twizz-idp/core` - External-API service layer (GitHub, AWS/CloudWatch, Vercel, Atlas)
-- `@twizz-idp/actions` - The write gate + named-env actions + service registry + release train (`promote.ts`) (dashboard and MCP)
+- `@twizz-idp/actions` - The write gate + named-env actions + service registry + release train (`promote.ts`)
+  + capacity planner (`capacity.ts`: targets/caps, values surgery, plan, calculator, PRs, Atlas) (dashboard and MCP)
 - `@twizz-idp/observer` - the agent harness (`agent.ts` generic loop over `@anthropic-ai/sdk`),
   the Observer log assistant (pure `./logs`, scope-locked tools, prompt) and the Configurator
   (`./configurator`: read-only repo tools + terminal `propose_config` → twizz.yaml/Dockerfile)

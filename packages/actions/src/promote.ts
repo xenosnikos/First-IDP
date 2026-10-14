@@ -93,6 +93,10 @@ export interface PromotionRepo {
   getPr(number: number): Promise<PromotionPr | null>;
   /** Squash-merge, refused by GitHub if the head moved past `sha`. Deletes the branch afterwards. */
   mergePr(number: number, opts: { title: string; sha: string }): Promise<{ sha: string }>;
+  /** Paths a PR changes (capacity merges refuse anything outside the tier's files). */
+  listPrFiles(number: number): Promise<string[]>;
+  /** Paths changed on the default branch since `branch` forked from it (stale-PR check). */
+  changedOnBaseSince(branch: string): Promise<string[]>;
 }
 
 export type PromoteDeps = { images: ImageRegistry; promotions: PromotionRepo };

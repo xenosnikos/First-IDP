@@ -100,3 +100,92 @@ export async function readClusterSnapshot(): Promise<ClusterSnapshot> {
     return { reachable: false, reason: String((e as { message?: string }).message ?? e), ...empty };
   }
 }
+
+// ── Capacity (docs/NEBULA.md §N5): HPAs, nodes and NodePools on non-prod ──
+// Same read-only credentials; needs get/list on horizontalpodautoscalers,
+// nodes and karpenter.sh nodepools (nebula-dashboard-read).
+
+export type CapacityKube = {
+  reachable: boolean;
+  reason?: string;
+  hpas: Array<{ namespace: string; name: string; min: number; max: number; current: number; desired: number; cpuTarget?: number }>;
+  nodes: Array<{ name: string; pool?: string; capacityType?: string; instanceType?: string; cpu: number; memoryGi: number }>;
+  nodePools: Array<{ name: string; limitCpu?: string; limitMemory?: string; usedCpu?: string; usedMemory?: string }>;
+};
+
+function cores(q?: string): number {
+  if (!q) return 0;
+  return q.endsWith("m") ? Number(q.slice(0, -1)) / 1000 : Number(q);
+}
+
+function gib(q?: string): number {
+  if (!q) return 0;
+  const m = q.match(/^(\d+(?:\.\d+)?)(Ki|Mi|Gi|Ti)?$/);
+  if (!m) return 0;
+  const n = Number(m[1]);
+  return m[2] === "Ki" ? n / 1024 ** 2 : m[2] === "Mi" ? n / 1024 : m[2] === "Ti" ? n * 1024 : m[2] === "Gi" ? n : n / 1024 ** 3;
+}
+
+export async function readCapacityKube(): Promise<CapacityKube> {
+  const empty = { hpas: [], nodes: [], nodePools: [] };
+  let loaded: Awaited<ReturnType<typeof loadKubeConfig>>;
+  try {
+    loaded = await loadKubeConfig();
+  } catch (e) {
+    return { reachable: false, reason: `kubeconfig: ${String(e)}`, ...empty };
+  }
+  if (!loaded) return { reachable: false, reason: "no in-cluster credentials and no KUBECONFIG", ...empty };
+  const { k8s, kc } = loaded;
+  const auto = kc.makeApiClient(k8s.AutoscalingV2Api);
+  const core = kc.makeApiClient(k8s.CoreV1Api);
+  const custom = kc.makeApiClient(k8s.CustomObjectsApi);
+  // each list fails on its own (RBAC may lag the code): partial data beats none
+  const settle = <T>(p: Promise<T>, what: string) => withTimeout(p, what).then((v) => ({ ok: true as const, v }), (e) => ({ ok: false as const, e: `${what}: ${String((e as { message?: string }).message ?? e)}` }));
+  const [hpaR, nodeR, poolR] = await Promise.all([
+    settle(auto.listHorizontalPodAutoscalerForAllNamespaces(), "hpas"),
+    settle(core.listNode(), "nodes"),
+    settle(custom.listClusterCustomObject("karpenter.sh", "v1", "nodepools"), "nodepools"),
+  ]);
+  const errors = [hpaR, nodeR, poolR].filter((r) => !r.ok).map((r) => (r as { e: string }).e);
+
+  type Hpa = Obj & { spec?: { minReplicas?: number; maxReplicas?: number; metrics?: Array<{ resource?: { name?: string; target?: { averageUtilization?: number } } }> }; status?: { currentReplicas?: number; desiredReplicas?: number } };
+  const hpas = hpaR.ok
+    ? ((hpaR.v as { body: { items: Hpa[] } }).body.items ?? []).map((h) => ({
+        namespace: h.metadata?.namespace ?? "",
+        name: h.metadata?.name ?? "",
+        min: h.spec?.minReplicas ?? 1,
+        max: h.spec?.maxReplicas ?? 1,
+        current: h.status?.currentReplicas ?? 0,
+        desired: h.status?.desiredReplicas ?? 0,
+        cpuTarget: h.spec?.metrics?.find((m) => m.resource?.name === "cpu")?.resource?.target?.averageUtilization,
+      }))
+    : [];
+
+  type Node = Obj & { status?: { capacity?: Record<string, string> } };
+  const nodes = nodeR.ok
+    ? ((nodeR.v as { body: { items: Node[] } }).body.items ?? []).map((n) => {
+        const l = n.metadata?.labels ?? {};
+        return {
+          name: n.metadata?.name ?? "",
+          pool: l["karpenter.sh/nodepool"],
+          capacityType: l["karpenter.sh/capacity-type"],
+          instanceType: l["node.kubernetes.io/instance-type"],
+          cpu: cores(n.status?.capacity?.cpu),
+          memoryGi: Math.round(gib(n.status?.capacity?.memory) * 10) / 10,
+        };
+      })
+    : [];
+
+  type Pool = Obj & { spec?: { limits?: Record<string, string> }; status?: { resources?: Record<string, string> } };
+  const nodePools = poolR.ok
+    ? (((poolR.v as { body?: { items?: Pool[] } }).body?.items ?? []) as Pool[]).map((p) => ({
+        name: p.metadata?.name ?? "",
+        limitCpu: p.spec?.limits?.cpu,
+        limitMemory: p.spec?.limits?.memory,
+        usedCpu: p.status?.resources?.cpu,
+        usedMemory: p.status?.resources?.memory,
+      }))
+    : [];
+
+  return { reachable: errors.length < 3, reason: errors.length ? errors.join("; ") : undefined, hpas, nodes, nodePools };
+}

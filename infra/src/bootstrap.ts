@@ -29,6 +29,10 @@ export function bootstrapCluster(
   });
 
   // ── Spot NodePool (EKS Auto Mode / Karpenter API) ────────────────
+  // Created here at cluster birth; since the capacity planner (docs/NEBULA.md
+  // §N5) its `spec` is OWNED BY GITOPS: twizz-gitops
+  // clusters/nonprod/capacity/nodepool-spot.yaml (Argo app `capacity`). Pulumi
+  // ignores spec drift and never deletes the live pool.
   const spotPool = new k8s.apiextensions.CustomResource(
     "spot-nodepool",
     {
@@ -50,7 +54,7 @@ export function bootstrapCluster(
         disruption: { consolidationPolicy: "WhenEmptyOrUnderutilized", consolidateAfter: "60s" },
       },
     },
-    { provider },
+    { provider, retainOnDelete: true, ignoreChanges: ["spec", "metadata.annotations", "metadata.labels"] },
   );
 
   // ── cert-manager ─────────────────────────────────────────────────
