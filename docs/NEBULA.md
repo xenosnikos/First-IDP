@@ -701,8 +701,9 @@ and refuses unless the plan is byte-identical to the one confirmed (`planHash` b
   secrets/configmaps/logs/exec, no kube-system, no create/delete.
   Node groups: eks:UpdateNodegroupConfig on those two clusters only. Prod API allowlist = bastion +
   Nebula NAT `108.133.39.9/32`. Tokens: SigV4-presigned STS (core `eks-auth.ts`, node:crypto).
-- **Rules** (`packages/actions/src/live-capacity.ts`): moly-backend + lolygram-discovery are a pair
-  (same replicas/HPA, or refused); unnamed workloads stay at their live baseline (the editor sends
+- **Rules** (`packages/actions/src/live-capacity.ts`): moly-backend + lolygram-discovery are a pair —
+  linked in the editor by default, but an uneven split (prod runs 30/20 by choice) is allowed with a
+  warning; unnamed workloads stay at their live baseline (the editor sends
   only what you changed); one apply ≤ ×3 and ≥ ×0.5 (rounded UP: 3→1 refused) per workload / node
   group; node groups shrink at most one node, one group per apply (pods carry no requests, so the
   scheduler cannot see load); caps (prod 120 replicas, 20 nodes/group; staging 20 / 6); never
@@ -713,9 +714,11 @@ and refuses unless the plan is byte-identical to the one confirmed (`planHash` b
 - **Accepted risk**: the prod API allowlist includes the NonProd NAT (108.133.39.9), shared by all
   NonProd egress incl. PR-preview pods; the endpoint still requires an authorised IAM identity.
 - **UI**: /capacity → Staging / Prod show the live workloads + node groups, a live sizing editor
-  (pair inputs move together), the plan in apply order, and **Apply to <cluster>** (operators,
-  two-step confirm, AuditLog `nebula.apply_live_capacity`).
-- **Presets** (`live:` in capacity/presets.yaml) are calibrated to 2026-10-14: prod pair 24 on
-  m5-2x-extra 3/3/5 + m5-2xlarge 2/2/4 = "normal" (no-op); quiet 16, campaign 36 (+2 nodes), peak 48 (+4).
+  (starts from what runs; sends only what you change; ⇆ link-pair toggle), the plan in apply
+  order, and **Apply to <cluster>** (operators, two-step confirm, AuditLog `nebula.apply_live_capacity`).
+- **No presets for the live tiers** (owner decision 2026-10-14): what is set on EKS-Moly-Prod and
+  EKS-Moly-staging (ns default/jobs) IS the desired configuration; Nebula shows it and changes it
+  only through the editor. The `live:` preset schema stays supported but capacity/presets.yaml
+  carries none.
 - **Atlas**: staging uses NonProd-Twizz (shared). Prod is moly-prod + prod-shift4 in another Atlas
   account — read once `ATLAS_PROD_*` exist (`scripts/nebula-set-atlas-keys.sh --prod`).
