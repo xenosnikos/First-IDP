@@ -19,6 +19,8 @@ import {
   type SecretStore,
 } from "./named-envs";
 import type { PromotionPr, PromotionRepo } from "./promote";
+import type { AtlasClusters } from "./capacity";
+import { ATLAS_TIERS, type AtlasSize, type AtlasTier } from "@twizz-idp/shared";
 
 /** GitHub Contents API over TwizzyNicky/twizz-gitops. Each put/delete is one
  * commit on `main` — Argo CD's git generator picks it up on its next poll. */
@@ -268,7 +270,7 @@ export class GithubPromotions implements PromotionRepo {
 
   async listOpenPrs(branchPrefix: string) {
     const { owner, repo, branch: base } = this.repo;
-    const { data } = await this.gh.pulls.list({ owner, repo, state: "open", base, per_page: 100 });
+    const data = await this.gh.paginate(this.gh.pulls.list, { owner, repo, state: "open", base, per_page: 100 });
     return data.filter((p) => p.head.ref.startsWith(branchPrefix)).map((p) => this.toPr(p));
   }
 
@@ -290,5 +292,50 @@ export class GithubPromotions implements PromotionRepo {
     // best effort: the branch has no further use
     await this.gh.git.deleteRef({ owner, repo, ref: `heads/${pr.head.ref}` }).catch(() => {});
     return { sha: data.sha };
+  }
+
+  async listPrFiles(number: number) {
+    const { owner, repo } = this.repo;
+    const files = await this.gh.paginate(this.gh.pulls.listFiles, { owner, repo, pull_number: number, per_page: 100 });
+    // a rename touches both paths
+    return files.flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
+  }
+
+  async changedOnBaseSince(branch: string) {
+    const { owner, repo, branch: base } = this.repo;
+    // three-dot compare: merge-base(branch, main) .. main
+    const { data } = await this.gh.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${branch}...${base}`, per_page: 100 });
+    if (data.files && data.files.length >= 300) throw new Error(`main changed ${data.files.length}+ files since ${branch} forked — re-apply instead of merging`);
+    return (data.files ?? []).flatMap((f) => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
+  }
+}
+
+/** The Atlas Admin API (packages/core AtlasTierService) as the capacity
+ * planner's port. Tiers outside the dedicated M-range (shared/flex) read as
+ * null-sized and are never written. */
+export class AtlasTierAdapter implements AtlasClusters {
+  constructor(
+    private readonly svc: {
+      getClusterTier(name: string): Promise<{ state: string; instanceSize: string; autoScaling?: { min: string; max: string } } | null>;
+      updateClusterTier(name: string, size: AtlasSize): Promise<{ state: string }>;
+    },
+  ) {}
+
+  private static tier(x: string): AtlasTier | undefined {
+    return (ATLAS_TIERS as readonly string[]).includes(x) ? (x as AtlasTier) : undefined;
+  }
+
+  async getTier(cluster: string) {
+    const c = await this.svc.getClusterTier(cluster);
+    if (!c) return null;
+    const instanceSize = AtlasTierAdapter.tier(c.instanceSize);
+    if (!instanceSize) throw new Error(`Atlas ${cluster} is on ${c.instanceSize}, not a dedicated tier Nebula sizes (${ATLAS_TIERS.join("/")})`);
+    const min = c.autoScaling && AtlasTierAdapter.tier(c.autoScaling.min);
+    const max = c.autoScaling && AtlasTierAdapter.tier(c.autoScaling.max);
+    return { state: c.state, instanceSize, autoScaling: min && max ? { min, max } : undefined };
+  }
+
+  setTier(cluster: string, size: AtlasSize) {
+    return this.svc.updateClusterTier(cluster, size);
   }
 }

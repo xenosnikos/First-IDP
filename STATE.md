@@ -1,6 +1,6 @@
 # TWIZZ-IDP - Project State
 
-Last updated: 2026-09-24
+Last updated: 2026-10-14
 
 ## Architecture stance (decided 2026-08-11)
 
@@ -20,6 +20,7 @@ Workflows/Events were deleted — never wired, 3 of 5 templates were fakes.
 | 4 | Vercel PR previews (frontend) + per-PR SAM stacks (Lambda) | TODO |
 | 5 | Repo onboarding CLI + org watcher | BUILT — `packages/onboard` (detect/plan/pr/protect), `.github/workflows/org-watch.yml`; needs a GITHUB_TOKEN with org membership |
 | 6 | Merge control + AI review + GitOps promotion | STAGING SHIPPED (2026-09-24) — release train: `promote_release` PR + sha-guarded `merge_promotion`, /releases page, MCP tools, Argo → EKS-Moly-staging ns `sentinel` (docs/NEBULA.md §N4); prod promotion deliberately absent |
+| 6b | Capacity templates (pods/nodes/Atlas ahead of traffic) | BUILT (2026-10-14), not deployed — /capacity page (presets + traffic calculator, plan/cost/export), `apply_capacity_preset` / `merge_capacity_pr` (gitops PR) + `set_atlas_tier` (NonProd only); NonProd + staging ns sentinel writable, prod plan/export only (docs/NEBULA.md §N5). Needs: twizz-gitops capacity/ + clusters/nonprod/capacity/ + RBAC merged, Atlas key with Project Cluster Manager, dashboard image bump |
 | 7 | MCP server + skill (tiered authz) | BUILT — `apps/mcp` (10 tools, stdio, policy+nonce+session-tagged roles+audit), `.mcp.json`, `.claude/skills/twizz-platform`; write tools unverified until cluster is up |
 | 8 | Agentic sandboxes | PARKED |
 

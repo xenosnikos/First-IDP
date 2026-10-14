@@ -27,8 +27,20 @@ import {
   readTargetState,
   releaseTarget,
   teardownNamedEnv,
+  AtlasTierAdapter,
+  applyCapacity,
+  capViolations,
+  capacityTarget,
+  hashSize,
+  loadPresets,
+  mergeCapacityPr,
+  parseCapacityBranch,
+  setAtlasTier,
+  AtlasSize,
+  TierSize,
   type GateResult,
 } from "@twizz-idp/actions";
+import { atlasTierService } from "@twizz-idp/core";
 import { gate, actor } from "../gate.js";
 import { operatorCreds, region } from "../auth.js";
 
@@ -94,6 +106,16 @@ async function releaseDeps(tool: string, resource: string) {
   return { images: new EcrRegistry(new ECRClient({ region, credentials: creds })), promotions: new GithubPromotions(gh) };
 }
 
+/** vCPU the NonProd `spot` pool runs now (read-only; refuses a ceiling below it). */
+async function spotUsedCpu(): Promise<number> {
+  const k8s = await import("@kubernetes/client-node");
+  const kc = new k8s.KubeConfig();
+  kc.loadFromFile(process.env.TWIZZ_NONPROD_KUBECONFIG ?? `${process.env.HOME}/.kube/twizz-nonprod.yaml`);
+  const res = await kc.makeApiClient(k8s.CustomObjectsApi).getClusterCustomObject("karpenter.sh", "v1", "nodepools", "spot");
+  const used = String((res as { body?: { status?: { resources?: { cpu?: string } } } }).body?.status?.resources?.cpu ?? "0");
+  return used.endsWith("m") ? Number(used.slice(0, -1)) / 1000 : Number(used);
+}
+
 export function registerWriteTools(server: McpServer) {
   server.tool(
     "promote_release",
@@ -135,6 +157,66 @@ export function registerWriteTools(server: McpServer) {
         `- Argo app ${t.argoApp} on ${t.cluster} then rolls ${service} to ${imageTag} at https://${t.host}`,
       ].join("\n");
       return gated("merge_promotion", fields, confirm, summary, () => mergePromotion(deps, { prNumber: pr, service, target, imageTag, actor }));
+    },
+  );
+
+  // ── Capacity templates (docs/NEBULA.md §N5) ─────────────────────────
+  // Writable tiers only: preview (EKS-Twizz-NonProd) and staging (ns sentinel).
+  // Prod is a plan/export pane in the dashboard — no tool here touches it.
+  const writableTier = z.enum(["preview", "staging"]).describe("preview = EKS-Twizz-NonProd shared services + spot NodePool; staging = EKS-Moly-staging ns sentinel");
+
+  server.tool(
+    "apply_capacity_preset",
+    "Capacity gate 1: open ONE twizz-gitops PR resizing a tier (replicas/resources/HPA per service, NonProd NodePool ceiling + warm capacity) from a named preset in capacity/presets.yaml, or an explicit custom size. Nothing changes until merge_capacity_pr. The Atlas tier is separate (set_atlas_tier). Operators; two-step confirm.",
+    { tier: writableTier, preset: z.string().max(24).optional().describe("preset name from capacity/presets.yaml"), custom: TierSize.optional().describe("explicit size instead of a preset"), confirm: confirmSchema },
+    async ({ tier, preset, custom, confirm }) => {
+      const promotions = new GithubPromotions(octokit());
+      let label = "custom";
+      let size = custom;
+      if (!size) {
+        if (!preset) throw new Error("pass a preset name or a custom size");
+        const p = (await loadPresets(promotions)).find((x) => x.name === preset);
+        if (!p?.tiers[tier]) throw new Error(`no preset "${preset}" with a ${tier} section`);
+        label = p.name;
+        size = p.tiers[tier]!;
+      }
+      const t = capacityTarget(tier);
+      const v = capViolations(t, size);
+      if (v.length) throw new Error(`over the ${tier} caps:\n${v.join("\n")}`);
+      const sizeHash = hashSize(size);
+      const summary = `Apply capacity "${label}" to ${tier} (${t.cluster}) — sizes ${sizeHash.slice(0, 8)}; opens one twizz-gitops PR, nothing changes until merge_capacity_pr`;
+      const chosen = size;
+      return gated("apply_capacity_preset", { tier, preset: label, sizeHash }, confirm, summary, async () =>
+        applyCapacity({ promotions }, { tier, label, size: chosen, actor, nodePoolUsedCpu: tier === "preview" && chosen.nodes ? await spotUsedCpu() : undefined }),
+      );
+    },
+  );
+
+  server.tool(
+    "merge_capacity_pr",
+    "Capacity gate 2: squash-merge an open capacity PR (sha-guarded; refused unless its branch applies exactly `preset` to `tier`). Argo CD then resizes the tier. Operators; two-step confirm.",
+    { pr: z.number().int().positive(), tier: writableTier, preset: z.string().max(24), headSha: z.string().regex(/^[0-9a-f]{40}$/).describe("the PR head sha you reviewed (merge is refused if it moved)"), confirm: confirmSchema },
+    async ({ pr, tier, preset, headSha, confirm }) => {
+      const promotions = new GithubPromotions(octokit());
+      const found = await promotions.getPr(pr);
+      if (!found) throw new Error(`twizz-gitops PR #${pr} does not exist`);
+      const parsed = parseCapacityBranch(found.branch);
+      if (!parsed || parsed.tier !== tier || parsed.label !== preset) throw new Error(`PR #${pr} (${found.branch}) is not the capacity PR ${preset} → ${tier}`);
+      if (found.headSha !== headSha) throw new Error(`PR #${pr} moved to ${found.headSha.slice(0, 7)} — review it again`);
+      const summary = `Merge twizz-gitops PR #${pr} "${found.title}" (head ${found.headSha.slice(0, 7)}); refused if it touches other files or main moved under it; Argo CD then resizes ${tier}`;
+      return gated("merge_capacity_pr", { pr: String(pr), tier, preset, headSha }, confirm, summary, () => mergeCapacityPr({ promotions }, { prNumber: pr, tier, label: preset, headSha, actor }));
+    },
+  );
+
+  server.tool(
+    "set_atlas_tier",
+    "Resize the NonProd MongoDB Atlas cluster (shared by every preview/named env): instanceSize M10–M40 plus optional compute auto-scaling bounds. The cluster is derived from the tier; staging/prod Atlas are never written. Operators; two-step confirm.",
+    { size: AtlasSize, confirm: confirmSchema },
+    async ({ size, confirm }) => {
+      const fields = { tier: "preview", instanceSize: size.instanceSize, autoScaling: size.autoScaling ? `${size.autoScaling.min}-${size.autoScaling.max}` : "off" };
+      const t = capacityTarget("preview");
+      const summary = `Resize Atlas ${t.atlas.cluster} → ${size.instanceSize}${size.autoScaling ? ` (auto ${size.autoScaling.min}–${size.autoScaling.max})` : ""}; Atlas rolls it node by node`;
+      return gated("set_atlas_tier", fields, confirm, summary, () => setAtlasTier({ atlas: new AtlasTierAdapter(atlasTierService) }, { tier: "preview", size, actor }));
     },
   );
 

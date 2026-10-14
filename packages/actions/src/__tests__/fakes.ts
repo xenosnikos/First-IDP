@@ -153,4 +153,12 @@ export class FakePromotions implements PromotionRepo {
     this.merged.push({ number, sha, title: opts.title });
     return { sha };
   }
+  /** test hook: paths "changed on main" since a branch forked */
+  baseChanges = new Map<string, string[]>();
+  async listPrFiles(number: number) {
+    return Object.keys(this.prs.find((x) => x.number === number)?.files ?? {});
+  }
+  async changedOnBaseSince(branch: string) {
+    return this.baseChanges.get(branch) ?? [];
+  }
 }

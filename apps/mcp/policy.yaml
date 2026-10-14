@@ -110,3 +110,29 @@ write_tools:
       target: ["staging"]
       imageTag: ["build-*", "nb-*", "main-*", "pr-*"]
       pr: ["*"]
+
+  # ── Capacity templates (docs/NEBULA.md §N5): size pods/nodes/Atlas ahead of traffic ──
+  # `tier` keys never contain "prod": preview = EKS-Twizz-NonProd, staging =
+  # EKS-Moly-staging ns sentinel. `production` is a plan/export pane only and is
+  # caught by global_deny before this table. Values files, the NodePool and the
+  # Atlas cluster are DERIVED from tier in code; per-tier caps enforced in code.
+  # `sizeHash` binds the nonce to the exact sizes confirmed.
+  apply_capacity_preset:
+    allow:
+      tier: ["preview", "staging"]
+      preset: ["*"]
+      sizeHash: ["*"]
+
+  merge_capacity_pr:
+    allow:
+      tier: ["preview", "staging"]
+      preset: ["*"]
+      pr: ["*"]
+      headSha: ["*"]                     # the reviewed head; merge refused if it moved
+
+  # Atlas tier: the NonProd cluster only (name derived from tier, never an input).
+  set_atlas_tier:
+    allow:
+      tier: ["preview"]
+      instanceSize: ["M10", "M20", "M30", "M40"]
+      autoScaling: ["*"]

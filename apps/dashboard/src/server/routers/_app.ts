@@ -8,6 +8,7 @@ import { actionsRouter } from "./actions";
 import { clustersRouter } from "./clusters";
 import { nebulaRouter } from "./nebula";
 import { observerRouter } from "./observer";
+import { capacityRouter } from "./capacity";
 
 export const appRouter = router({
   project: projectRouter,
@@ -22,6 +23,8 @@ export const appRouter = router({
   nebula: nebulaRouter,
   // Observer phase 1: read-only log assistant status (runs stream via /api/observer)
   observer: observerRouter,
+  // §N5: capacity presets, plans and the traffic calculator (queries; writes are in `actions`)
+  capacity: capacityRouter,
 });
 
 export type AppRouter = typeof appRouter;

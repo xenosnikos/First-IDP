@@ -642,3 +642,46 @@ pods need a restart to pick up the IRSA annotation.
 **Not done / decisions left.** Prod promotion (would need its own access entry + AppProject
 and a policy change — deliberately absent). WAF IP set + `SENTINEL_ACTIONS_ENABLED=true` on
 staging. Vercel promotion for the production admin. A `dev` tier on non-prod.
+
+## N5 — Capacity: traffic templates for pods, nodes and Atlas (built 2026-10-14)
+
+Admins size the platform ahead of expected traffic from `/capacity`. Pick a tier, then
+pick a **preset** (Quiet / Normal / Campaign / Peak) or run the **traffic calculator**
+(steady rps × peak × headroom). Nebula renders the diff against what gitops declares and
+what is actually running, with a rough ≈ $/month cost delta.
+
+| Tier (key) | Cluster | What Nebula may write |
+|---|---|---|
+| NonProd (`preview`) | EKS-Twizz-NonProd | Shared services `apps/shared/*.yaml`, spot NodePool ceiling + warm capacity, and the Atlas tier of `NonProd-Twizz` |
+| Staging (`staging`) | EKS-Moly-staging | ns `sentinel` only (`apps/<svc>/values-staging.yaml`). moly-backend, nodes and Atlas are plan/export only. |
+| Prod (`production`) | EKS-Moly-Prod | **Nothing.** This tier is a config pane: plan and Export YAML for the prod release process. |
+
+**Source of truth.** All of these live in twizz-gitops and are edited by PR:
+- `capacity/presets.yaml`: per tier, per service: replicas, requests/limits and an optional HPA. `nodes` holds the NodePool ceiling plus warm vCPU/GiB; `atlas` holds instanceSize plus auto-scaling bounds.
+- `capacity/profiles.yaml`: the calculator's per-pod factors: `rpsPerPod`, requests, `dbConnsPerPod`, HPA burst. Also the node base/overhead/warm fraction and the Atlas working set. **These are starting guesses — calibrate them.**
+- `clusters/nonprod/capacity/`: Argo app `capacity`, `prune: false`, no finalizer. It holds:
+  - the `spot` NodePool, adopted from Pulumi (`infra/src/bootstrap.ts` now has `retainOnDelete` and `ignoreChanges: spec`)
+  - the `capacity-warm` PriorityClass (-10, never preempts)
+  - the `warm-capacity` pause Deployment: 1 vCPU / 2Gi units. Real pods evict it instantly, so pre-provisioned nodes are handed over without waiting for Karpenter.
+
+**Writes.** Every write goes through the usual gate (policy → nonce → AuditLog) and is operator-only:
+- `apply_capacity_preset` opens ONE PR on branch `capacity/<tier>/<label>-<hash8>`. Named presets are re-read from gitops on the server. The nonce binds `(tier, preset, sizeHash)`. The call is idempotent per size.
+- `merge_capacity_pr` is gate 2: a sha-pinned squash merge, after which Argo syncs.
+- `set_atlas_tier` calls the Atlas Admin API, only for `NonProd-Twizz`, with M10–M40. It PATCHes only the instance size and compute auto-scaling (electable + read-only specs; analytics too while it has 0 nodes, which keeps the auto-scaling blocks in lockstep as Atlas requires), and refuses unless the cluster is IDLE.
+
+**Hard caps.** These are set in code (`CAPACITY_TARGETS`) and refused before the gate:
+- preview: ≤ 6 replicas per service, NodePool ≤ 256 vCPU, Atlas ≤ M40
+- staging: ≤ 10 replicas, Atlas ≤ M60
+
+**Reads.**
+- Staging and prod pods/nodes come from CloudWatch Container Insights. NonProd has no Container Insights, so its Deployments, HPAs, nodes and NodePools come from the kube API.
+- The Atlas Admin API needs **HTTP Digest** auth for programmatic keys (Basic returns 401); `atlasFetch` does the challenge/response.
+- On NonProd, the managed `spot` pool is an OVERFLOW pool: most workloads land on `private-egress` (owned by the twizz-support app, 16 vCPU) and the built-in `general-purpose` pool is uncapped. The page lists every pool; only `spot` is managed. This needs the extra get/list rules in `nebula-dashboard-read`.
+- The Atlas tier is read through `AtlasTierService`. Staging and prod Atlas are read only when `NEBULA_ATLAS_CLUSTER_STAGING` / `NEBULA_ATLAS_CLUSTER_PRODUCTION` name a cluster in the configured project.
+
+**Prod stays untouchable.** `production` has no write tool or mutation and is not in any input enum. Every value containing `prod` also hits the global `*prod*` deny. Tier keys are chosen so that the writable tiers never contain "prod".
+
+**Not yet:**
+- Atlas storage, IOPS and node counts.
+- Staging node pools: Argo is namespace-scoped there.
+- Moving `scale_shared_service` (a direct kube patch that Argo selfHeal reverts) onto capacity PRs.
