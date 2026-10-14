@@ -73,6 +73,9 @@ const big: ServiceSize = {
   autoscaling: { enabled: true, minReplicas: 2, maxReplicas: 4, targetCPUUtilizationPercentage: 70 },
 };
 
+/** NonProd has no metrics-server: preview sizes are fixed replicas. */
+const fixed: ServiceSize = { ...big, autoscaling: undefined };
+
 function repo() {
   const p = new FakePromotions();
   for (const n of ["ffmpeg-service", "lolygram-discovery", "alertservice"]) p.main.set(`apps/shared/${n}.yaml`, FFMPEG.replace(/ffmpeg-service/g, n));
@@ -116,10 +119,10 @@ describe("planCapacity", () => {
   it("plans only changed rows, renders files, computes cost", async () => {
     const t = CAPACITY_TARGETS.preview;
     const current = await readCurrentTier(repo(), t, { instanceSize: "M10" });
-    const plan = planCapacity(t, current, TierSize.parse({ services: { "ffmpeg-service": big }, nodes: { maxCpu: 96, maxMemoryGi: 192, warmCpu: 2, warmMemoryGi: 4 }, atlas: { instanceSize: "M20" } }));
+    const plan = planCapacity(t, current, TierSize.parse({ services: { "ffmpeg-service": fixed }, nodes: { maxCpu: 96, maxMemoryGi: 192, warmCpu: 2, warmMemoryGi: 4 }, atlas: { instanceSize: "M20" } }));
     expect(plan.violations).toEqual([]);
     expect(Object.keys(plan.files).sort()).toEqual(["apps/shared/ffmpeg-service.yaml", NODEPOOL_FILE, WARM_FILE].sort());
-    expect(plan.services.find((s) => s.service === "ffmpeg-service")!.changes).toHaveLength(3);
+    expect(plan.services.find((s) => s.service === "ffmpeg-service")!.changes).toHaveLength(2);
     expect(plan.services.find((s) => s.service === "alertservice")!.changes).toEqual([]);
     expect(plan.atlas!.changes).toEqual(["Atlas M10 → M20"]);
     expect(plan.cost.after).toBeGreaterThan(plan.cost.before!);
@@ -150,16 +153,22 @@ describe("planCapacity", () => {
     expect(again.files).toEqual({});
   });
 
-  it("warns when an HPA takes over replicas", async () => {
-    const t = CAPACITY_TARGETS.preview;
-    const plan = planCapacity(t, await readCurrentTier(repo(), t), TierSize.parse({ services: { "ffmpeg-service": big } }));
+  it("warns when an HPA takes over replicas (staging); refuses an HPA on NonProd (no metrics-server)", async () => {
+    const p = repo();
+    p.main.set("apps/twizz-sentinel/values-staging.yaml", FFMPEG.replace(/ffmpeg-service/g, "twizz-sentinel"));
+    const st = CAPACITY_TARGETS.staging;
+    const plan = planCapacity(st, await readCurrentTier(p, st), TierSize.parse({ services: { "twizz-sentinel": big } }));
     expect(plan.warnings.join()).toMatch(/HPA/);
+    expect(plan.violations).toEqual([]);
+    const pv = CAPACITY_TARGETS.preview;
+    const refused = planCapacity(pv, await readCurrentTier(p, pv), TierSize.parse({ services: { "ffmpeg-service": big } }));
+    expect(refused.violations.join()).toMatch(/metrics-server/);
   });
 
   it("flags caps", async () => {
     const t = CAPACITY_TARGETS.preview;
     const current = await readCurrentTier(repo(), t);
-    const plan = planCapacity(t, current, TierSize.parse({ services: { "ffmpeg-service": { ...big, autoscaling: { ...big.autoscaling!, maxReplicas: 50 } } }, nodes: { maxCpu: 1000, maxMemoryGi: 2000 }, atlas: { instanceSize: "M80" } }));
+    const plan = planCapacity(t, current, TierSize.parse({ services: { "ffmpeg-service": { ...fixed, replicas: 50 } }, nodes: { maxCpu: 1000, maxMemoryGi: 2000 }, atlas: { instanceSize: "M80" } }));
     expect(plan.violations.join("\n")).toMatch(/50 replicas exceeds/);
     expect(plan.violations.join("\n")).toMatch(/1000 vCPU exceeds/);
     expect(plan.violations.join("\n")).toMatch(/M80 exceeds/);
@@ -186,7 +195,11 @@ describe("estimateTier", () => {
     };
     const e = estimateTier(t, profile, { rps: 10, peakFactor: 1, headroom: 1 });
     expect(e.size.services["ffmpeg-service"].replicas).toBe(2);
-    expect(e.size.services["ffmpeg-service"].autoscaling).toMatchObject({ minReplicas: 2, maxReplicas: 4 });
+    // NonProd: profile asks for an HPA but the cluster cannot run one
+    expect(e.size.services["ffmpeg-service"].autoscaling).toBeUndefined();
+    expect(e.rationale.join()).toMatch(/metrics-server/);
+    const st = estimateTier(CAPACITY_TARGETS.staging, profile, { rps: 10, peakFactor: 1, headroom: 1 });
+    expect(st.size.services["ffmpeg-service"].autoscaling).toMatchObject({ minReplicas: 2, maxReplicas: 4 });
     expect(e.size.nodes!.maxCpu % 4).toBe(0);
     expect(e.size.atlas!.instanceSize).toBe("M10");
     const huge = estimateTier(t, profile, { rps: 10_000, peakFactor: 2, headroom: 1.3 });
@@ -209,7 +222,7 @@ describe("estimateTier", () => {
 describe("capacity PRs", () => {
   it("opens one PR, is idempotent, merges sha-pinned", async () => {
     const p = repo();
-    const size = TierSize.parse({ services: { "ffmpeg-service": big }, nodes: { maxCpu: 96, maxMemoryGi: 192, warmCpu: 2, warmMemoryGi: 4 } });
+    const size = TierSize.parse({ services: { "ffmpeg-service": fixed }, nodes: { maxCpu: 96, maxMemoryGi: 192, warmCpu: 2, warmMemoryGi: 4 } });
     const a = await applyCapacity({ promotions: p }, { tier: "preview", label: "campaign", size, actor: "nick" });
     expect(a.existing).toBe(false);
     expect(a.branch).toBe(capacityBranch("preview", "campaign", hashSize(size)));
@@ -228,13 +241,13 @@ describe("capacity PRs", () => {
     p.baseChanges.set(a.branch, ["named-envs/foo.yaml"]); // unrelated main churn is fine
     const m = await mergeCapacityPr({ promotions: p }, { prNumber: a.prNumber, tier: "preview", label: "campaign", headSha, actor: "nick" });
     expect(m.mergedSha).toBe(`merge-${a.prNumber}`);
-    expect(readServiceSize(p.main.get("apps/shared/ffmpeg-service.yaml")!)).toEqual(big);
+    expect(readServiceSize(p.main.get("apps/shared/ffmpeg-service.yaml")!)).toEqual(fixed);
   });
 
   it("refuses a second open PR per tier, and merges of PRs that touch other files", async () => {
     const p = repo();
-    const one = TierSize.parse({ services: { "ffmpeg-service": big } });
-    const two = TierSize.parse({ services: { "alertservice": big } });
+    const one = TierSize.parse({ services: { "ffmpeg-service": fixed } });
+    const two = TierSize.parse({ services: { "alertservice": fixed } });
     await applyCapacity({ promotions: p }, { tier: "preview", label: "campaign", size: one, actor: "nick" });
     await expect(applyCapacity({ promotions: p }, { tier: "preview", label: "peak", size: two, actor: "nick" })).rejects.toThrow(/already open/);
     // a different tier is independent

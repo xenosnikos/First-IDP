@@ -32,7 +32,8 @@ describe("Atlas tier", () => {
     const body = tierPatch(CLUSTER, { instanceSize: "M20", autoScaling: { min: "M10", max: "M30" } });
     const rc = body.replicationSpecs[0].regionConfigs[0];
     expect(body.replicationSpecs[0].id).toBe("rs1");
-    expect(rc.electableSpecs).toEqual({ instanceSize: "M20", nodeCount: 3, diskIOPS: 3000 });
+    // no ebsVolumeType → treated as STANDARD: IOPS follow the tier, not resent
+    expect(rc.electableSpecs).toEqual({ instanceSize: "M20", nodeCount: 3 });
     expect(rc.readOnlySpecs).toEqual({ instanceSize: "M20", nodeCount: 0 });
     expect(rc.autoScaling).toEqual({ diskGB: { enabled: true }, compute: { enabled: true, scaleDownEnabled: true, minInstanceSize: "M10", maxInstanceSize: "M30" } });
     expect(tierOf({ ...CLUSTER, replicationSpecs: body.replicationSpecs })).toMatchObject({ instanceSize: "M20", autoScaling: { min: "M10", max: "M30" } });
@@ -73,9 +74,16 @@ describe("Atlas tier on the live cluster shape", () => {
     const compute = { enabled: true, scaleDownEnabled: true, minInstanceSize: "M20", maxInstanceSize: "M40" };
     expect(rc.autoScaling).toEqual({ compute, diskGB: { enabled: true } });
     expect(rc.analyticsAutoScaling).toEqual({ compute, diskGB: { enabled: true } });
-    expect(rc.analyticsSpecs).toEqual({ instanceSize: "M30", diskIOPS: 3000, ebsVolumeType: "STANDARD", nodeCount: 0 });
-    expect(rc.electableSpecs).toEqual({ instanceSize: "M30", diskIOPS: 3000, ebsVolumeType: "STANDARD", nodeCount: 3 });
+    expect(rc.analyticsSpecs).toEqual({ instanceSize: "M30", ebsVolumeType: "STANDARD", nodeCount: 0 });
+    expect(rc.electableSpecs).toEqual({ instanceSize: "M30", ebsVolumeType: "STANDARD", nodeCount: 3 });
     expect([rc.providerName, rc.regionName, rc.priority]).toEqual(["AWS", "EU_WEST_1", 7]);
+  });
+
+  it("keeps provisioned IOPS", () => {
+    const prov = structuredClone(LIVE);
+    prov.replicationSpecs[0].regionConfigs[0].electableSpecs.ebsVolumeType = "PROVISIONED";
+    const rc = tierPatch(prov, { instanceSize: "M30" }).replicationSpecs[0].regionConfigs[0];
+    expect(rc.electableSpecs.diskIOPS).toBe(3000);
   });
 
   it("leaves real analytics nodes alone", () => {

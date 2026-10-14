@@ -143,6 +143,13 @@ export function tierOf(c: any): AtlasClusterTier {
   };
 }
 
+/** Node specs resent with a new tier. STANDARD volumes derive IOPS from the
+ * tier, so the old `diskIOPS` is dropped (only PROVISIONED IOPS are pinned). */
+function resized(spec: any, instanceSize: string): any {
+  const { diskIOPS, ...rest } = spec;
+  return { ...rest, instanceSize, ...(spec.ebsVolumeType === "PROVISIONED" && diskIOPS !== undefined ? { diskIOPS } : {}) };
+}
+
 /** The PATCH body that changes ONLY the compute tier (+ auto-scaling bounds)
  * of every region config; everything else is sent back exactly as read. */
 export function tierPatch(c: any, size: { instanceSize: string; autoScaling?: { min: string; max: string } }): { replicationSpecs: any[] } {
@@ -159,10 +166,10 @@ export function tierPatch(c: any, size: { instanceSize: string; autoScaling?: { 
         const noAnalytics = !rc.analyticsSpecs?.nodeCount;
         return {
           ...rc,
-          electableSpecs: { ...rc.electableSpecs, instanceSize: size.instanceSize },
+          electableSpecs: resized(rc.electableSpecs ?? {}, size.instanceSize),
           // read-only nodes must match the electable tier (even at nodeCount 0)
-          ...(rc.readOnlySpecs ? { readOnlySpecs: { ...rc.readOnlySpecs, instanceSize: size.instanceSize } } : {}),
-          ...(noAnalytics && rc.analyticsSpecs ? { analyticsSpecs: { ...rc.analyticsSpecs, instanceSize: size.instanceSize } } : {}),
+          ...(rc.readOnlySpecs ? { readOnlySpecs: resized(rc.readOnlySpecs, size.instanceSize) } : {}),
+          ...(noAnalytics && rc.analyticsSpecs ? { analyticsSpecs: resized(rc.analyticsSpecs, size.instanceSize) } : {}),
           autoScaling: { ...rc.autoScaling, compute },
           ...(noAnalytics && rc.analyticsAutoScaling ? { analyticsAutoScaling: { ...rc.analyticsAutoScaling, compute } } : {}),
         };

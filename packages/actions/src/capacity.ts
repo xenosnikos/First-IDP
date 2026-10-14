@@ -60,6 +60,9 @@ export type CapacityTarget = {
   /** Atlas cluster name (null = not linked); writes only where `writable`. */
   atlas: { cluster: string | null; writable: boolean };
   pricing: keyof typeof EC2_PRICE;
+  /** The cluster can run CPU HPAs (metrics-server present). Without it an HPA
+   * pins replicas to minReplicas and never scales — refused, not silently kept. */
+  hpa: boolean;
   caps: { maxReplicas: number; maxNodeCpu: number; maxAtlas: AtlasTier };
 };
 
@@ -76,6 +79,8 @@ export const CAPACITY_TARGETS: Record<CapacityTier, CapacityTarget> = {
     nodes: { nodePoolFile: NODEPOOL_FILE, warmFile: WARM_FILE },
     atlas: { cluster: "NonProd-Twizz", writable: true },
     pricing: "spot",
+    // no metrics-server on EKS-Twizz-NonProd (verified 2026-10-14): fixed replicas only
+    hpa: false,
     caps: { maxReplicas: 6, maxNodeCpu: 256, maxAtlas: "M40" },
   },
   staging: {
@@ -91,6 +96,7 @@ export const CAPACITY_TARGETS: Record<CapacityTier, CapacityTarget> = {
     ],
     atlas: { cluster: null, writable: false },
     pricing: "onDemand",
+    hpa: true,
     caps: { maxReplicas: 10, maxNodeCpu: 0, maxAtlas: "M60" },
   },
   production: {
@@ -100,6 +106,7 @@ export const CAPACITY_TARGETS: Record<CapacityTier, CapacityTarget> = {
     services: [{ name: "moly-backend", namespace: "default", workload: "moly-backend-deployment" }],
     atlas: { cluster: null, writable: false },
     pricing: "onDemand",
+    hpa: true,
     caps: { maxReplicas: 200, maxNodeCpu: 2048, maxAtlas: "M200" },
   },
 };
@@ -331,6 +338,7 @@ export function capViolations(t: CapacityTarget, size: TierSize): string[] {
     if (cpuToCores(s.requests.cpu) < MIN_CPU) v.push(`${name}: CPU request ${s.requests.cpu} is below the ${MIN_CPU * 1000}m floor`);
     if (memToGi(s.requests.memory) * 1024 < MIN_MEM_MI) v.push(`${name}: memory request ${s.requests.memory} is below the ${MIN_MEM_MI}Mi floor`);
     if (memToGi(s.limits.memory) * 1024 < MIN_LIMIT_MEM_MI) v.push(`${name}: memory limit ${s.limits.memory} is below the ${MIN_LIMIT_MEM_MI}Mi floor`);
+    if (s.autoscaling?.enabled && !t.hpa) v.push(`${name}: ${t.cluster} has no metrics-server — an HPA would never scale; use fixed replicas`);
     if (peakReplicas(s) > t.caps.maxReplicas) v.push(`${name}: ${peakReplicas(s)} replicas exceeds the ${t.tier} cap of ${t.caps.maxReplicas}`);
     if (cpuToCores(s.requests.cpu) > cpuToCores(s.limits.cpu)) v.push(`${name}: CPU request ${s.requests.cpu} > limit ${s.limits.cpu}`);
     if (memToGi(s.requests.memory) > memToGi(s.limits.memory)) v.push(`${name}: memory request ${s.requests.memory} > limit ${s.limits.memory}`);
@@ -492,7 +500,8 @@ export function estimateTier(t: CapacityTarget, profile: TierProfile, input: Est
     const max = Math.min(p.maxReplicas, t.caps.maxReplicas);
     const replicas = clamp(Math.ceil(design / p.rpsPerPod - 1e-9), p.minReplicas, max);
     const size: ServiceSize = { replicas, requests: p.requests, limits: p.limits };
-    if (p.hpa) {
+    if (p.hpa && !t.hpa) rationale.push(`${name}: no metrics-server on ${t.cluster} — fixed replicas instead of an HPA`);
+    if (p.hpa && t.hpa) {
       const floor = Math.max(1, replicas);
       size.autoscaling = { enabled: true, minReplicas: floor, maxReplicas: clamp(Math.ceil(floor * p.hpaBurst), floor, max), targetCPUUtilizationPercentage: 70 };
     }
