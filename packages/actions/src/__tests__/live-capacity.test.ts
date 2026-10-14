@@ -184,3 +184,14 @@ describe("policy.yaml: the prod exemption is exactly one tool, one field", async
     expect(evaluatePolicy(policy, "set_atlas_tier", { tier: "production", instanceSize: "M20", autoScaling: "off" }).allowed).toBe(false);
   });
 });
+
+describe("HPA needs CPU requests on every container", () => {
+  it("refuses when a sidecar has none", () => {
+    const s = PROD();
+    for (const w of s.workloads.filter((x) => (T.pair as readonly string[]).includes(x.name))) {
+      w.resources = { requests: { cpu: "250m", memory: "256Mi" } };
+      w.cpuRequestsOnAll = false;
+    }
+    expect(planLive(T, s, LiveTierSize.parse({ workloads: pair(24, [24, 48]) })).violations.join()).toMatch(/no CPU requests on every container/);
+  });
+});

@@ -298,6 +298,8 @@ export function registerWriteTools(server: McpServer) {
         const current = await readCurrentTier(promotions, t);
         const now = current.services[service];
         if (!now) throw new Error(`apps/shared/${service}.yaml has no sizing to scale`);
+        // fixed replicas would turn an HPA off — size HPA'd services with apply_capacity_preset
+        if (now.autoscaling?.enabled) throw new Error(`shared/${service} runs an HPA (${now.autoscaling.minReplicas}–${now.autoscaling.maxReplicas}); use apply_capacity_preset`);
         // same path as apply_capacity_preset: one gated, reviewable PR; Argo applies it on merge
         return applyCapacity({ promotions }, { tier: "preview", label: `scale-${service}`.slice(0, 24), size: { services: { [service]: { ...now, replicas, autoscaling: undefined } } }, actor });
       });

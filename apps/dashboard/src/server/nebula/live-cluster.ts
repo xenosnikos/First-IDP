@@ -87,6 +87,7 @@ export function liveClusterPort(t: LiveTarget): LiveClusterPort {
             ready: d.status?.readyReplicas ?? 0,
             container: ct?.name ?? name,
             resources,
+            cpuRequestsOnAll: (d.spec?.template?.spec?.containers ?? []).every((c) => !!c.resources?.requests?.cpu),
             ...(h
               ? {
                   hpa: {

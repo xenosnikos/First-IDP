@@ -24,7 +24,10 @@ export type LiveWorkload = {
   replicas: number;
   ready: number;
   container: string;
+  /** first container's resources (what the plan shows) */
   resources: LiveResources;
+  /** every container (incl. sidecars) has a CPU request — required for a CPU HPA */
+  cpuRequestsOnAll?: boolean;
   hpa?: { min: number; max: number; targetCPU?: number; current?: number; desired?: number };
 };
 export type LiveNodegroup = { name: string; status: string; instanceTypes: string[]; capacityType?: string; min: number; desired: number; max: number };
@@ -153,7 +156,7 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
       if (!live.metricsServer) violations.push(`${prefix} ${t.cluster} serves no metrics.k8s.io — an HPA would never scale`);
       // a CPU-utilization HPA needs CPU requests to compute anything; without them it is
       // inert AND blocks fixed sizing, and Nebula cannot delete it (RBAC) — refuse
-      if (!w.resources.requests?.cpu) violations.push(`${prefix} pods have no CPU requests — a CPU HPA could never scale them; size replicas instead`);
+      if (!(w.cpuRequestsOnAll ?? !!w.resources.requests?.cpu)) violations.push(`${prefix} pods have no CPU requests on every container — a CPU HPA could never scale them; size replicas instead`);
       if (to.min < w.replicas) warnings.push(`${prefix} HPA min ${to.min} < ${w.replicas} running — at today's utilization the HPA scales it DOWN to ${to.min} within minutes`);
       if (to.max > t.caps.maxReplicas) violations.push(`${prefix} HPA max ${to.max} exceeds the ${t.tier} cap of ${t.caps.maxReplicas}`);
       const base = w.hpa ? w.hpa.min : w.replicas;
