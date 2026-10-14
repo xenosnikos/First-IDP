@@ -170,7 +170,13 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))", gap: 16, alignItems: "start" }}>
         <CurrentPane data={tierQ.data} loading={tierQ.isLoading} />
 
-        <Section title="Template">
+        <Section title={tier === "production" ? "Configure" : "Template"}>
+          {tier === "production" ? (
+            <div style={{ fontSize: 12, color: "var(--n-ink-muted)", lineHeight: 1.6, marginBottom: 4 }}>
+              No presets on prod: what is set on the cluster is the desired configuration. Change it below — the editor starts from what runs and sends only what you change.
+            </div>
+          ) : (
+          <>
           <div style={{ ...label, margin: "6px 0 8px" }}>presets · capacity/presets.yaml</div>
           {overview.isLoading && <span style={{ color: "var(--n-ink-muted)" }}>reading twizz-gitops…</span>}
           {presets.map((p) => {
@@ -202,6 +208,8 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
           </Button>
           {estimateQ.error && <div style={{ marginTop: 10, color: "var(--n-fail)", fontSize: 11 }}><Pill word="FAIL" /> {estimateQ.error.message}</div>}
           {estimateQ.data && <EstimateBox e={estimateQ.data} onUse={(size) => setChoice({ mode: "custom", size })} onPreset={(name) => setChoice({ mode: "preset", name })} />}
+          </>
+          )}
 
           {liveTier && tierQ.data?.live && "baseline" in tierQ.data.live && (
             <LiveEditor
@@ -339,12 +347,19 @@ function LiveEditor({ live, seed, onPlan }: { live: LiveOk; seed: LiveSize; onPl
     return { w, n, touched };
   };
   const [st, setSt] = useState(init);
+  // linked by default (the usual case); unlink for an uneven split such as a 30/20 campaign
+  const [linked, setLinked] = useState(() => {
+    const [a, b] = pair;
+    const sa = seed.workloads[a] ?? live.baseline.workloads[a];
+    const sb = seed.workloads[b] ?? live.baseline.workloads[b];
+    return JSON.stringify(sa ?? null) === JSON.stringify(sb ?? null);
+  });
   const setW = (name: string, patch: Partial<(typeof st.w)[string]>) =>
     setSt((p) => {
       const w = { ...p.w, [name]: { ...p.w[name], ...patch } };
       const touched = new Set(p.touched).add(name);
-      // the pair always moves together
-      if (pair.includes(name)) for (const other of pair) if (other !== name && w[other]) { w[other] = { ...w[name] }; touched.add(other); }
+      // a linked pair moves together
+      if (linked && pair.includes(name)) for (const other of pair) if (other !== name && w[other]) { w[other] = { ...w[name] }; touched.add(other); }
       return { ...p, w, touched };
     });
   const setN = (name: string, v: (typeof st.n)[string]) => setSt((p) => ({ ...p, n: { ...p.n, [name]: v }, touched: new Set(p.touched).add(`ng:${name}`) }));
@@ -364,7 +379,12 @@ function LiveEditor({ live, seed, onPlan }: { live: LiveOk; seed: LiveSize; onPl
   const num: CSSProperties = { ...inputStyle, width: 64, padding: "4px 6px" };
   return (
     <div style={{ marginTop: 18 }}>
-      <div style={{ ...label, margin: "0 0 8px" }}>live sizing · {live.cluster} · ⇆ = scales as a pair</div>
+      <div style={{ ...label, margin: "0 0 8px", display: "flex", gap: 10, alignItems: "center" }}>
+        <span>live sizing · {live.cluster}</span>
+        <label style={{ textTransform: "none", letterSpacing: 0, fontSize: 11, color: "var(--n-ink-muted)" }} title="linked: moly-backend and lolygram-discovery move together; unlink for an uneven split">
+          <input type="checkbox" checked={linked} onChange={(e) => setLinked(e.target.checked)} /> ⇆ link pair
+        </label>
+      </div>
       {Object.entries(st.w).map(([name, v]) => (
         <div key={name} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 4, flexWrap: "wrap" }}>
           <span style={{ flex: 1, minWidth: 140 }}>{pair.includes(name) ? "⇆ " : ""}{name.replace(/-deployment$/, "")}</span>

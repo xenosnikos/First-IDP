@@ -5,7 +5,8 @@
 // apply re-reads and refuses if anything moved since the human confirmed.
 //
 // Rules (platform owner, 2026-10-14):
-//   - moly-backend + lolygram-discovery scale as a PAIR (same replicas / HPA)
+//   - moly-backend + lolygram-discovery are a PAIR: shown together, warned (not
+//     refused) when sized unevenly — an uneven split is an operator's call
 //   - every other workload stays at its baseline unless a preset names it
 //   - one apply never more than triples or halves a workload or node group
 //   - Nebula never deletes anything (no HPA removal, no scale to zero)
@@ -134,9 +135,11 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
   const [a, b] = t.pair;
   const da = desired.workloads[a];
   const db = desired.workloads[b];
-  if (!!da !== !!db) violations.push(`${a} and ${b} scale as a pair — size both or neither`);
+  // advisory (platform owner 2026-10-14): the pair usually moves together, but an
+  // uneven split (e.g. a campaign 30/20) is a legitimate choice — warn, don't refuse
+  if (!!da !== !!db) warnings.push(`${a} and ${b} usually scale as a pair — only one of them is being sized`);
   if (da && db && canonical({ r: da.replicas, a: da.autoscaling ?? null }) !== canonical({ r: db.replicas, a: db.autoscaling ?? null })) {
-    violations.push(`${a} and ${b} must have the same replicas / HPA (got ${fmtW({ replicas: da.replicas, hpa: da.autoscaling ? { min: da.autoscaling.minReplicas, max: da.autoscaling.maxReplicas } : null })} vs ${fmtW({ replicas: db.replicas, hpa: db.autoscaling ? { min: db.autoscaling.minReplicas, max: db.autoscaling.maxReplicas } : null })})`);
+    warnings.push(`${a} and ${b} are not scaled symmetrically (${fmtW({ replicas: da.replicas, hpa: da.autoscaling ? { min: da.autoscaling.minReplicas, max: da.autoscaling.maxReplicas } : null })} vs ${fmtW({ replicas: db.replicas, hpa: db.autoscaling ? { min: db.autoscaling.minReplicas, max: db.autoscaling.maxReplicas } : null })})`);
   }
 
   const nodegroupUps: LiveOp[] = [];

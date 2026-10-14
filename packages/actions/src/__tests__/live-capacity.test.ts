@@ -64,11 +64,14 @@ describe("planLive on the real prod shape", () => {
     expect(p.nodegroupRows.find((r) => r.name === "eks-prod-node-group-m5-2xlarge")!.after).toBe("baseline (untouched)");
   });
 
-  it("refuses an asymmetric pair, or sizing only one half", () => {
-    const asym = planLive(T, PROD(), LiveTierSize.parse({ workloads: { "moly-backend-deployment": { replicas: 30 }, "lolygram-discovery-deployment": { replicas: 24 } } }));
-    expect(asym.violations.join()).toMatch(/same replicas/);
+  it("an uneven pair (e.g. the 30/20 campaign) is allowed with a warning", () => {
+    const asym = planLive(T, PROD(), LiveTierSize.parse({ workloads: { "moly-backend-deployment": { replicas: 30 }, "lolygram-discovery-deployment": { replicas: 20 } } }));
+    expect(asym.violations).toEqual([]);
+    expect(asym.warnings.join()).toMatch(/not scaled symmetrically/);
+    expect(asym.ops).toHaveLength(2);
     const half = planLive(T, PROD(), LiveTierSize.parse({ workloads: { "moly-backend-deployment": { replicas: 30 } } }));
-    expect(half.violations.join()).toMatch(/pair/);
+    expect(half.violations).toEqual([]);
+    expect(half.warnings.join()).toMatch(/only one of them/);
   });
 
   it("step limits, caps, unknown names", () => {
