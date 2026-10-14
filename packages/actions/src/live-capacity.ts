@@ -43,7 +43,6 @@ export type LiveState = {
 export interface LiveClusterPort {
   read(): Promise<LiveState>;
   scale(namespace: string, name: string, replicas: number): Promise<void>;
-  patchResources(namespace: string, name: string, container: string, resources: LiveResources): Promise<void>;
   /** create the HPA (named after the Deployment) or patch its bounds */
   upsertHpa(namespace: string, name: string, a: { min: number; max: number; targetCPU: number }, exists: boolean): Promise<void>;
   updateNodegroup(name: string, size: NodegroupSize): Promise<void>;
@@ -74,8 +73,7 @@ export function isLiveTier(t: string): t is LiveTier {
 export type LiveOp =
   | { kind: "nodegroup"; name: string; from: NodegroupSize; to: NodegroupSize }
   | { kind: "scale"; namespace: string; name: string; from: number; to: number }
-  | { kind: "hpa"; namespace: string; name: string; from: LiveWorkload["hpa"] | null; to: { min: number; max: number; targetCPU: number } }
-  | { kind: "resources"; namespace: string; name: string; container: string; from: LiveResources; to: LiveResources };
+  | { kind: "hpa"; namespace: string; name: string; from: LiveWorkload["hpa"] | null; to: { min: number; max: number; targetCPU: number } };
 
 export type LiveRow = { workload: string; namespace: string; pair: boolean; before: string; after: string; changes: string[] };
 export type LiveNodegroupRow = { name: string; before: string; after: string; changes: string[] };
@@ -117,7 +115,7 @@ function sameRes(a: LiveResources, b: LiveResources): boolean {
 function within(t: LiveTarget, from: number, to: number): string | null {
   if (from <= 0) return null;
   if (to > Math.ceil(from * t.caps.maxStepUp)) return `more than ×${t.caps.maxStepUp} in one step (${from} → ${to})`;
-  if (to < Math.floor(from * t.caps.maxStepDown)) return `below ×${t.caps.maxStepDown} in one step (${from} → ${to})`;
+  if (to < Math.ceil(from * t.caps.maxStepDown)) return `below ×${t.caps.maxStepDown} in one step (${from} → ${to})`;
   return null;
 }
 
@@ -153,6 +151,10 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
     if (want.autoscaling?.enabled) {
       const to = { min: want.autoscaling.minReplicas, max: want.autoscaling.maxReplicas, targetCPU: want.autoscaling.targetCPUUtilizationPercentage };
       if (!live.metricsServer) violations.push(`${prefix} ${t.cluster} serves no metrics.k8s.io — an HPA would never scale`);
+      // a CPU-utilization HPA needs CPU requests to compute anything; without them it is
+      // inert AND blocks fixed sizing, and Nebula cannot delete it (RBAC) — refuse
+      if (!w.resources.requests?.cpu) violations.push(`${prefix} pods have no CPU requests — a CPU HPA could never scale them; size replicas instead`);
+      if (to.min < w.replicas) warnings.push(`${prefix} HPA min ${to.min} < ${w.replicas} running — at today's utilization the HPA scales it DOWN to ${to.min} within minutes`);
       if (to.max > t.caps.maxReplicas) violations.push(`${prefix} HPA max ${to.max} exceeds the ${t.tier} cap of ${t.caps.maxReplicas}`);
       const base = w.hpa ? w.hpa.min : w.replicas;
       const step = within(t, base, to.min);
@@ -173,21 +175,10 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
         changes.push(`replicas ${w.replicas} → ${want.replicas}`);
       }
     }
-    if (want.resources) {
-      const to = mergeRes(w.resources, want.resources);
-      if (!sameRes(w.resources, to)) {
-        for (const k of ["requests", "limits"] as const) {
-          const cpu = to[k]?.cpu, mem = to[k]?.memory;
-          if (cpu && cpuToCores(cpu) < 0.05) violations.push(`${prefix} ${k}.cpu ${cpu} is below 50m`);
-          if (mem && memToGi(mem) * 1024 < (k === "limits" ? 128 : 64)) violations.push(`${prefix} ${k}.memory ${mem} is below ${k === "limits" ? 128 : 64}Mi`);
-        }
-        const oldLim = w.resources.limits?.memory, newLim = to.limits?.memory;
-        if (oldLim && newLim && memToGi(newLim) < memToGi(oldLim)) warnings.push(`${prefix} memory limit shrinks ${oldLim} → ${newLim} (OOMKill risk)`);
-        if (!w.resources.requests?.cpu && to.requests?.cpu) warnings.push(`${prefix} gets CPU requests for the first time — pods are rescheduled against node capacity`);
-        warnings.push(`${prefix} changing resources rolls the Deployment's pods (rolling update)`);
-        workloadOps.push({ kind: "resources", namespace: w.namespace, name, container: w.container, from: w.resources, to });
-        changes.push(`${fmtRes(w.resources)} → ${fmtRes(to)}`);
-      }
+    if (want.resources && !sameRes(w.resources, mergeRes(w.resources, want.resources))) {
+      // RBAC grants deployments/scale + HPAs only (no `patch deployments`: that would be
+      // full pod-template control on prod) — resources are changed by the app's own deploy
+      violations.push(`${prefix} resource sizing is not available on live tiers (Nebula may only scale replicas / HPAs here)`);
     }
     rows.push({ workload: name, namespace: w.namespace, pair: (t.pair as readonly string[]).includes(name), before: `${fmtW(w)} · ${fmtRes(w.resources)}`, after: changes.length ? changes.join("; ") : "unchanged", changes });
   }
@@ -220,6 +211,11 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
   }
   for (const ng of live.nodegroups.filter((x) => !desired.nodegroups[x.name])) nodegroupRows.push({ name: ng.name, before: fmtNg(ng), after: "baseline (untouched)", changes: [] });
 
+  // drain guard: pods here mostly carry no requests, so the scheduler cannot see
+  // load — shrink capacity one node, one group, per apply
+  for (const o of nodegroupDowns) if (o.kind === "nodegroup" && o.from.desired - o.to.desired > 1) violations.push(`node group ${o.name}: desired ${o.from.desired} → ${o.to.desired} — shrink one node per apply`);
+  if (nodegroupDowns.length > 1) violations.push(`${nodegroupDowns.length} node groups shrink at once — shrink one group per apply`);
+
   // order: grow nodes first, then workloads, then shrink nodes
   ops.push(...nodegroupUps, ...workloadOps, ...nodegroupDowns);
 
@@ -242,9 +238,7 @@ const describeOp = (o: LiveOp) =>
     ? `node group ${o.name}: ${fmtNg(o.from)} → ${fmtNg(o.to)}`
     : o.kind === "scale"
       ? `${o.namespace}/${o.name}: replicas ${o.from} → ${o.to}`
-      : o.kind === "hpa"
-        ? `${o.namespace}/${o.name}: HPA ${o.from ? `${o.from.min}–${o.from.max}` : "(new)"} → ${o.to.min}–${o.to.max} @${o.to.targetCPU}%`
-        : `${o.namespace}/${o.name}[${o.container}]: ${fmtRes(o.from)} → ${fmtRes(o.to)}`;
+      : `${o.namespace}/${o.name}: HPA ${o.from ? `${o.from.min}–${o.from.max}` : "(new)"} → ${o.to.min}–${o.to.max} @${o.to.targetCPU}%`;
 
 export { describeOp as describeLiveOp };
 
@@ -262,8 +256,7 @@ export async function applyLive(port: LiveClusterPort, t: LiveTarget, desired: L
     try {
       if (op.kind === "nodegroup") await port.updateNodegroup(op.name, op.to);
       else if (op.kind === "scale") await port.scale(op.namespace, op.name, op.to);
-      else if (op.kind === "hpa") await port.upsertHpa(op.namespace, op.name, op.to, !!op.from);
-      else await port.patchResources(op.namespace, op.name, op.container, op.to);
+      else await port.upsertHpa(op.namespace, op.name, op.to, !!op.from);
       applied.push(describeOp(op));
     } catch (e) {
       return { tier: t.tier, cluster: t.cluster, applied, failed: `${describeOp(op)}: ${String((e as Error).message ?? e)}`, planHash: plan.planHash };

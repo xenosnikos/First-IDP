@@ -696,15 +696,22 @@ and refuses unless the plan is byte-identical to the one confirmed (`planHash` b
 
 - **Access** (applied 2026-10-14): EKS access entries map `twizz-nebula-dashboard` to group
   `nebula-capacity` (infra/src/capacity-access.ts); RBAC infra/k8s/nebula-capacity-rbac.yaml — read
-  nodes; in ns default + jobs read pods, patch deployments + deployments/scale, create/patch HPAs.
-  `can-i`-verified on both clusters: no secrets/configmaps, no kube-system, no create/delete.
+  nodes; in ns default + jobs read pods/deployments, write ONLY deployments/scale + HPAs (no
+  `patch deployments`: that would be full pod-template control on prod). `can-i`-verified: no
+  secrets/configmaps/logs/exec, no kube-system, no create/delete.
   Node groups: eks:UpdateNodegroupConfig on those two clusters only. Prod API allowlist = bastion +
   Nebula NAT `108.133.39.9/32`. Tokens: SigV4-presigned STS (core `eks-auth.ts`, node:crypto).
 - **Rules** (`packages/actions/src/live-capacity.ts`): moly-backend + lolygram-discovery are a pair
-  (same replicas/HPA, or refused); unnamed workloads stay at their live baseline; one apply ≤ ×3 and
-  ≥ ×0.5 per workload / node group; caps (prod 120 replicas, 20 nodes/group; staging 20 / 6); never
-  deletes (no HPA removal, no zero); HPAs only where metrics.k8s.io is served; resources merge onto
-  the live container (floors + OOM warning); node groups grow first, shrink last; stop at first failure.
+  (same replicas/HPA, or refused); unnamed workloads stay at their live baseline (the editor sends
+  only what you changed); one apply ≤ ×3 and ≥ ×0.5 (rounded UP: 3→1 refused) per workload / node
+  group; node groups shrink at most one node, one group per apply (pods carry no requests, so the
+  scheduler cannot see load); caps (prod 120 replicas, 20 nodes/group; staging 20 / 6); never
+  deletes (no HPA removal, no zero); HPAs only with metrics.k8s.io AND CPU requests on the pods
+  (prod's pair has none today → replicas only), with a warning when HPA min < running; replicas
+  only — resources are not sizable live; node groups grow first, shrink last; stop at first
+  failure. The audit row stores the JSON result + the confirmed summary.
+- **Accepted risk**: the prod API allowlist includes the NonProd NAT (108.133.39.9), shared by all
+  NonProd egress incl. PR-preview pods; the endpoint still requires an authorised IAM identity.
 - **UI**: /capacity → Staging / Prod show the live workloads + node groups, a live sizing editor
   (pair inputs move together), the plan in apply order, and **Apply to <cluster>** (operators,
   two-step confirm, AuditLog `nebula.apply_live_capacity`).

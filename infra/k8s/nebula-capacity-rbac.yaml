@@ -3,9 +3,10 @@
 # the dashboard's IRSA role maps to (infra/src/capacity-access.ts).
 #
 # Read:  nodes (cluster-wide), pods / deployments / HPAs in ns default + jobs.
-# Write: deployments (patch: replicas + container resources), deployments/scale,
-#        HPAs — in ns default + jobs ONLY. No secrets, configmaps, services,
-#        ingresses, RBAC, namespaces, or anything cluster-scoped beyond reading nodes.
+# Write: deployments/scale (replicas) and HPAs — in ns default + jobs ONLY.
+#        Deliberately NO `patch deployments`: that is full pod-template control
+#        (image, command, env, volumes, serviceAccount) on prod. No secrets,
+#        configmaps, services, ingresses, RBAC, namespaces, pods/log or exec.
 # Applied by scripts/nebula-capacity-access.sh. Remove = delete these objects.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
@@ -37,7 +38,7 @@ rules:
     verbs: [get, list]
   - apiGroups: [apps]
     resources: [deployments]
-    verbs: [get, list, patch]
+    verbs: [get, list]
   - apiGroups: [apps]
     resources: [deployments/scale]
     verbs: [get, patch, update]

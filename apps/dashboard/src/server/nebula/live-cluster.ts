@@ -1,7 +1,7 @@
 // The live-capacity port (docs/NEBULA.md §N5.2) on EKS-Moly-staging and
 // EKS-Moly-Prod: kube API with a fresh EKS token from the dashboard's IRSA
-// role (group `nebula-capacity`: patch deployments / scale / HPAs in
-// default + jobs, read nodes) + EKS node-group scaling. Every call is
+// role (group `nebula-capacity`: deployments/scale + HPAs in default + jobs,
+// read deployments/pods/nodes — no `patch deployments`, so no pod-template access) + EKS node-group scaling. Every call is
 // hard-timed; nothing here can create or delete a Deployment, Pod or Secret
 // (RBAC refuses it even if the code tried).
 import { eksAccess, listNodegroups, updateNodegroupScaling } from "@twizz-idp/core";
@@ -9,7 +9,6 @@ import type { LiveClusterPort, LiveResources, LiveState, LiveTarget, LiveWorkloa
 
 const TIMEOUT_MS = 10_000;
 const MERGE = { headers: { "Content-Type": "application/merge-patch+json" } };
-const STRATEGIC = { headers: { "Content-Type": "application/strategic-merge-patch+json" } };
 
 function withTimeout<T>(p: Promise<T>, what: string): Promise<T> {
   return Promise.race([p, new Promise<never>((_, reject) => setTimeout(() => reject(new Error(`${what} timed out after ${TIMEOUT_MS}ms`)), TIMEOUT_MS))]);
@@ -17,7 +16,7 @@ function withTimeout<T>(p: Promise<T>, what: string): Promise<T> {
 
 async function clients(cluster: string) {
   const k8s = await import("@kubernetes/client-node");
-  const a = await eksAccess(cluster);
+  const a = await withTimeout(eksAccess(cluster), `EKS auth ${cluster}`);
   const kc = new k8s.KubeConfig();
   kc.loadFromOptions({
     clusters: [{ name: cluster, server: a.server, caData: a.caData, skipTLSVerify: false }],
@@ -117,12 +116,6 @@ export function liveClusterPort(t: LiveTarget): LiveClusterPort {
     async scale(namespace, name, replicas) {
       const c = await clients(t.cluster);
       await withTimeout(c.apps.patchNamespacedDeploymentScale(name, namespace, { spec: { replicas } }, undefined, undefined, undefined, undefined, undefined, MERGE), `scale ${namespace}/${name}`);
-    },
-
-    async patchResources(namespace, name, container, resources) {
-      const c = await clients(t.cluster);
-      const body = { spec: { template: { spec: { containers: [{ name: container, resources }] } } } };
-      await withTimeout(c.apps.patchNamespacedDeployment(name, namespace, body, undefined, undefined, undefined, undefined, undefined, STRATEGIC), `resources ${namespace}/${name}`);
     },
 
     async upsertHpa(namespace, name, a, exists) {

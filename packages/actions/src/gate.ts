@@ -51,7 +51,10 @@ export function createGate({ policy, nonces, audit, actionPrefix = "mcp." }: Gat
 
     try {
       const result = await action();
-      await audit({ action: actionName, resource, allowed: true, detail: { result: String(result).slice(0, 500) } });
+      // what ran, as JSON (an object result used to land as "[object Object]"), plus the
+      // summary the human confirmed — a prod resize must be reconstructable from the audit row
+      const text = typeof result === "string" ? result : (JSON.stringify(result) ?? String(result));
+      await audit({ action: actionName, resource, allowed: true, detail: { result: text.slice(0, 2000), summary: summary.slice(0, 2000) } });
       return { done: true, result };
     } catch (e) {
       await audit({ action: actionName, resource, allowed: true, detail: { error: String(e) } });

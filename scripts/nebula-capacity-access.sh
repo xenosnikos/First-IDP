@@ -4,8 +4,8 @@
 #
 #   1. prod API allowlist: ADD Nebula's NAT egress IP (keeps every existing CIDR)
 #   2. RBAC (infra/k8s/nebula-capacity-rbac.yaml) on staging, then prod
-#   3. verify: the nebula-capacity group can patch deployments in default/jobs
-#      and can NOT read secrets
+#   3. verify: the nebula-capacity group can scale deployments + manage HPAs in
+#      default/jobs and can NOT patch pod templates or read secrets/logs
 #
 # The access entries + node-group IAM are Pulumi (infra/src/capacity-access.ts):
 # run `pulumi up` in infra/ first or after — an entry without RBAC grants nothing.
@@ -54,8 +54,9 @@ for target in "staging:$STG_KC" "prod:$HOME/.kube/twizz-prod.yaml"; do
   else "$KUBECTL" --kubeconfig "$kc" apply -f "$RBAC"; fi
   # ── 3. verify the grant is exactly as narrow as intended
   as=(--as nebula-capacity-check --as-group nebula-capacity)
-  for check in "patch deployments -n default:yes" "patch deployments/scale -n jobs:yes" "create horizontalpodautoscalers -n default:yes" \
-               "list nodes:yes" "get secrets -n default:no" "patch deployments -n kube-system:no" "delete deployments -n default:no"; do
+  for check in "patch deployments --subresource=scale -n default:yes" "patch deployments --subresource=scale -n jobs:yes" "create horizontalpodautoscalers -n default:yes" \
+               "list nodes:yes" "list deployments -n default:yes" "patch deployments -n default:no" "get secrets -n default:no" \
+               "patch deployments --subresource=scale -n kube-system:no" "delete deployments -n default:no" "get pods --subresource=log -n default:no"; do
     q=${check%%:*}; want=${check##*:}
     got=$("$KUBECTL" --kubeconfig "$kc" auth can-i $q "${as[@]}" 2>/dev/null || true)
     printf '   %-45s %-4s %s\n' "$q" "$got" "$([ "$got" = "$want" ] && echo ok || echo "UNEXPECTED (want $want)")"

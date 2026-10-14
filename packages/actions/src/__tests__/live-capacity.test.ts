@@ -41,9 +41,6 @@ class FakePort implements LiveClusterPort {
     this.calls.push(`scale ${ns}/${name} ${r}`);
     this.state.workloads.find((w) => w.name === name)!.replicas = r;
   }
-  async patchResources(ns: string, name: string) {
-    this.calls.push(`resources ${ns}/${name}`);
-  }
   async upsertHpa(ns: string, name: string, a: { min: number; max: number }, exists: boolean) {
     this.calls.push(`hpa ${exists ? "patch" : "create"} ${ns}/${name} ${a.min}-${a.max}`);
   }
@@ -83,12 +80,20 @@ describe("planLive on the real prod shape", () => {
     expect(planLive(T, PROD(), LiveTierSize.parse({ workloads: pair(11) })).violations.join()).toMatch(/below ×0.5/);
   });
 
-  it("an HPA: created with the floor raised now; refused without metrics-server", () => {
-    const p = planLive(T, PROD(), LiveTierSize.parse({ workloads: pair(24, [30, 60]) }));
-    expect(p.ops.filter((o) => o.kind === "hpa")).toHaveLength(2);
-    expect(p.ops.filter((o) => o.kind === "scale").map((o) => (o as { to: number }).to)).toEqual([30, 30]);
-    const noMetrics = { ...PROD(), metricsServer: false };
-    expect(planLive(T, noMetrics, LiveTierSize.parse({ workloads: pair(24, [24, 48]) })).violations.join()).toMatch(/metrics/);
+  it("an HPA: refused on pods without CPU requests (prod's pair today) — it would be inert and undeletable", () => {
+    expect(planLive(T, PROD(), LiveTierSize.parse({ workloads: pair(24, [30, 60]) })).violations.join()).toMatch(/no CPU requests/);
+  });
+
+  it("an HPA where requests exist: floor raised now; warns when min < running; refused without metrics-server", () => {
+    const s = PROD();
+    for (const w of s.workloads.filter((x) => (T.pair as readonly string[]).includes(x.name))) w.resources = { requests: { cpu: "250m", memory: "256Mi" } };
+    const up = planLive(T, s, LiveTierSize.parse({ workloads: pair(24, [30, 60]) }));
+    expect(up.violations).toEqual([]);
+    expect(up.ops.filter((o) => o.kind === "hpa")).toHaveLength(2);
+    expect(up.ops.filter((o) => o.kind === "scale").map((o) => (o as { to: number }).to)).toEqual([30, 30]);
+    const down = planLive(T, s, LiveTierSize.parse({ workloads: pair(24, [12, 48]) }));
+    expect(down.warnings.join()).toMatch(/scales it DOWN to 12/);
+    expect(planLive(T, { ...s, metricsServer: false }, LiveTierSize.parse({ workloads: pair(24, [24, 48]) })).violations.join()).toMatch(/metrics/);
   });
 
   it("never deletes an existing HPA", () => {
@@ -97,12 +102,30 @@ describe("planLive on the real prod shape", () => {
     expect(planLive(T, s, LiveTierSize.parse({ workloads: pair(24) })).violations.join()).toMatch(/never deletes/);
   });
 
-  it("resources: merged onto the live container, floors + warnings", () => {
+  it("resources are not sizable on live tiers (RBAC has no `patch deployments`)", () => {
     const p = planLive(T, PROD(), LiveTierSize.parse({ workloads: { "invoice-gen-deployment": { replicas: 2, resources: { limits: { memory: "512Mi" } } } } }));
-    expect(p.violations).toEqual([]);
-    expect(p.warnings.join()).toMatch(/OOMKill/);
-    const op = p.ops.find((o) => o.kind === "resources")!;
-    expect(op.kind === "resources" && op.to).toEqual({ requests: { cpu: "50m", memory: "900Mi" }, limits: { cpu: "500m", memory: "512Mi" } });
+    expect(p.violations.join()).toMatch(/resource sizing is not available/);
+    // restating the current values is not a change
+    expect(planLive(T, PROD(), LiveTierSize.parse({ workloads: { "invoice-gen-deployment": { replicas: 2, resources: { limits: { memory: "900Mi" } } } } })).violations).toEqual([]);
+  });
+
+  it("step-down rounds up: 3→1 and 5→2 refused, 2→1 and 3→2 allowed", () => {
+    const s = PROD();
+    s.nodegroups[0] = { ...s.nodegroups[0], min: 1, desired: 3, max: 5 };
+    const ng = (desired: number) => planLive(T, s, LiveTierSize.parse({ nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: 1, desired, max: 5 } } })).violations.join();
+    expect(ng(1)).toMatch(/below ×0.5/);
+    expect(ng(2)).toBe("");
+    const two = planLive(T, PROD(), LiveTierSize.parse({ workloads: { "alert-service-deployment": { replicas: 1 } } }));
+    expect(two.violations).toEqual([]);
+  });
+
+  it("drain guard: one node, one group per apply", () => {
+    const s = PROD();
+    s.nodegroups = s.nodegroups.map((n) => ({ ...n, min: 1, desired: 4, max: 6 }));
+    const bigDrop = planLive(T, s, LiveTierSize.parse({ nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: 1, desired: 2, max: 6 } } })).violations.join();
+    expect(bigDrop).toMatch(/shrink one node per apply/);
+    const both = planLive(T, s, LiveTierSize.parse({ nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: 1, desired: 3, max: 6 }, "eks-prod-node-group-m5-2xlarge": { min: 1, desired: 3, max: 6 } } })).violations.join();
+    expect(both).toMatch(/shrink one group per apply/);
   });
 
   it("a refused node group: drained to zero / not ACTIVE", () => {

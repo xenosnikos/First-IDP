@@ -333,25 +333,32 @@ function LiveEditor({ live, seed, onPlan }: { live: LiveOk; seed: LiveSize; onPl
       const s = seed.nodegroups[g.name] ?? { min: g.min, desired: g.desired, max: g.max };
       n[g.name] = { min: String(s.min), desired: String(s.desired), max: String(s.max) };
     }
-    return { w, n };
+    // a preset seeds (and so "touches") exactly what it names; the live baseline touches nothing
+    const fromPreset = seed !== live.baseline;
+    const touched = new Set<string>(fromPreset ? [...Object.keys(seed.workloads), ...Object.keys(seed.nodegroups).map((k) => `ng:${k}`)] : []);
+    return { w, n, touched };
   };
   const [st, setSt] = useState(init);
   const setW = (name: string, patch: Partial<(typeof st.w)[string]>) =>
     setSt((p) => {
       const w = { ...p.w, [name]: { ...p.w[name], ...patch } };
+      const touched = new Set(p.touched).add(name);
       // the pair always moves together
-      if (pair.includes(name)) for (const other of pair) if (other !== name && w[other]) w[other] = { ...w[name] };
-      return { ...p, w };
+      if (pair.includes(name)) for (const other of pair) if (other !== name && w[other]) { w[other] = { ...w[name] }; touched.add(other); }
+      return { ...p, w, touched };
     });
+  const setN = (name: string, v: (typeof st.n)[string]) => setSt((p) => ({ ...p, n: { ...p.n, [name]: v }, touched: new Set(p.touched).add(`ng:${name}`) }));
+  // only what was touched is sent: everything else stays at whatever runs at apply time
   const build = (): LiveSize => {
     const workloads: LiveSize["workloads"] = {};
     for (const [name, v] of Object.entries(st.w)) {
+      if (!st.touched.has(name)) continue;
       workloads[name] = v.hpa
         ? { replicas: Number(v.min), autoscaling: { enabled: true, minReplicas: Number(v.min), maxReplicas: Number(v.max), targetCPUUtilizationPercentage: 70 } }
         : { replicas: Number(v.replicas) };
     }
     const nodegroups: LiveSize["nodegroups"] = {};
-    for (const [name, v] of Object.entries(st.n)) nodegroups[name] = { min: Number(v.min), desired: Number(v.desired), max: Number(v.max) };
+    for (const [name, v] of Object.entries(st.n)) if (st.touched.has(`ng:${name}`)) nodegroups[name] = { min: Number(v.min), desired: Number(v.desired), max: Number(v.max) };
     return { workloads, nodegroups };
   };
   const num: CSSProperties = { ...inputStyle, width: 64, padding: "4px 6px" };
@@ -377,13 +384,13 @@ function LiveEditor({ live, seed, onPlan }: { live: LiveOk; seed: LiveSize; onPl
       {Object.entries(st.n).map(([name, v]) => (
         <div key={name} style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, marginBottom: 4, flexWrap: "wrap" }}>
           <span style={{ flex: 1, minWidth: 140 }} title={name}>nodes {name.replace(/^eks-/, "")}</span>
-          <input style={num} aria-label={`${name} min`} value={v.min} onChange={(e) => setSt((p) => ({ ...p, n: { ...p.n, [name]: { ...v, min: e.target.value } } }))} />/
-          <input style={num} aria-label={`${name} desired`} value={v.desired} onChange={(e) => setSt((p) => ({ ...p, n: { ...p.n, [name]: { ...v, desired: e.target.value } } }))} />/
-          <input style={num} aria-label={`${name} max`} value={v.max} onChange={(e) => setSt((p) => ({ ...p, n: { ...p.n, [name]: { ...v, max: e.target.value } } }))} />
+          <input style={num} aria-label={`${name} min`} value={v.min} onChange={(e) => setN(name, { ...v, min: e.target.value })} />/
+          <input style={num} aria-label={`${name} desired`} value={v.desired} onChange={(e) => setN(name, { ...v, desired: e.target.value })} />/
+          <input style={num} aria-label={`${name} max`} value={v.max} onChange={(e) => setN(name, { ...v, max: e.target.value })} />
         </div>
       ))}
       <div style={{ display: "flex", gap: 8, marginTop: 8 }}>
-        <Button variant="ion" onClick={() => onPlan(build())}>Plan these values</Button>
+        <Button variant="ion" disabled={st.touched.size === 0} title={st.touched.size ? `plans only what you changed (${st.touched.size})` : "change a value first"} onClick={() => onPlan(build())}>Plan these values</Button>
         <Button onClick={() => setSt(init())}>Reset</Button>
       </div>
     </div>
