@@ -62,10 +62,43 @@ export const AtlasSize = z.object({
 });
 export type AtlasSize = z.infer<typeof AtlasSize>;
 
+// ── Live tiers (EKS-Moly-staging ns default/jobs, EKS-Moly-Prod) ─────────
+// Sized straight on the cluster (no gitops source exists there: the app
+// pipelines only `rollout restart`). Keys are Deployment names.
+
+const K8S_NAME = /^[a-z0-9]([-a-z0-9]{0,61}[a-z0-9])?$/;
+
+export const LiveWorkloadSize = z.object({
+  replicas: z.number().int().min(1).max(400),
+  /** CPU HPA (needs metrics-server on the cluster); omitted = no HPA */
+  autoscaling: AutoscalingSize.optional(),
+  /** omitted = leave the container's resources exactly as they are */
+  resources: z
+    .object({
+      requests: z.object({ cpu: cpuQuantity, memory: memQuantity }).partial().optional(),
+      limits: z.object({ cpu: cpuQuantity, memory: memQuantity }).partial().optional(),
+    })
+    .optional(),
+});
+export type LiveWorkloadSize = z.infer<typeof LiveWorkloadSize>;
+
+export const NodegroupSize = z
+  .object({ min: z.number().int().min(0).max(100), desired: z.number().int().min(0).max(100), max: z.number().int().min(1).max(100) })
+  .refine((n) => n.min <= n.desired && n.desired <= n.max, "node group needs min <= desired <= max");
+export type NodegroupSize = z.infer<typeof NodegroupSize>;
+
+export const LiveTierSize = z.object({
+  workloads: z.record(z.string().regex(K8S_NAME), LiveWorkloadSize).default({}),
+  nodegroups: z.record(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/), NodegroupSize).default({}),
+});
+export type LiveTierSize = z.infer<typeof LiveTierSize>;
+
 export const TierSize = z.object({
   services: z.record(z.string().regex(/^[a-z][a-z0-9-]{1,39}$/), ServiceSize).default({}),
   nodes: NodeSize.optional(),
   atlas: AtlasSize.optional(),
+  /** staging (ns default/jobs) + production: workloads + node groups sized on the live cluster */
+  live: LiveTierSize.optional(),
 });
 export type TierSize = z.infer<typeof TierSize>;
 

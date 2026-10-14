@@ -31,6 +31,7 @@ import {
   applyCapacity,
   capViolations,
   capacityTarget,
+  readCurrentTier,
   hashSize,
   loadPresets,
   mergeCapacityPr,
@@ -283,27 +284,24 @@ export function registerWriteTools(server: McpServer) {
 
   server.tool(
     "scale_shared_service",
-    "Scale a shared singleton service on EKS-Twizz-NonProd (0-3 replicas). Two-step confirm.",
+    "Scale a shared singleton service on EKS-Twizz-NonProd (1-3 replicas) by opening a capacity PR on twizz-gitops (apps/shared/<service>.yaml replicaCount; merge with merge_capacity_pr). A direct kube patch would be reverted by Argo CD selfHeal within minutes. Two-step confirm.",
     {
       service: z.enum(["ffmpeg-service", "lolygram-discovery", "alertservice"]),
-      replicas: z.number().int().min(0).max(3),
+      replicas: z.number().int().min(1).max(3),
       confirm: confirmSchema,
     },
     async ({ service, replicas, confirm }) => {
       const fields = { service, replicas: String(replicas) };
-      return gated("scale_shared_service", fields, confirm, `Scale shared/${service} to ${replicas} replicas`, async () => {
-        const k8s = await import("@kubernetes/client-node");
-        const kc = new k8s.KubeConfig();
-        kc.loadFromFile(process.env.TWIZZ_NONPROD_KUBECONFIG ?? `${process.env.HOME}/.kube/twizz-nonprod.yaml`);
-        const apps = kc.makeApiClient(k8s.AppsV1Api);
-        await apps.patchNamespacedDeploymentScale(
-          service,
-          "shared",
-          { spec: { replicas } },
-          undefined, undefined, undefined, undefined, undefined,
-          { headers: { "Content-Type": "application/merge-patch+json" } },
-        );
-        return `shared/${service} scaled to ${replicas}`;
+      return gated("scale_shared_service", fields, confirm, `Open a twizz-gitops PR scaling shared/${service} to ${replicas} replica(s) (apps/shared/${service}.yaml); merge it with merge_capacity_pr`, async () => {
+        const promotions = new GithubPromotions(octokit());
+        const t = capacityTarget("preview");
+        const current = await readCurrentTier(promotions, t);
+        const now = current.services[service];
+        if (!now) throw new Error(`apps/shared/${service}.yaml has no sizing to scale`);
+        // fixed replicas would turn an HPA off — size HPA'd services with apply_capacity_preset
+        if (now.autoscaling?.enabled) throw new Error(`shared/${service} runs an HPA (${now.autoscaling.minReplicas}–${now.autoscaling.maxReplicas}); use apply_capacity_preset`);
+        // same path as apply_capacity_preset: one gated, reviewable PR; Argo applies it on merge
+        return applyCapacity({ promotions }, { tier: "preview", label: `scale-${service}`.slice(0, 24), size: { services: { [service]: { ...now, replicas, autoscaling: undefined } } }, actor });
       });
     },
   );

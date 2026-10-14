@@ -6,3 +6,4 @@ export * from "./insights-query";
 export * from "./vercel";
 export * from "./atlas";
 export * from "./introspect";
+export * from "./eks-auth";

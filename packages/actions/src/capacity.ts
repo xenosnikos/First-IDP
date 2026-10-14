@@ -91,10 +91,10 @@ export const CAPACITY_TARGETS: Record<CapacityTier, CapacityTarget> = {
       // The release-train apps in ns `sentinel` — the only staging namespace Nebula deploys to.
       { name: "twizz-sentinel", namespace: "sentinel", workload: "twizz-sentinel", valuesFile: stagingValues("twizz-sentinel") },
       { name: "twizz-admin", namespace: "sentinel", workload: "twizz-admin", valuesFile: stagingValues("twizz-admin") },
-      // The monolith is deployed by its own staging pipeline: planned here, applied there.
-      { name: "moly-backend", namespace: "default", workload: "moly-backend-deployment" },
     ],
-    atlas: { cluster: null, writable: false },
+    // staging's MONGO_URI points at the NonProd Atlas cluster (shared with
+    // previews): shown here, resized only from the NonProd tier
+    atlas: { cluster: "NonProd-Twizz", writable: false },
     pricing: "onDemand",
     hpa: true,
     caps: { maxReplicas: 10, maxNodeCpu: 0, maxAtlas: "M60" },
@@ -103,7 +103,8 @@ export const CAPACITY_TARGETS: Record<CapacityTier, CapacityTarget> = {
     tier: "production",
     cluster: "EKS-Moly-Prod",
     writable: false,
-    services: [{ name: "moly-backend", namespace: "default", workload: "moly-backend-deployment" }],
+    // workloads + node groups are sized LIVE (live-capacity.ts, LIVE_TARGETS.production)
+    services: [],
     atlas: { cluster: null, writable: false },
     pricing: "onDemand",
     hpa: true,

@@ -174,14 +174,15 @@ describe("planCapacity", () => {
     expect(plan.violations.join("\n")).toMatch(/M80 exceeds/);
   });
 
-  it("prod rows are plan-only and exportable, never files", async () => {
+  it("prod has no gitops part: services are sized live (live-capacity.ts), never by PR", async () => {
     const t = CAPACITY_TARGETS.production;
     const current = await readCurrentTier(repo(), t);
     const plan = planCapacity(t, current, TierSize.parse({ services: { "moly-backend": big }, nodes: { maxCpu: 64, maxMemoryGi: 128 } }));
     expect(plan.files).toEqual({});
-    expect(plan.services.every((s) => !s.writable)).toBe(true);
+    expect(plan.services).toEqual([]);
+    expect(plan.warnings.join()).toMatch(/not a production capacity target/);
     expect(plan.nodes!.writable).toBe(false);
-    expect(parse(exportPlan(plan)).services["moly-backend"].replicaCount).toBe(2);
+    expect(parse(exportPlan(plan)).tier).toBe("production");
   });
 });
 

@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { CAPACITY_TIERS, EstimateInput, TierSize, type CapacityTier } from "@twizz-idp/shared";
-import { estimateTier, exportPlan, hashSize, listCapacityPrs, nearestPreset, planCapacity } from "@twizz-idp/actions";
+import { LIVE_TARGETS, describeLiveOp, estimateTier, exportPlan, hashSize, isLiveTier, listCapacityPrs, liveAsSize, nearestPreset, planCapacity, planLive } from "@twizz-idp/actions";
 import { router, protectedProcedure } from "../trpc";
 import { namedEnvDeps } from "../nebula/deps";
-import { currentFor, nodePoolUsedCpu, observe, presetsAndProfiles, targetFor } from "../nebula/capacity";
+import { currentFor, nodePoolUsedCpu, observe, presetsAndProfiles, readLive, readProdAtlas, targetFor } from "../nebula/capacity";
 
 // Capacity page (docs/NEBULA.md §N5). QUERIES ONLY: presets, the current
 // state per tier, a plan (diff + cost + export) and the traffic calculator.
@@ -46,8 +46,22 @@ export const capacityRouter = router({
 
   /** One tier: what gitops declares + what is actually running. */
   tier: protectedProcedure.input(z.object({ tier: tierSchema })).query(async ({ input }) => {
-    const [{ t, current, atlasError }, observed] = await Promise.all([currentFor(input.tier), observe(targetFor(input.tier))]);
+    const tier = input.tier;
+    const [{ t, current, atlasError }, observed, live, prodAtlas] = await Promise.all([
+      currentFor(tier),
+      observe(targetFor(tier)),
+      isLiveTier(tier) ? readLive(tier) : Promise.resolve(null),
+      tier === "production" ? readProdAtlas() : Promise.resolve(null),
+    ]);
+    const lt = isLiveTier(tier) ? LIVE_TARGETS[tier] : null;
     return {
+      prodAtlas,
+      // the Moly clusters, read straight from the API (always reflects what runs)
+      live: lt
+        ? live && "state" in live
+          ? { ...live.state, pair: lt.pair, caps: lt.caps, baseline: liveAsSize(lt, live.state) }
+          : { error: live && "error" in live ? live.error : "not read", pair: lt.pair, caps: lt.caps }
+        : null,
       tier: t.tier,
       cluster: t.cluster,
       writable: t.writable,
@@ -66,7 +80,17 @@ export const capacityRouter = router({
     const [{ t, current }, used] = await Promise.all([currentFor(input.tier), input.tier === "preview" ? nodePoolUsedCpu() : Promise.resolve(undefined)]);
     const plan = planCapacity(t, current, size, { nodePoolUsedCpu: used });
     const { files, ...rest } = plan;
-    return { ...rest, label, size, sizeHash: hashSize(size), files: Object.keys(files), writable: t.writable, exportYaml: exportPlan(plan) };
+    // live part (staging ns default/jobs, prod): a diff against a FRESH read
+    let live: (ReturnType<typeof planLive> & { opsText: string[] }) | { error: string } | null = null;
+    if (isLiveTier(input.tier) && size.live) {
+      const r = await readLive(input.tier);
+      if ("error" in r) live = { error: r.error };
+      else {
+        const p = planLive(LIVE_TARGETS[input.tier], r.state, size.live);
+        live = { ...p, opsText: p.ops.map(describeLiveOp) };
+      }
+    }
+    return { ...rest, label, size, sizeHash: hashSize(size), files: Object.keys(files), writable: t.writable, exportYaml: exportPlan(plan), live };
   }),
 
   /** Traffic calculator: rps → a custom size + the nearest named preset. */

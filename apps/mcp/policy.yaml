@@ -25,7 +25,7 @@ write_tools:
   scale_shared_service:
     allow:
       service: ["ffmpeg-service", "lolygram-discovery", "alertservice"]
-      # replicas constrained in code to 0..3
+      # replicas 1..3 in code; opens a capacity PR (Argo selfHeal reverted the old direct patch)
 
   # ── Nebula named envs (manual model; twizz-gitops/named-envs/README.md) ──
   # Secret names and ECR repos are derived from `service` in code — never inputs.
@@ -136,3 +136,19 @@ write_tools:
       tier: ["preview"]
       instanceSize: ["M10", "M20", "M30", "M40"]
       autoScaling: ["*"]
+
+  # ── Live capacity (docs/NEBULA.md §N5.2): EKS-Moly-staging + EKS-Moly-Prod ──
+  # Platform-owner decision 2026-10-14: Nebula adjusts PROD capacity from the UI.
+  # `tier: production` is the ONE value exempted from global_deny (this tool,
+  # this field only). What it can touch is bounded twice: in code (pair rule,
+  # x3 / x0.5 step limits, caps, never delete / never zero) and in Kubernetes
+  # RBAC (nebula-capacity: patch deployments/scale/HPAs in default + jobs).
+  # `planHash` binds the nonce to the exact ops AND the live values they came from.
+  apply_live_capacity:
+    exempt_global_deny: [tier]
+    allow:
+      tier: ["staging", "production"]
+      preset: ["*"]
+      planHash: ["*"]
+    deny:
+      preset: ["*prod*"]                 # preset names are free text; keep them clean

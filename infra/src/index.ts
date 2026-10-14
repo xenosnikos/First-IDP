@@ -7,6 +7,7 @@ import { bootstrapCluster } from "./bootstrap";
 import { createNetbirdRouter } from "./netbird";
 import { createAdminGate } from "./admin-gate";
 import { createStagingAccess, registerStagingCluster } from "./staging";
+import { createCapacityAccess } from "./capacity-access";
 import * as pulumi from "@pulumi/pulumi";
 
 const tags = { Project: "twizz-idp" };
@@ -28,6 +29,10 @@ const cfg = new pulumi.Config();
 // Release train (docs/NEBULA.md §N4): IAM + EKS access entry so Argo CD may
 // deploy the staging tier into ONE namespace on EKS-Moly-staging.
 const stagingAccess = createStagingAccess({ oidcProviderArn: eks.oidcProviderArn, oidcProviderUrl: eks.oidcProviderUrl }, tags);
+
+// Capacity control (docs/NEBULA.md §N5): Nebula's role → group `nebula-capacity`
+// on EKS-Moly-Prod + EKS-Moly-staging (rights come from infra/k8s RBAC), + node-group scaling.
+createCapacityAccess({ name: iam.nebulaDashboardRoleName, arn: iam.nebulaDashboardRoleArn }, tags);
 
 const bootstrap = bootstrapCluster(
   eks.kubeconfig,

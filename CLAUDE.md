@@ -75,7 +75,10 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
   (owner-or-operator), `promoteRelease`/`mergePromotion` (operators; gitops PR to the staging
   tier, §N4) + `listReleaseTrain` (read), `applyCapacityPreset`/`mergeCapacityPr`/`setAtlasTier`
   (operators; capacity PR on gitops, NonProd Atlas tier, §N5)
-- `capacity` - overview, tier, plan, estimate (queries; presets/profiles from twizz-gitops `capacity/`)
+- `capacity` - overview, tier, plan, estimate (queries; presets/profiles from twizz-gitops `capacity/`;
+  staging/prod `live` = straight from the cluster via `server/nebula/live-cluster.ts`)
+- `actions.applyLiveCapacity` - operators; resizes workloads + node groups ON EKS-Moly-staging/Prod
+  (`@twizz-idp/actions` live-capacity.ts: pair rule, ×3/×0.5 step limits, caps, never delete; nonce binds planHash)
 
 ## Auth / RBAC
 
@@ -136,22 +139,26 @@ naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app he
 
 - **AWS Account**: 848281935985, region eu-west-1 (profile `twizz`)
 - **ECR**: 848281935985.dkr.ecr.eu-west-1.amazonaws.com
-- **EKS Prod**: EKS-Moly-Prod — **DO NOT MODIFY, EVER** (private API, SOCKS tunnel via bastion)
+- **EKS Prod**: EKS-Moly-Prod — **do not modify by hand or from code**, with ONE exception decided by the
+  platform owner (2026-10-14): Nebula's capacity control (docs/NEBULA.md §N5.2) — group `nebula-capacity`
+  (infra/k8s/nebula-capacity-rbac.yaml) may patch replicas/resources/HPAs in ns default+jobs and scale the
+  managed node groups, only through `apply_live_capacity` (gated, operator-only, audited). API allowlist =
+  bastion 54.220.18.111 + Nebula NAT 108.133.39.9 (SOCKS tunnel via bastion for humans)
 - **EKS Staging**: EKS-Moly-staging (staging in default ns, dev in dev ns) — leave as-is,
-  EXCEPT namespace `sentinel`: the release-train tier, deployed by the non-prod Argo CD
-  through a namespace-scoped access entry (infra/src/staging.ts, docs/NEBULA.md §N4)
+  EXCEPT namespace `sentinel` (release train, Argo CD, infra/src/staging.ts, §N4) and the same
+  `nebula-capacity` live sizing as prod in ns default+jobs + its node group (§N5.2)
 - **EKS Non-Prod**: EKS-Twizz-NonProd — owned by this platform (Pulumi, Phase 2)
 - **GitHub orgs**: `twizz-app` (canonical, new repos), `MymTwo` (Moly-backend, frontend)
 - **GitHub sign-in**: GitHub App `twizz-nebula` (client `Iv23liulodACgG6rqlKr`) in-cluster; legacy OAuth app `Ov23lirMDHUPPYwRkz5A` for local dev
 - **Vercel Team**: Loly (`team_ocn3vwvvs3VDxcjxNcY7l8Mu`) — owns `frontend` project `prj_3Op05Dm743j4qscD37c6hpfHRnfD`
-- **MongoDB Atlas**: Project 684296275fe8cc27d7b99d9b (public key iydvdumt); nonprod cluster `nonprod-twizz`
+- **MongoDB Atlas**: Project 684296275fe8cc27d7b99d9b (public key iydvdumt); nonprod cluster `NonProd-Twizz` (Digest auth; staging uses it too). Prod Atlas (moly-prod, prod-shift4) is another Atlas account: `ATLAS_PROD_*`
 - **CloudWatch Logs**: `/aws/containerinsights/{cluster}/application` (pod logs), `/performance` (metrics)
 - **Kubeconfigs**: per-cluster files `~/.kube/twizz-*.yaml` (aliases `ktw-staging`, `ktw-prod`);
   never merge Twizz contexts into the default kubeconfig
 
 ## Do NOT
 
-- Modify EKS-Moly-Prod cluster or its workloads
+- Modify EKS-Moly-Prod cluster or its workloads outside `apply_live_capacity` (§N5.2)
 - Store secrets in code, env files, ConfigMaps, or Notion (see docs/SECURITY-ROTATIONS.md)
 - Add dependencies without checking if they exist in workspace first
 - Run git commands unless explicitly asked

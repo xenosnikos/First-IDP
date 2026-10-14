@@ -1,8 +1,11 @@
 // Capacity page wiring (docs/NEBULA.md §N5): presets/profiles from gitops,
 // the Atlas tier, and what is actually running — kube for NonProd,
 // CloudWatch Container Insights for staging/prod (no kube path there).
-import { awsService, atlasTierService } from "@twizz-idp/core";
+import { awsService, atlasTierService, prodAtlasTierService } from "@twizz-idp/core";
 import {
+  LIVE_TARGETS,
+  type LiveState,
+  type LiveTier,
   AtlasTierAdapter,
   capacityTarget,
   loadPresets,
@@ -14,6 +17,7 @@ import {
 import type { AtlasSize, CapacityTier } from "@twizz-idp/shared";
 import { namedEnvDeps } from "./deps";
 import { readCapacityKube, readClusterSnapshot } from "./kube";
+import { liveClusterPort } from "./live-cluster";
 
 const errMsg = (e: unknown) => String((e as Error)?.message ?? e);
 
@@ -135,4 +139,24 @@ async function observeKube(t: CapacityTarget) {
       kubeError: kube.reason,
     },
   };
+}
+
+/** Live state of a Moly cluster (staging ns default/jobs, prod). Never throws. */
+export async function readLive(tier: LiveTier): Promise<{ state: LiveState } | { error: string }> {
+  try {
+    return { state: await liveClusterPort(LIVE_TARGETS[tier]).read() };
+  } catch (e) {
+    return { error: errMsg(e) };
+  }
+}
+
+/** Prod Atlas clusters (moly-prod, prod-shift4, …) from the prod Atlas account. Read-only. */
+export async function readProdAtlas(): Promise<{ clusters: Array<{ name: string; state: string; instanceSize: string; autoScaling?: { min: string; max: string } }> } | { error: string }> {
+  const svc = prodAtlasTierService();
+  if (!svc) return { error: "prod Atlas key not configured (ATLAS_PROD_PUBLIC_KEY / _PRIVATE_KEY / _PROJECT_ID in SM preview/nebula)" };
+  try {
+    return { clusters: await svc.listClusterTiers() };
+  } catch (e) {
+    return { error: errMsg(e) };
+  }
 }
