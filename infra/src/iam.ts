@@ -628,5 +628,6 @@ export function createIamRoles(
     mcpOperatorRoleArn: mcpOperator.arn,
     nebulaReaperRoleArn: nebulaReaperRole.arn,
     nebulaDashboardRoleArn: nebulaDashboardRole.arn,
+    nebulaDashboardRoleName: nebulaDashboardRole.name,
   };
 }

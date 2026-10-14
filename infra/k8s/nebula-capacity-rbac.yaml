@@ -1,0 +1,66 @@
+# Nebula capacity control (docs/NEBULA.md §N5) on EKS-Moly-Prod / EKS-Moly-staging.
+# Bound to the Kubernetes group `nebula-capacity`, which the EKS access entry of
+# the dashboard's IRSA role maps to (infra/src/capacity-access.ts).
+#
+# Read:  nodes (cluster-wide), pods / deployments / HPAs in ns default + jobs.
+# Write: deployments (patch: replicas + container resources), deployments/scale,
+#        HPAs — in ns default + jobs ONLY. No secrets, configmaps, services,
+#        ingresses, RBAC, namespaces, or anything cluster-scoped beyond reading nodes.
+# Applied by scripts/nebula-capacity-access.sh. Remove = delete these objects.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nebula-capacity-nodes
+  labels: { app.kubernetes.io/part-of: nebula-capacity }
+rules:
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [get, list]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: nebula-capacity-nodes
+  labels: { app.kubernetes.io/part-of: nebula-capacity }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: nebula-capacity-nodes }
+subjects:
+  - { apiGroup: rbac.authorization.k8s.io, kind: Group, name: nebula-capacity }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: nebula-capacity-workloads
+  labels: { app.kubernetes.io/part-of: nebula-capacity }
+rules:
+  - apiGroups: [""]
+    resources: [pods]
+    verbs: [get, list]
+  - apiGroups: [apps]
+    resources: [deployments]
+    verbs: [get, list, patch]
+  - apiGroups: [apps]
+    resources: [deployments/scale]
+    verbs: [get, patch, update]
+  - apiGroups: [autoscaling]
+    resources: [horizontalpodautoscalers]
+    verbs: [get, list, create, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nebula-capacity
+  namespace: default
+  labels: { app.kubernetes.io/part-of: nebula-capacity }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: nebula-capacity-workloads }
+subjects:
+  - { apiGroup: rbac.authorization.k8s.io, kind: Group, name: nebula-capacity }
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nebula-capacity
+  namespace: jobs
+  labels: { app.kubernetes.io/part-of: nebula-capacity }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: ClusterRole, name: nebula-capacity-workloads }
+subjects:
+  - { apiGroup: rbac.authorization.k8s.io, kind: Group, name: nebula-capacity }
