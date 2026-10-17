@@ -52,6 +52,9 @@ import {
   applyLive,
   describeLiveOp,
   planLive,
+  PROD_ATLAS,
+  planProdAtlas,
+  setProdAtlasTier,
   type GateResult,
   type NamedEnvManifest,
 } from "@twizz-idp/actions";
@@ -62,7 +65,7 @@ import { isOperator } from "@/lib/nebula/operators";
 import { argoWord, ttlWord } from "@/lib/nebula/status";
 import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
-import { atlasPort, nodePoolUsedCpu, readAtlas, readLive, targetFor } from "../nebula/capacity";
+import { atlasPort, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, targetFor } from "../nebula/capacity";
 import { liveClusterPort } from "../nebula/live-cluster";
 import { resolveSize } from "./capacity";
 
@@ -450,6 +453,37 @@ export const actionsRouter = router({
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
       return shape(await gate("set_atlas_tier", fields, confirm, summary, () => setAtlasTier({ atlas: atlasPort() }, { tier, size, actor: ctx.login })));
+    }),
+
+  /** Resize ONE prod Atlas cluster (§N5.3; platform-owner decision 2026-10-16).
+   * Operators only. Both calls re-read the cluster and re-plan; the nonce binds
+   * `from` (the tier the human reviewed) and setProdAtlasTier re-checks it. */
+  setProdAtlasTier: operatorProcedure
+    .input(z.object({ cluster: z.enum(PROD_ATLAS.clusters), size: AtlasSize, from: z.string().max(40), confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { cluster, size, from, confirm } = input;
+      const port = prodAtlasPort();
+      if (!port) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "prod Atlas key not configured" });
+      // a refused PROD resize leaves an audit row too, not just the ones that pass the gate
+      const refuse = async (code: "NOT_FOUND" | "CONFLICT" | "BAD_REQUEST", message: string) => {
+        await auditDenial(ctx.prisma, ctx.login, "set_prod_atlas_tier", message, cluster);
+        return new TRPCError({ code, message });
+      };
+      const before = await port.getTier(cluster);
+      if (!before) throw await refuse("NOT_FOUND", `Atlas cluster ${cluster} not found`);
+      if (fmtAtlas(before) !== from) throw await refuse("CONFLICT", `${cluster} is now ${fmtAtlas(before)} (you reviewed ${from}) — reload it`);
+      const plan = planProdAtlas(cluster, before, size);
+      if (plan.violations.length) throw await refuse("BAD_REQUEST", plan.violations.join("\n"));
+      const fields = { tier: "production", cluster, instanceSize: size.instanceSize, autoScaling: size.autoScaling ? `${size.autoScaling.min}-${size.autoScaling.max}` : "off", from };
+      const summary = [
+        `Resize PRODUCTION Atlas cluster ${cluster}: ${plan.from} → ${plan.to}`,
+        ...plan.changes.map((c) => `- ${c}`),
+        `- ≈ $${plan.cost.before.toLocaleString("en-US")} → $${plan.cost.after.toLocaleString("en-US")} /month (list price)`,
+        ...plan.warnings.map((w) => `! ${w}`),
+        `- Atlas Admin API, applied now; refused if the cluster changes before you confirm`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("set_prod_atlas_tier", fields, confirm, summary, () => setProdAtlasTier({ atlas: port }, { cluster, size, from, actor: ctx.login })));
     }),
 
   /** Live capacity (§N5.2): resize workloads + node groups ON EKS-Moly-staging

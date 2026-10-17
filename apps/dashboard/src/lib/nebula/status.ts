@@ -28,6 +28,10 @@ export const STATUS_WORDS = [
   "UNONBOARDED",
   // N4: release-train tier
   "STAGING",
+  // N6: monitor signals (headroom left / getting tight / act now)
+  "OK",
+  "WATCH",
+  "HOT",
 ] as const;
 
 export type StatusWord = (typeof STATUS_WORDS)[number];
@@ -44,6 +48,7 @@ export function toneOf(word: StatusWord): Tone {
     case "STAGING":
       return "ion";
     case "DEPLOYED":
+    case "OK":
       return "pass";
     case "UNONBOARDED":
       return "pending";
@@ -55,12 +60,14 @@ export function toneOf(word: StatusWord): Tone {
     case "PASS":
       return "pass";
     case "FAIL":
+    case "HOT":
     case "EXPIRED":
     case "DENIED":
       return "fail";
     case "RUNNING":
     case "PENDING":
     case "EXPIRING":
+    case "WATCH":
       return "pending";
     case "AWAITING HUMAN":
       return "ember";

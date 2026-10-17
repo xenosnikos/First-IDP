@@ -137,6 +137,21 @@ write_tools:
       instanceSize: ["M10", "M20", "M30", "M40"]
       autoScaling: ["*"]
 
+  # Prod Atlas tier (docs/NEBULA.md §N5.3). Platform-owner decision 2026-10-16:
+  # ops resize the prod MongoDB clusters ahead of traffic. `tier` and `cluster`
+  # are the ONLY fields exempted from global_deny (their values necessarily say
+  # "prod"); the cluster allowlist is exact. Code bounds every call further:
+  # +2 / -1 tier per change, IDLE only, auto-scaling kept on/off, and `from`
+  # (the tier the human reviewed) must still be what runs.
+  set_prod_atlas_tier:
+    exempt_global_deny: [tier, cluster]
+    allow:
+      tier: ["production"]
+      cluster: ["Moly-Prod", "Prod-Shift4"]
+      instanceSize: ["M10", "M20", "M30", "M40", "M50", "M60", "M80", "M140", "M200"]
+      autoScaling: ["*"]
+      from: ["M*"]
+
   # ── Live capacity (docs/NEBULA.md §N5.2): EKS-Moly-staging + EKS-Moly-Prod ──
   # Platform-owner decision 2026-10-14: Nebula adjusts PROD capacity from the UI.
   # `tier: production` is the ONE value exempted from global_deny (this tool,

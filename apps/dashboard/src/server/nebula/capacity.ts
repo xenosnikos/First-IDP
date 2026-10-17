@@ -13,8 +13,11 @@ import {
   readCurrentTier,
   type CapacityTarget,
   type CurrentTier,
+  atlasMonthly,
+  isProdAtlasCluster,
+  prodAtlasOptions,
 } from "@twizz-idp/actions";
-import type { AtlasSize, CapacityTier } from "@twizz-idp/shared";
+import { ATLAS_TIERS, type AtlasSize, type AtlasTier, type CapacityTier } from "@twizz-idp/shared";
 import { namedEnvDeps } from "./deps";
 import { readCapacityKube, readClusterSnapshot } from "./kube";
 import { liveClusterPort } from "./live-cluster";
@@ -150,12 +153,29 @@ export async function readLive(tier: LiveTier): Promise<{ state: LiveState } | {
   }
 }
 
-/** Prod Atlas clusters (moly-prod, prod-shift4, …) from the prod Atlas account. Read-only. */
-export async function readProdAtlas(): Promise<{ clusters: Array<{ name: string; state: string; instanceSize: string; autoScaling?: { min: string; max: string } }> } | { error: string }> {
+/** The prod Atlas account (ATLAS_PROD_*) as an AtlasClusters port; null = key not configured. */
+export function prodAtlasPort(): AtlasTierAdapter | null {
+  const svc = prodAtlasTierService();
+  return svc ? new AtlasTierAdapter(svc) : null;
+}
+
+type ProdAtlasRow = { name: string; state: string; instanceSize: string; autoScaling?: { min: string; max: string }; resizable: boolean; options: AtlasTier[]; monthly?: number };
+
+/** Prod Atlas clusters (Moly-Prod, Prod-Shift4) from the prod Atlas account,
+ * with the tiers one gated change may move each to (§N5.3). */
+export async function readProdAtlas(): Promise<{ clusters: ProdAtlasRow[] } | { error: string }> {
   const svc = prodAtlasTierService();
   if (!svc) return { error: "prod Atlas key not configured (ATLAS_PROD_PUBLIC_KEY / _PRIVATE_KEY / _PROJECT_ID in SM preview/nebula)" };
   try {
-    return { clusters: await svc.listClusterTiers() };
+    const rows = await svc.listClusterTiers();
+    return {
+      clusters: rows.map((c) => {
+        const tier = (ATLAS_TIERS as readonly string[]).includes(c.instanceSize) ? (c.instanceSize as AtlasTier) : null;
+        const known = (x: string) => (ATLAS_TIERS as readonly string[]).includes(x);
+        const resizable = !!tier && isProdAtlasCluster(c.name) && (!c.autoScaling || (known(c.autoScaling.min) && known(c.autoScaling.max)));
+        return { ...c, resizable, options: resizable && tier ? prodAtlasOptions(tier) : [], monthly: tier ? atlasMonthly(tier) : undefined };
+      }),
+    };
   } catch (e) {
     return { error: errMsg(e) };
   }

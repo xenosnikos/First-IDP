@@ -317,7 +317,7 @@ export class AtlasTierAdapter implements AtlasClusters {
   constructor(
     private readonly svc: {
       getClusterTier(name: string): Promise<{ state: string; instanceSize: string; autoScaling?: { min: string; max: string } } | null>;
-      updateClusterTier(name: string, size: AtlasSize): Promise<{ state: string }>;
+      updateClusterTier(name: string, size: AtlasSize, expect?: AtlasSize): Promise<{ state: string }>;
     },
   ) {}
 
@@ -332,10 +332,13 @@ export class AtlasTierAdapter implements AtlasClusters {
     if (!instanceSize) throw new Error(`Atlas ${cluster} is on ${c.instanceSize}, not a dedicated tier Nebula sizes (${ATLAS_TIERS.join("/")})`);
     const min = c.autoScaling && AtlasTierAdapter.tier(c.autoScaling.min);
     const max = c.autoScaling && AtlasTierAdapter.tier(c.autoScaling.max);
+    // never read auto-scaling as "off" because its bounds are tiers we don't model:
+    // a resize built from that read would switch auto-scaling off
+    if (c.autoScaling && !(min && max)) throw new Error(`Atlas ${cluster} auto-scales ${c.autoScaling.min}–${c.autoScaling.max}, outside the tiers Nebula sizes (${ATLAS_TIERS.join("/")})`);
     return { state: c.state, instanceSize, autoScaling: min && max ? { min, max } : undefined };
   }
 
-  setTier(cluster: string, size: AtlasSize) {
-    return this.svc.updateClusterTier(cluster, size);
+  setTier(cluster: string, size: AtlasSize, expect?: AtlasSize) {
+    return this.svc.updateClusterTier(cluster, size, expect);
   }
 }

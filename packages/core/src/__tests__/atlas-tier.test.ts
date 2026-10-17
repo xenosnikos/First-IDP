@@ -93,6 +93,16 @@ describe("Atlas tier on the live cluster shape", () => {
     expect(rc.analyticsSpecs.instanceSize).toBe("M10");
     expect(rc.analyticsAutoScaling.compute.maxInstanceSize).toBe("M20");
   });
+
+  it("keeps a deliberate scale-down OFF when resizing an auto-scaled cluster", () => {
+    const pinned = structuredClone(LIVE);
+    pinned.replicationSpecs[0].regionConfigs[0].autoScaling.compute.scaleDownEnabled = false;
+    const rc = tierPatch(pinned, { instanceSize: "M30", autoScaling: { min: "M20", max: "M40" } }).replicationSpecs[0].regionConfigs[0];
+    expect(rc.autoScaling.compute).toEqual({ enabled: true, scaleDownEnabled: false, minInstanceSize: "M20", maxInstanceSize: "M40" });
+    // turning auto-scaling on where it was off defaults scale-down on (unchanged behaviour)
+    const fresh = tierPatch(CLUSTER, { instanceSize: "M20", autoScaling: { min: "M10", max: "M30" } }).replicationSpecs[0].regionConfigs[0];
+    expect(fresh.autoScaling.compute.scaleDownEnabled).toBe(true);
+  });
 });
 
 describe("Digest auth", () => {

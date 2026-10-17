@@ -720,5 +720,45 @@ and refuses unless the plan is byte-identical to the one confirmed (`planHash` b
   EKS-Moly-staging (ns default/jobs) IS the desired configuration; Nebula shows it and changes it
   only through the editor. The `live:` preset schema stays supported but capacity/presets.yaml
   carries none.
-- **Atlas**: staging uses NonProd-Twizz (shared). Prod is moly-prod + prod-shift4 in another Atlas
-  account — read once `ATLAS_PROD_*` exist (`scripts/nebula-set-atlas-keys.sh --prod`).
+- **Atlas**: staging uses NonProd-Twizz (shared). Prod is Moly-Prod + Prod-Shift4 in another Atlas
+  account (project "Loly" `64a3f2d23e82167aa3f7f66e`, key "Nebula" = Project Cluster Manager,
+  `ATLAS_PROD_*` in SM preview/nebula since 2026-10-16) — resized per §N5.3.
+
+### N5.3 — Prod Atlas tier (2026-10-16)
+
+Platform-owner decision: ops resize the prod MongoDB clusters from Nebula ahead of anticipated
+traffic, without a devops hand-off. /capacity → Prod → "atlas · prod account": per cluster, pick a
+tier (and the auto-scaling bounds where auto-scaling is on) → **Plan** (fresh read) → **Resize**
+(operators, two-step confirm, AuditLog `nebula.set_prod_atlas_tier`).
+
+- **Rules** (`packages/actions/src/prod-atlas.ts`): clusters allowlisted (Moly-Prod, Prod-Shift4 —
+  in code AND policy.yaml `set_prod_atlas_tier`, whose `tier`/`cluster` are the only fields exempt
+  from global_deny); one cluster per change; at most +2 tiers up / −1 down (range M10–M200); IDLE
+  only; compute auto-scaling stays on/off as configured (bounds editable; the tier must sit inside
+  them; ceiling cut ≤ 1 tier); an existing `scaleDownEnabled` choice is kept (core `tierPatch`);
+  the nonce binds `from` (the tier reviewed) and the action re-reads and refuses if it moved.
+- **Warnings shown in the plan**: rolling node-by-node change with one primary election (seconds
+  of write retries — do it ahead of traffic, not at peak); downsizing = less RAM; on an
+  auto-scaled cluster, raise the floor (min) too or Atlas may scale back down after low load.
+- Cost is Atlas list price per cluster (capacity-prices.ts), shown as a delta, not a bill.
+
+## N6 — Monitor: prod + staging at a glance (2026-10-16)
+
+`/monitor` — one page so ops can see pressure and headroom without devops watching CloudWatch,
+Atlas and kubectl. Read-only for every signed-in user; "Scale on /capacity →" for the fix.
+Refreshes every 60 s (paused in background tabs); windows 15m / 1h / 6h / 24h.
+
+- **Pressure board** (`server/nebula/monitor-model.ts` `deriveSignals`, unit-tested): requests,
+  5xx rate (≥1 % WATCH, ≥5 % HOT), p95 latency (≥1 s / ≥3 s), node CPU (≥70 / ≥85 %, or a node
+  ≥90 %), node memory (≥75 / ≥90 %), node headroom (WATCH when a group's desired = max), workloads
+  (not fully ready / restarts), per Atlas cluster CPU (≥60 / ≥80 %) + connections vs tier max
+  (≥70 / ≥90 %) + query targeting ≥1000 (an index hint, WATCH only). Data older than 6 min is
+  UNKNOWN, never OK. Words: OK / WATCH / HOT (status.ts).
+- **Sources** (`server/nebula/monitor.ts`), all with access Nebula already had:
+  traffic = prod ALB `app/k8s-internalingressgr-*` (found via ListMetrics; per target group =
+  per service), staging = classic ELB `ada851bd…` (TCP pass-through: requests + 5xx, no latency);
+  CPU/memory = Container Insights (node + per-deployment `PodName`: total cores, hottest pod,
+  working set, pods, restarts); pods ready/desired + node groups = the live kube read (§N5.2);
+  database = Atlas measurements on each cluster's primary (prod key / NonProd key for staging).
+- **Freshness / cost**: CloudWatch 1-min data lags ~1–2 min. One snapshot per (tier, window) is
+  cached 30 s and shared by all viewers; a prod snapshot is ~50 GetMetricData metrics (≈ $0.0005).
