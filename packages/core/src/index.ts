@@ -7,3 +7,4 @@ export * from "./vercel";
 export * from "./atlas";
 export * from "./introspect";
 export * from "./eks-auth";
+export * from "./metrics";

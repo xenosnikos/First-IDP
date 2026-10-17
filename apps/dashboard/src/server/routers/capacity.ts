@@ -1,10 +1,10 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
-import { CAPACITY_TIERS, EstimateInput, TierSize, type CapacityTier } from "@twizz-idp/shared";
-import { LIVE_TARGETS, describeLiveOp, estimateTier, exportPlan, hashSize, isLiveTier, listCapacityPrs, liveAsSize, nearestPreset, planCapacity, planLive } from "@twizz-idp/actions";
+import { AtlasSize, CAPACITY_TIERS, EstimateInput, TierSize, type CapacityTier } from "@twizz-idp/shared";
+import { LIVE_TARGETS, PROD_ATLAS, describeLiveOp, planProdAtlas, estimateTier, exportPlan, hashSize, isLiveTier, listCapacityPrs, liveAsSize, nearestPreset, planCapacity, planLive } from "@twizz-idp/actions";
 import { router, protectedProcedure } from "../trpc";
 import { namedEnvDeps } from "../nebula/deps";
-import { currentFor, nodePoolUsedCpu, observe, presetsAndProfiles, readLive, readProdAtlas, targetFor } from "../nebula/capacity";
+import { currentFor, nodePoolUsedCpu, observe, presetsAndProfiles, prodAtlasPort, readLive, readProdAtlas, targetFor } from "../nebula/capacity";
 
 // Capacity page (docs/NEBULA.md §N5). QUERIES ONLY: presets, the current
 // state per tier, a plan (diff + cost + export) and the traffic calculator.
@@ -91,6 +91,15 @@ export const capacityRouter = router({
       }
     }
     return { ...rest, label, size, sizeHash: hashSize(size), files: Object.keys(files), writable: t.writable, exportYaml: exportPlan(plan), live };
+  }),
+
+  /** What resizing ONE prod Atlas cluster would do, against a fresh read (§N5.3). */
+  prodAtlasPlan: protectedProcedure.input(z.object({ cluster: z.enum(PROD_ATLAS.clusters), size: AtlasSize })).query(async ({ input }) => {
+    const port = prodAtlasPort();
+    if (!port) throw new TRPCError({ code: "PRECONDITION_FAILED", message: "prod Atlas key not configured" });
+    const before = await port.getTier(input.cluster);
+    if (!before) throw new TRPCError({ code: "NOT_FOUND", message: `Atlas cluster ${input.cluster} not found` });
+    return planProdAtlas(input.cluster, before, input.size);
   }),
 
   /** Traffic calculator: rps → a custom size + the nearest named preset. */

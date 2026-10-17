@@ -4,6 +4,9 @@ const ATLAS_PUBLIC_KEY = process.env.ATLAS_PUBLIC_KEY ?? "";
 const ATLAS_PRIVATE_KEY = process.env.ATLAS_PRIVATE_KEY ?? "";
 const ATLAS_PROJECT_ID = process.env.ATLAS_PROJECT_ID ?? "";
 const ATLAS_API = "https://cloud.mongodb.com/api/atlas/v2";
+/** processes + measurements are served on the 2023-01-01 API version */
+const MEASURE_ACCEPT = "application/vnd.atlas.2023-01-01+json";
+const ATLAS_TIMEOUT_MS = 15_000;
 
 /** Parse a `WWW-Authenticate: Digest k="v", k2=v2` challenge. */
 export function parseDigestChallenge(header: string): Record<string, string> {
@@ -44,7 +47,9 @@ async function atlasFetch(path: string, options: RequestInit = {}, creds: AtlasC
     ...(options.headers as Record<string, string> | undefined),
   };
   // Digest is challenge/response: the first call earns the nonce, the second is authenticated.
-  let res = await fetch(url, { ...options, headers });
+  // Every call is hard-timed: a hung Atlas must never hang a Nebula request.
+  const timed = () => ({ signal: options.signal ?? AbortSignal.timeout(ATLAS_TIMEOUT_MS) });
+  let res = await fetch(url, { ...options, ...timed(), headers });
   const challenge = res.status === 401 ? res.headers.get("www-authenticate") : null;
   if (challenge && /^Digest/i.test(challenge)) {
     await res.text();
@@ -56,7 +61,7 @@ async function atlasFetch(path: string, options: RequestInit = {}, creds: AtlasC
       challenge: parseDigestChallenge(challenge),
       cnonce: randomBytes(8).toString("hex"),
     });
-    res = await fetch(url, { ...options, headers: { ...headers, Authorization: authorization } });
+    res = await fetch(url, { ...options, ...timed(), headers: { ...headers, Authorization: authorization } });
   }
 
   if (!res.ok) {
@@ -160,8 +165,11 @@ export function tierPatch(c: any, size: { instanceSize: string; autoScaling?: { 
     replicationSpecs: (c.replicationSpecs ?? []).map((r: any) => ({
       ...r,
       regionConfigs: (r.regionConfigs ?? []).map((rc: any) => {
+        // an existing auto-scaling setup keeps its scale-down choice (prod may pin it off)
+        const was = rc.autoScaling?.compute;
+        const scaleDown = was?.enabled ? was.scaleDownEnabled !== false : true;
         const compute = size.autoScaling
-          ? { enabled: true, scaleDownEnabled: true, minInstanceSize: size.autoScaling.min, maxInstanceSize: size.autoScaling.max }
+          ? { enabled: true, scaleDownEnabled: scaleDown, minInstanceSize: size.autoScaling.min, maxInstanceSize: size.autoScaling.max }
           : { enabled: false, scaleDownEnabled: false };
         // No analytics nodes (nodeCount 0): keep their spec + auto-scaling in
         // lockstep with the electable tier so Atlas never sees mismatched
@@ -200,11 +208,46 @@ export class AtlasTierService {
     }
   }
 
+  /** The primary (+ secondaries) of a replica-set cluster, matched by the
+   * replica set name in its standard connection string. */
+  async clusterProcesses(clusterName: string): Promise<{ primary?: string; processes: Array<{ id: string; typeName: string }> }> {
+    const c = await atlasFetch(`/groups/${this.creds.projectId}/clusters/${encodeURIComponent(clusterName)}`, {}, this.creds);
+    const rs = /[?&]replicaSet=([^&]+)/.exec(String(c.connectionStrings?.standard ?? ""))?.[1];
+    if (!rs) return { processes: [] };
+    const data = await atlasFetch(`/groups/${this.creds.projectId}/processes?itemsPerPage=500`, { headers: { Accept: MEASURE_ACCEPT } }, this.creds);
+    const processes = ((data.results ?? []) as any[])
+      .filter((p) => p.replicaSetName === rs)
+      .map((p) => ({ id: String(p.id), typeName: String(p.typeName) }));
+    return { primary: processes.find((p) => p.typeName === "REPLICA_PRIMARY")?.id, processes };
+  }
+
+  /** Per-minute (or coarser) measurements of one process: name → [epochMs, value][] ascending, nulls dropped. */
+  async processMeasurements(processId: string, o: { granularity: "PT1M" | "PT5M" | "PT1H"; period: string; metrics: readonly string[] }): Promise<Record<string, Array<[number, number]>>> {
+    const qs = new URLSearchParams({ granularity: o.granularity, period: o.period });
+    for (const m of o.metrics) qs.append("m", m);
+    const data = await atlasFetch(`/groups/${this.creds.projectId}/processes/${encodeURIComponent(processId)}/measurements?${qs}`, { headers: { Accept: MEASURE_ACCEPT } }, this.creds);
+    const out: Record<string, Array<[number, number]>> = {};
+    for (const m of (data.measurements ?? []) as any[]) {
+      out[m.name] = ((m.dataPoints ?? []) as any[]).filter((d) => typeof d.value === "number").map((d) => [Date.parse(d.timestamp), d.value] as [number, number]);
+    }
+    return out;
+  }
+
   /** Resize a DEDICATED cluster. Callers gate this (policy + nonce + audit). */
-  async updateClusterTier(clusterName: string, size: { instanceSize: string; autoScaling?: { min: string; max: string } }): Promise<{ state: string }> {
+  async updateClusterTier(
+    clusterName: string,
+    size: { instanceSize: string; autoScaling?: { min: string; max: string } },
+    /** the tier the caller checked; the PATCH is built from a fresh read and refused if it moved */
+    expect?: { instanceSize: string; autoScaling?: { min: string; max: string } },
+  ): Promise<{ state: string }> {
     const path = `/groups/${this.creds.projectId}/clusters/${encodeURIComponent(clusterName)}`;
     const current = await atlasFetch(path, {}, this.creds);
-    if (!/^M\d+$/.test(tierOf(current).instanceSize)) throw new Error(`${clusterName} is a shared/flex tier (${tierOf(current).instanceSize}) — upgrade it to a dedicated tier in the Atlas UI first`);
+    const now = tierOf(current);
+    if (!/^M\d+$/.test(now.instanceSize)) throw new Error(`${clusterName} is a shared/flex tier (${now.instanceSize}) — upgrade it to a dedicated tier in the Atlas UI first`);
+    if (now.state !== "IDLE") throw new Error(`${clusterName} is ${now.state} — not resized`);
+    if (expect && JSON.stringify({ i: now.instanceSize, a: now.autoScaling ?? null }) !== JSON.stringify({ i: expect.instanceSize, a: expect.autoScaling ?? null })) {
+      throw new Error(`${clusterName} changed while resizing (now ${now.instanceSize}) — not resized`);
+    }
     const updated = await atlasFetch(path, { method: "PATCH", body: JSON.stringify(tierPatch(current, size)) }, this.creds);
     return { state: updated.stateName ?? "UPDATING" };
   }

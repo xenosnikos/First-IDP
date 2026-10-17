@@ -12,7 +12,7 @@ docs/NEBULA.md §N3.7) is self-service for any signed-in user; `teardownNamedEnv
 `extendNamedEnv`, `setEnvVars`, `rebuildFromRef` are owner-or-operator (`ownedEnv()`, denial
 audited); `promoteRelease` / `mergePromotion` (release train, docs/NEBULA.md §N4: a gitops PR
 to the staging tier, then a sha-guarded merge) are operator-only, as are `applyCapacityPreset` /
-`mergeCapacityPr` / `setAtlasTier` (capacity, docs/NEBULA.md §N5; prod is plan/export only). Every one then goes through `@twizz-idp/actions` `createGate` (policy.yaml →
+`mergeCapacityPr` / `setAtlasTier` / `applyLiveCapacity` / `setProdAtlasTier` (capacity, docs/NEBULA.md §N5–§N5.3). Every one then goes through `@twizz-idp/actions` `createGate` (policy.yaml →
 `PrismaNonceStore` two-step confirm → action → `AuditLog` row). Secret VALUES never enter
 gate fields, summaries, audit rows, results or git — `createEnvFromRepo` refuses them on the
 request call and accepts them only with the nonce. Never add a mutation that bypasses the
@@ -40,7 +40,8 @@ a 401. Never build a `GitHubService` from `session.accessToken` directly.
 release-image drawer for operators; non-prod tier only), `/environments/topology` the pre-Nebula
 introspection map, `/projects` (kind column + "Spin up"), `/clusters` (Observer), `/pipelines`,
 `/releases` the release train (`components/releases/release-train.tsx`), `/capacity` the capacity
-planner (`components/capacity/capacity-view.tsx`).
+planner (`components/capacity/capacity-view.tsx`), `/monitor` the read-only prod/staging monitor
+(`components/monitor/monitor-view.tsx`, server `server/nebula/monitor.ts` + pure `monitor-model.ts`, §N6).
 
 ## Tests
 `pnpm --filter @twizz-idp/dashboard test` (vitest): status-word mapping, operator

@@ -9,6 +9,7 @@ import { clustersRouter } from "./clusters";
 import { nebulaRouter } from "./nebula";
 import { observerRouter } from "./observer";
 import { capacityRouter } from "./capacity";
+import { monitorRouter } from "./monitor";
 
 export const appRouter = router({
   project: projectRouter,
@@ -25,6 +26,8 @@ export const appRouter = router({
   observer: observerRouter,
   // §N5: capacity presets, plans and the traffic calculator (queries; writes are in `actions`)
   capacity: capacityRouter,
+  // §N6: consolidated near-real-time view of the Moly clusters (queries only)
+  monitor: monitorRouter,
 });
 
 export type AppRouter = typeof appRouter;

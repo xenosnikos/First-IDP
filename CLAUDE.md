@@ -33,7 +33,8 @@ and the strictly-authorized MCP toolset. See STATE.md for phase status.
 | `/pipelines` | Recent pipeline runs |
 | `/pipelines/[runId]` | Step timeline + log viewer (points at GitHub Actions from Phase 3) |
 | `/clusters` | Pods + logs across all three clusters (observe-only for staging/prod); URL-addressable log queries; the Observer panel |
-| `/capacity` | Capacity (docs/NEBULA.md §N5): per tier (NonProd/Staging/Prod) presets + traffic calculator → diff, cost, export; Open PR / Merge / Atlas tier (operators, gated; prod plan-only) |
+| `/capacity` | Capacity (docs/NEBULA.md §N5): NonProd/staging-sentinel presets + calculator → gitops PR; staging/prod live sizing editor (§N5.2); prod Atlas tier (§N5.3) — operators, gated |
+| `/monitor` | Monitor (docs/NEBULA.md §N6): prod + staging traffic, CPU/memory, pods, node headroom, Atlas — OK/WATCH/HOT board, 60 s refresh, read-only |
 | `/releases` | Release train (docs/NEBULA.md §N4): per service on the train, ECR candidates, what staging runs, open promotion PRs; Promote / Merge (operators, gated) |
 
 The deploy wizard and release board were removed (GitOps replaces both). The Nebula
@@ -76,9 +77,11 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
   tier, §N4) + `listReleaseTrain` (read), `applyCapacityPreset`/`mergeCapacityPr`/`setAtlasTier`
   (operators; capacity PR on gitops, NonProd Atlas tier, §N5)
 - `capacity` - overview, tier, plan, estimate (queries; presets/profiles from twizz-gitops `capacity/`;
-  staging/prod `live` = straight from the cluster via `server/nebula/live-cluster.ts`)
+  staging/prod `live` = straight from the cluster via `server/nebula/live-cluster.ts`; `prodAtlasPlan`)
+- `monitor` - snapshot({tier, window}) (queries only; `server/nebula/monitor.ts`, 30 s shared cache)
 - `actions.applyLiveCapacity` - operators; resizes workloads + node groups ON EKS-Moly-staging/Prod
-  (`@twizz-idp/actions` live-capacity.ts: pair rule, ×3/×0.5 step limits, caps, never delete; nonce binds planHash)
+  (`@twizz-idp/actions` live-capacity.ts: pair advisory, ×3/×0.5 step limits, caps, never delete; nonce binds planHash)
+- `actions.setProdAtlasTier` - operators; resizes ONE prod Atlas cluster (prod-atlas.ts: allowlist, +2/−1 tier, IDLE, nonce binds `from`)
 
 ## Auth / RBAC
 
@@ -91,7 +94,7 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
   or the `ALLOWED_GITHUB_LOGINS` allowlist (what actually admits people today). Upserts
   `User`, writes an `AuditLog` row per attempt. In-cluster sign-in uses the GitHub App
   `twizz-nebula` (client `Iv23liulodACgG6rqlKr`); `NEBULA_OPERATORS` gates writes.
-- Middleware matcher covers `/projects`, `/environments`, `/pipelines`.
+- Middleware matcher covers `/projects`, `/environments`, `/pipelines`, `/clusters`, `/releases`, `/capacity`, `/monitor`.
 - Every write anywhere (dashboard or MCP) must create an `AuditLog` row. Observer runs
   (an LLM call is cost-bearing) write one too: `nebula.observer.<kind>`.
 - User management (Nebula sign-in allowlist, operators, VPN, SSO gates): see the
@@ -151,7 +154,7 @@ naming alias). Phase 3 adds EKS-Twizz-NonProd `pr-*` namespaces + Argo CD app he
 - **GitHub orgs**: `twizz-app` (canonical, new repos), `MymTwo` (Moly-backend, frontend)
 - **GitHub sign-in**: GitHub App `twizz-nebula` (client `Iv23liulodACgG6rqlKr`) in-cluster; legacy OAuth app `Ov23lirMDHUPPYwRkz5A` for local dev
 - **Vercel Team**: Loly (`team_ocn3vwvvs3VDxcjxNcY7l8Mu`) — owns `frontend` project `prj_3Op05Dm743j4qscD37c6hpfHRnfD`
-- **MongoDB Atlas**: Project 684296275fe8cc27d7b99d9b (public key iydvdumt); nonprod cluster `NonProd-Twizz` (Digest auth; staging uses it too). Prod Atlas (moly-prod, prod-shift4) is another Atlas account: `ATLAS_PROD_*`
+- **MongoDB Atlas**: Project 684296275fe8cc27d7b99d9b (public key iydvdumt); nonprod cluster `NonProd-Twizz` (Digest auth; staging uses it too). Prod Atlas (Moly-Prod, Prod-Shift4) is another Atlas account, project "Loly" 64a3f2d23e82167aa3f7f66e: `ATLAS_PROD_*`, resizable via `set_prod_atlas_tier` (§N5.3)
 - **CloudWatch Logs**: `/aws/containerinsights/{cluster}/application` (pod logs), `/performance` (metrics)
 - **Kubeconfigs**: per-cluster files `~/.kube/twizz-*.yaml` (aliases `ktw-staging`, `ktw-prod`);
   never merge Twizz contexts into the default kubeconfig

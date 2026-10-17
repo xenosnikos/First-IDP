@@ -679,7 +679,8 @@ export async function mergeCapacityPr(
 
 export interface AtlasClusters {
   getTier(cluster: string): Promise<(AtlasSize & { state: string }) | null>;
-  setTier(cluster: string, size: AtlasSize): Promise<{ state: string }>;
+  /** `expect`: the tier the caller checked; refused if the cluster moved since */
+  setTier(cluster: string, size: AtlasSize, expect?: AtlasSize): Promise<{ state: string }>;
 }
 
 /** Change the Atlas tier of a WRITABLE tier's linked cluster (NonProd only).
@@ -693,7 +694,7 @@ export async function setAtlasTier(deps: { atlas: AtlasClusters }, input: { tier
   if (!before) throw new Error(`Atlas cluster ${t.atlas.cluster} not found`);
   if (before.state !== "IDLE") throw new Error(`Atlas cluster ${t.atlas.cluster} is ${before.state} — wait for IDLE before resizing`);
   if (atlasEq(before, input.size)) throw new Error(`${t.atlas.cluster} is already ${fmtAtlas(input.size)}`);
-  const r = await deps.atlas.setTier(t.atlas.cluster, input.size);
+  const r = await deps.atlas.setTier(t.atlas.cluster, input.size, { instanceSize: before.instanceSize, autoScaling: before.autoScaling });
   return { cluster: t.atlas.cluster, from: fmtAtlas(before), to: fmtAtlas(input.size), state: r.state };
 }
 

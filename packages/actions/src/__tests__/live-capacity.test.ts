@@ -169,7 +169,7 @@ describe("applyLive", () => {
   });
 });
 
-describe("policy.yaml: the prod exemption is exactly one tool, one field", async () => {
+describe("policy.yaml: prod exemptions are exactly two tools, named fields", async () => {
   const { evaluatePolicy, loadPolicyFile } = await import("../policy");
   const policy = loadPolicyFile(new URL("../../../../apps/mcp/policy.yaml", import.meta.url).pathname);
   it("apply_live_capacity may name tier=production", () => {
@@ -185,6 +185,15 @@ describe("policy.yaml: the prod exemption is exactly one tool, one field", async
     expect(evaluatePolicy(policy, "apply_capacity_preset", { tier: "production", preset: "peak", sizeHash: "ab" })).toMatchObject({ allowed: false, reason: expect.stringMatching(/global deny/) });
     expect(evaluatePolicy(policy, "promote_release", { service: "twizz-sentinel", target: "production", imageTag: "main-1" })).toMatchObject({ allowed: false, reason: expect.stringMatching(/global deny/) });
     expect(evaluatePolicy(policy, "set_atlas_tier", { tier: "production", instanceSize: "M20", autoScaling: "off" }).allowed).toBe(false);
+  });
+  it("set_prod_atlas_tier: tier + cluster exempt, exact cluster allowlist, other fields still checked", () => {
+    const ok = { tier: "production", cluster: "Moly-Prod", instanceSize: "M80", autoScaling: "off", from: "M60" };
+    expect(evaluatePolicy(policy, "set_prod_atlas_tier", ok).allowed).toBe(true);
+    expect(evaluatePolicy(policy, "set_prod_atlas_tier", { ...ok, cluster: "Prod-Shift4", autoScaling: "M30-M40" }).allowed).toBe(true);
+    expect(evaluatePolicy(policy, "set_prod_atlas_tier", { ...ok, cluster: "Moly-Prod-2" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "set_prod_atlas_tier", { ...ok, tier: "staging" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "set_prod_atlas_tier", { ...ok, instanceSize: "M400" }).allowed).toBe(false);
+    expect(evaluatePolicy(policy, "set_prod_atlas_tier", { ...ok, autoScaling: "prod" })).toMatchObject({ allowed: false, reason: expect.stringMatching(/global deny/) });
   });
 });
 

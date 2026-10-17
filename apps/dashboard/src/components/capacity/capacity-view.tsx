@@ -23,7 +23,9 @@ type CapAction =
   | { kind: "apply"; tier: WritableTier; label: string; preset?: string; custom?: TierSize }
   | { kind: "merge"; tier: WritableTier; label: string; prNumber: number; headSha: string }
   | { kind: "atlas"; size: AtlasSize }
-  | { kind: "live"; tier: LiveTier; label: string; preset?: string; custom?: TierSize; planHash: string };
+  | { kind: "live"; tier: LiveTier; label: string; preset?: string; custom?: TierSize; planHash: string }
+  | { kind: "prodAtlas"; cluster: ProdAtlasCluster; size: AtlasSize; from: string };
+type ProdAtlasCluster = "Moly-Prod" | "Prod-Shift4";
 type LiveTier = "staging" | "production";
 
 type ApplyResult = { prNumber: number; prUrl: string; existing: boolean; files: string[]; branch: string };
@@ -84,15 +86,17 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
   const merge = trpc.actions.mergeCapacityPr.useMutation();
   const atlas = trpc.actions.setAtlasTier.useMutation();
   const liveApply = trpc.actions.applyLiveCapacity.useMutation();
+  const prodAtlas = trpc.actions.setProdAtlasTier.useMutation();
   const run = useCallback(
     async (args: { action: CapAction; confirm?: string }): Promise<GateResult> => {
       const { action: a, confirm } = args;
       if (a.kind === "apply") return (await apply.mutateAsync({ tier: a.tier, preset: a.preset, custom: a.custom, confirm })) as GateResult;
       if (a.kind === "merge") return (await merge.mutateAsync({ tier: a.tier, label: a.label, prNumber: a.prNumber, headSha: a.headSha, confirm })) as GateResult;
       if (a.kind === "live") return (await liveApply.mutateAsync({ tier: a.tier, preset: a.preset, custom: a.custom, planHash: a.planHash, confirm })) as GateResult;
+      if (a.kind === "prodAtlas") return (await prodAtlas.mutateAsync({ cluster: a.cluster, size: a.size, from: a.from, confirm })) as GateResult;
       return (await atlas.mutateAsync({ tier: "preview", size: a.size, confirm })) as GateResult;
     },
-    [apply, merge, atlas, liveApply],
+    [apply, merge, atlas, liveApply, prodAtlas],
   );
   const gated = useGatedAction<{ action: CapAction }, ApplyResult | MergeResult | AtlasResult | LiveResult>(run);
   const start = (a: CapAction) => {
@@ -124,9 +128,11 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
         ? `Merge capacity PR #${action.prNumber}`
         : action?.kind === "live"
           ? `Resize ${CAPACITY_TIER_LABEL[action.tier]} live → "${action.label}"`
-          : action
-            ? `Resize NonProd Atlas → ${action.size.instanceSize}`
-            : "";
+          : action?.kind === "prodAtlas"
+            ? `Resize PROD Atlas ${action.cluster} → ${action.size.instanceSize}`
+            : action
+              ? `Resize NonProd Atlas → ${action.size.instanceSize}`
+              : "";
   const liveTier = tier === "staging" || tier === "production" ? (tier as LiveTier) : null;
 
   return (
@@ -218,6 +224,10 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
               seed={(choice?.mode === "preset" ? presets.find((p) => p.name === choice.name)?.tiers[tier]?.live : undefined) ?? tierQ.data.live.baseline}
               onPlan={(live) => setChoice({ mode: "custom", size: { services: {}, live } })}
             />
+          )}
+
+          {tier === "production" && tierQ.data?.prodAtlas && "clusters" in tierQ.data.prodAtlas && (
+            <ProdAtlasEditor clusters={tierQ.data.prodAtlas.clusters} operator={operator} onApply={(a) => start(a)} />
           )}
         </Section>
 
@@ -553,6 +563,84 @@ function EstimateBox({ e, onUse, onPreset }: { e: EstimateView; onUse: (s: TierS
         <Button variant="ion" onClick={() => onUse(e.size)}>Plan this estimate</Button>
         {e.nearest && <Button onClick={() => onPreset(e.nearest!)}>Closest preset: {e.nearest}</Button>}
       </div>
+    </div>
+  );
+}
+
+type ProdAtlasRow = Extract<NonNullable<TierView["prodAtlas"]>, { clusters: unknown }>["clusters"][number];
+const ATLAS_ORDER = ["M10", "M20", "M30", "M40", "M50", "M60", "M80", "M140", "M200"] as const;
+type Tier = (typeof ATLAS_ORDER)[number];
+
+/** Prod Atlas (§N5.3): pick a tier one step away (+2 / -1), keep auto-scaling
+ * as configured (bounds editable), plan against a fresh read, then gate. */
+function ProdAtlasEditor({ clusters, operator, onApply }: { clusters: ProdAtlasRow[]; operator: boolean; onApply: (a: Extract<CapAction, { kind: "prodAtlas" }>) => void }) {
+  return (
+    <div style={{ marginTop: 18 }}>
+      <div style={{ ...label, margin: "0 0 8px" }}>atlas · prod account · one cluster per change</div>
+      {clusters.map((c) => (
+        // keyed on what runs: if the cluster moves (or auto-scales), the row and its plan reset
+        <ProdAtlasRowEditor key={`${c.name}:${c.instanceSize}:${c.autoScaling?.min ?? ""}-${c.autoScaling?.max ?? ""}:${c.state}`} c={c} operator={operator} onApply={onApply} />
+      ))}
+    </div>
+  );
+}
+
+function ProdAtlasRowEditor({ c, operator, onApply }: { c: ProdAtlasRow; operator: boolean; onApply: (a: Extract<CapAction, { kind: "prodAtlas" }>) => void }) {
+  const cur = c.instanceSize as Tier;
+  const [size, setSize] = useState<Tier>(cur);
+  const [min, setMin] = useState<Tier>((c.autoScaling?.min as Tier) ?? cur);
+  const [max, setMax] = useState<Tier>((c.autoScaling?.max as Tier) ?? cur);
+  const [ask, setAsk] = useState<AtlasSize | null>(null);
+  const from = `${c.instanceSize}${c.autoScaling ? ` (auto ${c.autoScaling.min}–${c.autoScaling.max})` : ""}`;
+  const desired: AtlasSize = { instanceSize: size, ...(c.autoScaling ? { autoScaling: { min, max } } : {}) };
+  const changed = JSON.stringify(desired) !== JSON.stringify({ instanceSize: cur, ...(c.autoScaling ? { autoScaling: c.autoScaling } : {}) });
+  const planQ = trpc.capacity.prodAtlasPlan.useQuery({ cluster: c.name as ProdAtlasCluster, size: ask ?? desired }, { enabled: !!ask, retry: false });
+  const sel: CSSProperties = { ...inputStyle, width: 78, padding: "4px 6px" };
+  const reset = () => setAsk(null);
+  if (!c.resizable) {
+    return <div style={{ fontSize: 12, color: "var(--n-ink-muted)", marginBottom: 6 }}>{c.name}: {from} <span style={{ color: "var(--n-ink-faint)" }}>— not resizable from Nebula</span></div>;
+  }
+  const p = ask ? planQ.data : undefined;
+  return (
+    <div style={{ padding: "8px 0", borderTop: "1px solid var(--n-hairline)" }}>
+      <div style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, flexWrap: "wrap" }}>
+        <span style={{ flex: 1, minWidth: 120 }}>{c.name} <span style={{ color: "var(--n-ink-faint)" }}>{from} · {c.state}{c.monthly ? ` · ≈$${c.monthly.toLocaleString("en-US")}/mo` : ""}</span></span>
+        <select style={sel} aria-label={`${c.name} tier`} value={size} onChange={(e) => { setSize(e.target.value as Tier); reset(); }}>
+          {[cur, ...(c.options as Tier[])].sort((a, b) => ATLAS_ORDER.indexOf(a) - ATLAS_ORDER.indexOf(b)).map((t) => (
+            <option key={t} value={t}>{t}{t === cur ? " (now)" : ""}</option>
+          ))}
+        </select>
+        {c.autoScaling && (
+          <>
+            <span style={{ color: "var(--n-ink-muted)", fontSize: 11 }}>auto</span>
+            <select style={sel} aria-label={`${c.name} auto-scaling min`} value={min} onChange={(e) => { setMin(e.target.value as Tier); reset(); }}>
+              {ATLAS_ORDER.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>–
+            <select style={sel} aria-label={`${c.name} auto-scaling max`} value={max} onChange={(e) => { setMax(e.target.value as Tier); reset(); }}>
+              {ATLAS_ORDER.map((t) => <option key={t} value={t}>{t}</option>)}
+            </select>
+          </>
+        )}
+        <Button disabled={!changed} title={changed ? "plan against a fresh read of the cluster" : "pick a different tier first"} onClick={() => setAsk(desired)}>Plan</Button>
+      </div>
+      {ask && planQ.isLoading && <div style={{ fontSize: 11, color: "var(--n-ink-muted)", marginTop: 6 }}>reading {c.name}…</div>}
+      {ask && planQ.error && <div style={{ fontSize: 11, color: "var(--n-fail)", marginTop: 6 }}><Pill word="FAIL" /> {planQ.error.message}</div>}
+      {p && (
+        <div style={{ marginTop: 8, fontSize: 12 }}>
+          {p.violations.map((v) => <div key={v} style={{ fontSize: 11, color: "var(--n-fail)", marginBottom: 3 }}><Pill word="DENIED" /> {v}</div>)}
+          {p.changes.map((x) => <div key={x}>{x}</div>)}
+          {p.changes.length > 0 && <div style={{ color: "var(--n-ink-muted)", fontSize: 11 }}>≈ {usd(p.cost.before)} → <b>{usd(p.cost.after)}</b> /mo (list price)</div>}
+          {p.warnings.map((w) => <div key={w} style={{ fontSize: 11, color: "var(--n-pending)", marginTop: 3 }}>⚠ {w}</div>)}
+          <Button
+            variant="ion"
+            disabled={!operator || p.violations.length > 0}
+            title={!operator ? "operators only" : p.violations.length ? "refused — see above" : `resize ${c.name} now (Atlas API, two-step confirm)`}
+            onClick={() => ask && onApply({ kind: "prodAtlas", cluster: c.name as ProdAtlasCluster, size: ask, from })}
+          >
+            Resize {c.name}
+          </Button>
+        </div>
+      )}
     </div>
   );
 }

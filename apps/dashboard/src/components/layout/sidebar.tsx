@@ -14,7 +14,8 @@ const NAV: { href: string; label: string; glyph: string; blurb: string }[] = [
   { href: "/pipelines", label: "Pipelines", glyph: "Pi", blurb: "CI runs" },
   { href: "/clusters", label: "Clusters", glyph: "Cl", blurb: "pods + logs across all three clusters (observe-only for staging/prod)" },
   { href: "/releases", label: "Release train", glyph: "Rt", blurb: "promote sentinel + admin from previews to staging by gitops PR (operators)" },
-  { href: "/capacity", label: "Capacity", glyph: "Ca", blurb: "presets + traffic calculator for pods, nodes and Atlas (NonProd/staging by PR; prod plan-only)" },
+  { href: "/monitor", label: "Monitor", glyph: "Mo", blurb: "prod + staging at a glance: traffic, CPU/memory, pods, node headroom, database (live)" },
+  { href: "/capacity", label: "Capacity", glyph: "Ca", blurb: "size pods, nodes and Atlas: NonProd/staging by PR, staging/prod live (operators, gated)" },
 ];
 
 const STORAGE_KEY = "nebula.sidebar.collapsed";

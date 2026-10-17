@@ -9,7 +9,7 @@ export const dynamic = "force-dynamic";
 
 // Capacity (docs/NEBULA.md §N5): traffic templates for pods, nodes and the
 // Atlas tier. Reads via the `capacity` router; the writes (capacity PR, merge,
-// NonProd Atlas tier) are gated and operator-only. Prod is plan/export only.
+// NonProd Atlas tier, staging/prod live sizing, prod Atlas tier) are gated and operator-only.
 export default async function CapacityPage() {
   const session = await auth();
   if (!session?.user) redirect("/");
