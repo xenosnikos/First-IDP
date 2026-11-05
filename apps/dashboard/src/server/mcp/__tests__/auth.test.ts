@@ -177,3 +177,20 @@ describe("gate hardening (Codex review 2026-11-05)", () => {
     expect(r).toMatchObject({ ok: false, reason: expect.stringMatching(/duplicate/) });
   });
 });
+
+describe("pre-auth concurrency cap (Codex re-review)", () => {
+  it("beyond MAX_PENDING distinct pending verifications, new callers get 503 instead of another outbound call", async () => {
+    const { MAX_PENDING } = await import("../auth");
+    _resetMcpAuthCache();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    const slow = vi.fn(async () => { await gate; return { ok: false, status: 401, text: async () => "", json: async () => ({}) } as unknown as Response; });
+    const deps = { prisma: prisma() as never, fetch: slow as never, now: () => NOW, config: cfg() };
+    const pending = Array.from({ length: MAX_PENDING }, (_, i) => authenticateMcp(headers({ authorization: `Bearer gho_${String(i).padStart(36, "x")}` }), deps));
+    const extra = await authenticateMcp(headers({ authorization: `Bearer gho_${"y".repeat(36)}` }), deps);
+    expect(extra).toMatchObject({ ok: false, status: 503 });
+    expect(slow).toHaveBeenCalledTimes(MAX_PENDING);
+    release();
+    await Promise.all(pending);
+  });
+});

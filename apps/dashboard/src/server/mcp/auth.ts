@@ -25,7 +25,7 @@ export type McpSession = {
   scopes: McpScope[];
 };
 
-export type McpAuthResult = { ok: true; session: McpSession } | { ok: false; status: 401 | 403; reason: string };
+export type McpAuthResult = { ok: true; session: McpSession } | { ok: false; status: 401 | 403 | 503; reason: string };
 
 export type McpAuthHeaders = { authorization?: string | null; google?: string | null; aws?: string | null };
 
@@ -42,15 +42,20 @@ const ghCache = new Map<string, GhEntry>();
 const googleCache = new Map<string, IdEntry>();
 const awsCache = new Map<string, IdEntry>();
 const denyCache = new Map<string, number>();
-/** identical concurrent verifications share one outbound call */
+/** identical concurrent verifications share one outbound call; distinct ones are
+ * capped globally (Codex review): beyond MAX_PENDING, new verifications get 503 */
 const inflight = new Map<string, Promise<unknown>>();
+export const MAX_PENDING = 32;
+class Busy extends Error {}
 function once<T>(key: string, fn: () => Promise<T>): Promise<T> {
   const hit = inflight.get(key) as Promise<T> | undefined;
   if (hit) return hit;
+  if (inflight.size >= MAX_PENDING) return Promise.reject(new Busy("busy"));
   const p = fn().finally(() => inflight.delete(key));
   inflight.set(key, p);
   return p;
 }
+const BUSY: McpAuthResult = { ok: false, status: 503, reason: "Nebula is verifying too many identities right now — retry in a few seconds" };
 
 function put<V>(m: Map<string, V>, k: string, v: V) {
   if (m.size >= MAX) m.delete(m.keys().next().value!);
@@ -66,6 +71,7 @@ const sha = (s: string) => createHash("sha256").update(s).digest("hex");
 
 export function _resetMcpAuthCache() {
   ghCache.clear();
+  inflight.clear();
   googleCache.clear();
   awsCache.clear();
   denyCache.clear();
@@ -105,7 +111,9 @@ export async function authenticateMcp(
   const gk = sha(token);
   let gh = ghCache.get(gk);
   if (!gh || now - gh.at > (gh.r.ok ? GH_TTL_MS : DENY_TTL_MS)) {
-    const { who, r } = await once(`gh:${gk}`, async () => {
+    let verified: { who: Awaited<ReturnType<typeof githubLoginOf>>; r: GhEntry["r"] };
+    try {
+      verified = await once(`gh:${gk}`, async () => {
       const who = await githubLoginOf(token, f as never).catch(() => null);
       const r: GhEntry["r"] = !who
         ? { ok: false, status: 401, reason: "GitHub rejected the token (expired or revoked?) — re-run `gh auth login`" }
@@ -113,7 +121,12 @@ export async function authenticateMcp(
           ? { ok: true, login: who.login, name: who.name }
           : { ok: false, status: 403, reason: `${who.login} is not allowed on Nebula (ALLOWED_GITHUB_LOGINS / org membership)` };
       return { who, r };
-    });
+      });
+    } catch (e) {
+      if (e instanceof Busy) return BUSY;
+      throw e;
+    }
+    const { who, r } = verified;
     gh = { at: now, r };
     put(ghCache, gk, gh);
     // no audit row for a token GitHub doesn't recognise: there is no identity to attribute it to
@@ -132,7 +145,8 @@ export async function authenticateMcp(
   const gc = gtk ? googleCache.get(gtk) : undefined;
   if (gc && gc.until > now) google = gc.value;
   else {
-    const v = await once(`g:${gtk}`, () => verifyGoogle(h.google, cfg, f as unknown as IdFetch, now)).catch((e) => ({ ok: false as const, reason: `Google verification failed: ${String((e as Error).message ?? e)}` }));
+    const v = await once(`g:${gtk}`, () => verifyGoogle(h.google, cfg, f as unknown as IdFetch, now)).catch((e) => (e instanceof Busy ? null : { ok: false as const, reason: `Google verification failed: ${String((e as Error).message ?? e)}` }));
+    if (!v) return BUSY;
     if (!v.ok) return deny(login, 401, v.reason, { stage: "google" });
     google = v.email;
     put(googleCache, gtk, { until: Math.min(v.exp, now + ID_TTL_MS), value: v.email });
@@ -145,7 +159,8 @@ export async function authenticateMcp(
   const ac = ak ? awsCache.get(ak) : undefined;
   if (ac && ac.until > now) aws = ac.value;
   else {
-    const v = await once(`a:${ak}`, () => verifyAws(h.aws, cfg, f as unknown as IdFetch, now)).catch((e) => ({ ok: false as const, reason: `AWS verification failed: ${String((e as Error).message ?? e)}` }));
+    const v = await once(`a:${ak}`, () => verifyAws(h.aws, cfg, f as unknown as IdFetch, now)).catch((e) => (e instanceof Busy ? null : { ok: false as const, reason: `AWS verification failed: ${String((e as Error).message ?? e)}` }));
+    if (!v) return BUSY;
     if (!v.ok) return deny(login, 401, v.reason, { stage: "aws", google });
     aws = v.arn;
     // never trust a proof past its own signed expiry (Codex review): Claude Code re-runs the

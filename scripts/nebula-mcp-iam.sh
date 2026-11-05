@@ -22,7 +22,7 @@ GROUP=nebula-mcp-users
 IAM_PATH=/nebula-mcp/
 POLICY_NAME=NebulaMcpSelfServiceOnly
 SELF="arn:aws:iam::$ACCOUNT:user${IAM_PATH}\${aws:username}"
-MFA="arn:aws:iam::$ACCOUNT:mfa/\${aws:username}*"
+MFA="arn:aws:iam::$ACCOUNT:mfa/\${aws:username}"
 
 T=$(mktemp)
 trap 'rm -f "$T"' EXIT

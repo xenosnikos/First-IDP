@@ -40,7 +40,7 @@ function notesFor(login: string): Record<string, unknown> {
 const jsonRpcError = (status: number, message: string) =>
   new Response(JSON.stringify({ jsonrpc: "2.0", error: { code: status === 401 ? -32001 : -32003, message }, id: null }), {
     status,
-    headers: { "content-type": "application/json", ...(status === 401 ? { "www-authenticate": 'Bearer realm="nebula"' } : {}) },
+    headers: { "content-type": "application/json", ...(status === 401 ? { "www-authenticate": 'Bearer realm="nebula"' } : {}), ...(status === 503 ? { "retry-after": "5" } : {}) },
   });
 
 export async function POST(req: Request): Promise<Response> {
