@@ -4,7 +4,7 @@ import { AtlasSize, CAPACITY_TIERS, EstimateInput, TierSize, type CapacityTier }
 import { LIVE_TARGETS, PROD_ATLAS, describeLiveOp, planProdAtlas, estimateTier, exportPlan, hashSize, isLiveTier, listCapacityPrs, liveAsSize, nearestPreset, planCapacity, planLive } from "@twizz-idp/actions";
 import { router, protectedProcedure } from "../trpc";
 import { namedEnvDeps } from "../nebula/deps";
-import { currentFor, nodePoolUsedCpu, observe, presetsAndProfiles, prodAtlasPort, readLive, readProdAtlas, targetFor } from "../nebula/capacity";
+import { currentFor, liveTemplateOpts, nodePoolUsedCpu, observe, presetsAndProfiles, prodAtlasPort, readLive, readProdAtlas, targetFor } from "../nebula/capacity";
 
 // Capacity page (docs/NEBULA.md §N5). QUERIES ONLY: presets, the current
 // state per tier, a plan (diff + cost + export) and the traffic calculator.
@@ -83,10 +83,10 @@ export const capacityRouter = router({
     // live part (staging ns default/jobs, prod): a diff against a FRESH read
     let live: (ReturnType<typeof planLive> & { opsText: string[] }) | { error: string } | null = null;
     if (isLiveTier(input.tier) && size.live) {
-      const r = await readLive(input.tier);
+      const [r, opts] = await Promise.all([readLive(input.tier), liveTemplateOpts(input.tier, input)]);
       if ("error" in r) live = { error: r.error };
       else {
-        const p = planLive(LIVE_TARGETS[input.tier], r.state, size.live);
+        const p = planLive(LIVE_TARGETS[input.tier], r.state, size.live, opts);
         live = { ...p, opsText: p.ops.map(describeLiveOp) };
       }
     }

@@ -80,7 +80,7 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
   staging/prod `live` = straight from the cluster via `server/nebula/live-cluster.ts`; `prodAtlasPlan`)
 - `monitor` - snapshot({tier, window}) (queries only; `server/nebula/monitor.ts`, 30 s shared cache)
 - `actions.applyLiveCapacity` - operators; resizes workloads + node groups ON EKS-Moly-staging/Prod
-  (`@twizz-idp/actions` live-capacity.ts: pair advisory, ×3/×0.5 step limits, caps, never delete; nonce binds planHash)
+  (`@twizz-idp/actions` live-capacity.ts: pair advisory, ×3/×0.5 step limits, caps, never delete; nonce binds planHash; prod templates Baseline/Campaign/Max may step down to their own values, never below `baseline`)
 - `actions.setProdAtlasTier` - operators; resizes ONE prod Atlas cluster (prod-atlas.ts: allowlist, +2/−1 tier, IDLE, nonce binds `from`)
 
 ## Auth / RBAC

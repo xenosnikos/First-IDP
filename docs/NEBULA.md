@@ -716,10 +716,17 @@ and refuses unless the plan is byte-identical to the one confirmed (`planHash` b
 - **UI**: /capacity → Staging / Prod show the live workloads + node groups, a live sizing editor
   (starts from what runs; sends only what you change; ⇆ link-pair toggle), the plan in apply
   order, and **Apply to <cluster>** (operators, two-step confirm, AuditLog `nebula.apply_live_capacity`).
-- **No presets for the live tiers** (owner decision 2026-10-14): what is set on EKS-Moly-Prod and
-  EKS-Moly-staging (ns default/jobs) IS the desired configuration; Nebula shows it and changes it
-  only through the editor. The `live:` preset schema stays supported but capacity/presets.yaml
-  carries none.
+- **Prod templates** (owner decision 2026-11-05, replacing "no presets for the live tiers" of
+  2026-10-14): capacity/presets.yaml carries three prod templates with a `production.live` section —
+  **Baseline** (prod as it ran on 2026-11-05: pair 40/20, node group 5/5/8), **Campaign** (2×:
+  80/40, 8/10/14) and **Max** (3×, the most one apply allows: 120/60, 12/15/20). One click plans a
+  template against what runs; one confirm applies it. A NAMED template is planned with
+  `LivePlanOpts.template` (floor = the tier's `baseline` template, read from gitops): for whatever
+  the floor names, the ≥ ×0.5 step-down and the one-node-per-apply drain guard are lifted, so Max →
+  Baseline is one apply; nothing may go below the floor. ×3 step-up, caps, never-zero and
+  one-group-per-apply still hold, the plan hash binds the template name, and a template's uneven
+  pair split does not warn. Hand edits in the editor keep every original rule. Staging has no live
+  templates (editor only).
 - **Atlas**: staging uses NonProd-Twizz (shared). Prod is Moly-Prod + Prod-Shift4 in another Atlas
   account (project "Loly" `64a3f2d23e82167aa3f7f66e`, key "Nebula" = Project Cluster Manager,
   `ATLAS_PROD_*` in SM preview/nebula since 2026-10-16) — resized per §N5.3.

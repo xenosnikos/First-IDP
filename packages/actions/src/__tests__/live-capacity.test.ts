@@ -207,3 +207,87 @@ describe("HPA needs CPU requests on every container", () => {
     expect(planLive(T, s, LiveTierSize.parse({ workloads: pair(24, [24, 48]) })).violations.join()).toMatch(/no CPU requests on every container/);
   });
 });
+
+// ── Prod templates (platform owner 2026-11-05): Baseline / Campaign / Max in one click ──
+describe("named templates with a baseline floor", () => {
+  const NG = "eks-prod-node-group-m5-2x-extra";
+  // EKS-Moly-Prod as it runs on 2026-11-05: one node group, the pair at 40/20
+  const NOW = (): LiveState => {
+    const s = PROD();
+    s.nodegroups = [{ name: NG, status: "ACTIVE", instanceTypes: ["m5.2xlarge"], min: 5, desired: 5, max: 8 }];
+    for (const w of s.workloads) if (w.name === "moly-backend-deployment") w.replicas = 40;
+    for (const w of s.workloads) if (w.name === "lolygram-discovery-deployment") w.replicas = 20;
+    return s;
+  };
+  const tpl = (b: number, d: number, ng: [number, number, number]) =>
+    LiveTierSize.parse({ workloads: { "moly-backend-deployment": { replicas: b }, "lolygram-discovery-deployment": { replicas: d } }, nodegroups: { [NG]: { min: ng[0], desired: ng[1], max: ng[2] } } });
+  const BASELINE = tpl(40, 20, [5, 5, 8]);
+  const CAMPAIGN = tpl(80, 40, [8, 10, 14]);
+  const MAX = tpl(120, 60, [12, 15, 20]);
+  const at = (size: LiveTierSize): LiveState => {
+    const s = NOW();
+    for (const [n, w] of Object.entries(size.workloads)) s.workloads.find((x) => x.name === n)!.replicas = w.replicas;
+    for (const [n, g] of Object.entries(size.nodegroups)) Object.assign(s.nodegroups.find((x) => x.name === n)!, g);
+    return s;
+  };
+  const opts = (name: string) => ({ template: { name, floor: BASELINE } });
+
+  it("Baseline → Campaign and Baseline → Max plan clean (Max is exactly the ×3 / cap edge)", () => {
+    for (const [name, size] of [["campaign", CAMPAIGN], ["max", MAX]] as const) {
+      const p = planLive(T, NOW(), size, opts(name));
+      expect(p.violations).toEqual([]);
+      expect(p.ops[0]).toMatchObject({ kind: "nodegroup", name: NG }); // nodes grow first
+    }
+  });
+
+  it("Max → Baseline in ONE apply as a template; the same values by hand are still refused", () => {
+    const asTemplate = planLive(T, at(MAX), BASELINE, opts("baseline"));
+    expect(asTemplate.violations).toEqual([]);
+    expect(asTemplate.ops.map((o) => o.kind)).toEqual(["scale", "scale", "nodegroup"]); // pods first, then drain
+    const byHand = planLive(T, at(MAX), BASELINE).violations.join("\n");
+    expect(byHand).toMatch(/below ×0.5/);
+    expect(byHand).toMatch(/shrink one node per apply/);
+  });
+
+  it("never below the baseline floor, even as a template", () => {
+    const v = planLive(T, at(CAMPAIGN), tpl(30, 20, [4, 4, 8]), opts("quiet")).violations.join("\n");
+    expect(v).toMatch(/moly-backend-deployment: 30 replicas is below the baseline template \(40\)/);
+    expect(v).toMatch(new RegExp(`node group ${NG}: 4/4/8 is below the baseline template \\(5/5/8\\)`));
+  });
+
+  it("step-up limit and caps still hold for templates", () => {
+    const v = planLive(T, NOW(), tpl(121, 61, [12, 16, 21]), opts("too-big")).violations.join("\n");
+    expect(v).toMatch(/exceeds the production cap of 120/);
+    expect(v).toMatch(/more than ×3/);
+    expect(v).toMatch(/max 21 exceeds the production cap of 20/);
+  });
+
+  it("a template's uneven pair split does not warn; the same split by hand still does", () => {
+    expect(planLive(T, NOW(), CAMPAIGN, opts("campaign")).warnings.join()).not.toMatch(/not scaled symmetrically/);
+    expect(planLive(T, NOW(), CAMPAIGN).warnings.join()).toMatch(/not scaled symmetrically/);
+  });
+
+  it("a template without a floor gets the normal rules", () => {
+    const v = planLive(T, at(MAX), BASELINE, { template: { name: "baseline" } }).violations.join("\n");
+    expect(v).toMatch(/below ×0.5/);
+  });
+
+  it("the plan hash binds the template: a hand edit can't reuse a template's confirmation", () => {
+    const a = planLive(T, NOW(), CAMPAIGN, opts("campaign")).planHash;
+    expect(planLive(T, NOW(), CAMPAIGN).planHash).not.toBe(a);
+    expect(planLive(T, NOW(), CAMPAIGN, opts("campaign")).planHash).toBe(a);
+  });
+
+  it("applyLive applies a template step-down only with the template options", async () => {
+    const port = new FakePort(at(MAX));
+    const hash = planLive(T, at(MAX), BASELINE, opts("baseline")).planHash;
+    const r = await applyLive(port, T, BASELINE, hash, opts("baseline"));
+    expect(r.failed).toBeUndefined();
+    expect(port.calls).toEqual([
+      "scale default/moly-backend-deployment 40",
+      "scale default/lolygram-discovery-deployment 20",
+      `nodegroup ${NG} 5`,
+    ]);
+    await expect(applyLive(new FakePort(at(MAX)), T, BASELINE, hash)).rejects.toThrow(/changed since you reviewed/);
+  });
+});

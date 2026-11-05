@@ -116,15 +116,27 @@ function sameRes(a: LiveResources, b: LiveResources): boolean {
   return canonical({ r: a.requests ?? {}, l: a.limits ?? {} }) === canonical({ r: b.requests ?? {}, l: b.limits ?? {} });
 }
 
-function within(t: LiveTarget, from: number, to: number): string | null {
+function within(t: LiveTarget, from: number, to: number, freeDown = false): string | null {
   if (from <= 0) return null;
   if (to > Math.ceil(from * t.caps.maxStepUp)) return `more than ×${t.caps.maxStepUp} in one step (${from} → ${to})`;
-  if (to < Math.ceil(from * t.caps.maxStepDown)) return `below ×${t.caps.maxStepDown} in one step (${from} → ${to})`;
+  if (!freeDown && to < Math.ceil(from * t.caps.maxStepDown)) return `below ×${t.caps.maxStepDown} in one step (${from} → ${to})`;
   return null;
 }
 
+/** The template every live tier falls back to; its values are the floor for the others. */
+export const BASELINE_TEMPLATE = "baseline";
+
+/** Planning a NAMED template (platform owner 2026-11-05: Baseline / Campaign /
+ * Max in one click). With a `floor` (the tier's `baseline` template), a template
+ * may scale DOWN to its own values in one apply: the ×0.5 step-down and the
+ * one-node-per-apply drain guard are lifted for whatever the floor names, and
+ * nothing may go below the floor. Step-up limits, caps, never-zero and
+ * one-group-per-apply still hold. Without a floor the normal rules apply. */
+export type LivePlanOpts = { template?: { name: string; floor?: LiveTierSize } };
+
 /** Pure: the ops that take `live` to `desired`, with every rule checked. */
-export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize): LivePlan {
+export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize, opts: LivePlanOpts = {}): LivePlan {
+  const floor = opts.template?.floor;
   const violations: string[] = [];
   const warnings: string[] = [];
   const ops: LiveOp[] = [];
@@ -138,7 +150,8 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
   // advisory (platform owner 2026-10-14): the pair usually moves together, but an
   // uneven split (e.g. a campaign 30/20) is a legitimate choice — warn, don't refuse
   if (!!da !== !!db) warnings.push(`${a} and ${b} usually scale as a pair — only one of them is being sized`);
-  if (da && db && canonical({ r: da.replicas, a: da.autoscaling ?? null }) !== canonical({ r: db.replicas, a: db.autoscaling ?? null })) {
+  // (a named template's split is a reviewed decision in gitops — prod runs the pair 2:1 — so only hand edits warn)
+  if (!opts.template && da && db && canonical({ r: da.replicas, a: da.autoscaling ?? null }) !== canonical({ r: db.replicas, a: db.autoscaling ?? null })) {
     warnings.push(`${a} and ${b} are not scaled symmetrically (${fmtW({ replicas: da.replicas, hpa: da.autoscaling ? { min: da.autoscaling.minReplicas, max: da.autoscaling.maxReplicas } : null })} vs ${fmtW({ replicas: db.replicas, hpa: db.autoscaling ? { min: db.autoscaling.minReplicas, max: db.autoscaling.maxReplicas } : null })})`);
   }
 
@@ -174,7 +187,9 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
     } else {
       if (w.hpa) violations.push(`${prefix} has an HPA (${w.hpa.min}–${w.hpa.max}); Nebula never deletes it — size it with an HPA, or remove the HPA by hand first`);
       if (want.replicas > t.caps.maxReplicas) violations.push(`${prefix} ${want.replicas} replicas exceeds the ${t.tier} cap of ${t.caps.maxReplicas}`);
-      const step = within(t, w.replicas, want.replicas);
+      const floorReplicas = floor?.workloads[name]?.replicas;
+      if (floorReplicas !== undefined && want.replicas < floorReplicas) violations.push(`${prefix} ${want.replicas} replicas is below the ${BASELINE_TEMPLATE} template (${floorReplicas})`);
+      const step = within(t, w.replicas, want.replicas, floorReplicas !== undefined);
       if (step) violations.push(`${prefix} replicas ${step}`);
       if (want.replicas !== w.replicas) {
         workloadOps.push({ kind: "scale", namespace: w.namespace, name, from: w.replicas, to: want.replicas });
@@ -205,7 +220,9 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
     if (ng.status !== "ACTIVE") violations.push(`node group ${name} is ${ng.status} — wait for ACTIVE`);
     if (want.max > t.caps.maxNodesPerGroup) violations.push(`node group ${name}: max ${want.max} exceeds the ${t.tier} cap of ${t.caps.maxNodesPerGroup}`);
     if (want.min < 1) violations.push(`node group ${name}: min ${want.min} — a group never scales to zero`);
-    const step = within(t, from.desired, want.desired);
+    const ngFloor = floor?.nodegroups[name];
+    if (ngFloor && (want.min < ngFloor.min || want.desired < ngFloor.desired)) violations.push(`node group ${name}: ${fmtNg(want)} is below the ${BASELINE_TEMPLATE} template (${fmtNg(ngFloor)})`);
+    const step = within(t, from.desired, want.desired, !!ngFloor);
     if (step) violations.push(`node group ${name}: desired ${step}`);
     if (canonical(from) !== canonical(want)) {
       const op: LiveOp = { kind: "nodegroup", name, from, to: want };
@@ -219,7 +236,8 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
 
   // drain guard: pods here mostly carry no requests, so the scheduler cannot see
   // load — shrink capacity one node, one group, per apply
-  for (const o of nodegroupDowns) if (o.kind === "nodegroup" && o.from.desired - o.to.desired > 1) violations.push(`node group ${o.name}: desired ${o.from.desired} → ${o.to.desired} — shrink one node per apply`);
+  // (a template with a floor may shrink a group it names to its own values in one apply)
+  for (const o of nodegroupDowns) if (o.kind === "nodegroup" && o.from.desired - o.to.desired > 1 && !floor?.nodegroups[o.name]) violations.push(`node group ${o.name}: desired ${o.from.desired} → ${o.to.desired} — shrink one node per apply`);
   if (nodegroupDowns.length > 1) violations.push(`${nodegroupDowns.length} node groups shrink at once — shrink one group per apply`);
 
   // order: grow nodes first, then workloads, then shrink nodes
@@ -231,7 +249,8 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize):
   if (addedPods > 0 && nodegroupUps.length === 0) warnings.push(`+${addedPods} pods with no node-group change; ${live.nodes.length} nodes / ${nodeCpu} vCPU today — check node headroom`);
 
   const touched = ops.map((o) => (o.kind === "nodegroup" ? live.nodegroups.find((n) => n.name === o.name) : live.workloads.find((w) => w.name === o.name)));
-  const planHash = createHash("sha256").update(canonical({ tier: t.tier, ops, touched })).digest("hex");
+  // a template plan binds its name too (it is checked under different rules); hand edits hash as before
+  const planHash = createHash("sha256").update(canonical(opts.template ? { tier: t.tier, ops, touched, template: opts.template.name } : { tier: t.tier, ops, touched })).digest("hex");
   return { tier: t.tier, cluster: t.cluster, readAt: live.readAt, rows: rows.sort((x, y) => Number(y.pair) - Number(x.pair) || x.workload.localeCompare(y.workload)), nodegroupRows, ops, violations, warnings, planHash };
 }
 
@@ -251,9 +270,9 @@ export { describeOp as describeLiveOp };
 /** Re-read, re-plan, and apply ONLY if the plan is byte-identical to the one
  * the human confirmed (`planHash`). Ops run in plan order and stop at the
  * first failure; the result lists exactly what was applied. */
-export async function applyLive(port: LiveClusterPort, t: LiveTarget, desired: LiveTierSize, confirmedHash: string): Promise<LiveApplyResult> {
+export async function applyLive(port: LiveClusterPort, t: LiveTarget, desired: LiveTierSize, confirmedHash: string, opts: LivePlanOpts = {}): Promise<LiveApplyResult> {
   const live = await port.read();
-  const plan = planLive(t, live, desired);
+  const plan = planLive(t, live, desired, opts);
   if (plan.planHash !== confirmedHash) throw new Error(`${t.cluster} changed since you reviewed the plan — reload it and confirm again`);
   if (plan.violations.length) throw new Error(`refused:\n${plan.violations.join("\n")}`);
   if (!plan.ops.length) throw new Error(`${t.cluster} already matches — nothing to apply`);
