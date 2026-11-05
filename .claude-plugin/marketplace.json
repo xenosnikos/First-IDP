@@ -1,0 +1,17 @@
+{
+  "name": "twizz-idp",
+  "owner": {
+    "name": "Twizz platform"
+  },
+  "metadata": {
+    "description": "Twizz internal developer platform plugins: Nebula (non-prod environments, staging promotions, log diagnosis) from Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "twizz-nebula",
+      "source": "./plugins/twizz-nebula",
+      "description": "Nebula MCP server: spin up preview envs on EKS-Twizz-NonProd, promote to staging, diagnose with Observer log queries (NonProd, staging, prod read-only) and twizz-sentinel. Invitation-only.",
+      "category": "development"
+    }
+  ]
+}

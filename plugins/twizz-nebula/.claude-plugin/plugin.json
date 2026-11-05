@@ -1,0 +1,11 @@
+{
+  "name": "twizz-nebula",
+  "displayName": "Twizz Nebula",
+  "version": "0.1.0",
+  "description": "Drive Nebula (nebula.prv.twizz.com) from Claude Code: preview envs on EKS-Twizz-NonProd (backends and frontends on *.prv.twizz.com), promotions to staging, Observer log diagnosis on NonProd, staging and prod (read-only), twizz-sentinel alerts. Invitation-only (Nebula MCP list).",
+  "author": {
+    "name": "Twizz platform"
+  },
+  "repository": "https://github.com/xenosnikos/First-IDP",
+  "keywords": ["twizz", "nebula", "preview", "staging", "logs", "sentinel"]
+}

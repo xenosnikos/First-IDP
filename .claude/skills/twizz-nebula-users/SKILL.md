@@ -46,10 +46,17 @@ Projects, Clusters, Observer, Configurator) need only gate 3.
 `AWS_PROFILE=twizz bash scripts/nebula-allow-login.sh <github-login> --operator`, then the
 resync + restart above. Keep the list short; every write is audited under their login.
 
+## MCP access (twizz-nebula plugin, docs/NEBULA.md §N7)
+
+Invitation-only, on top of sign-in: operators always, plus `NEBULA_MCP_USERS`.
+`AWS_PROFILE=twizz bash scripts/nebula-allow-login.sh <github-login> --mcp` (grant) or
+`… --revoke-mcp` (MCP only), then resync + restart. MCP users can read prod logs/monitor:
+grant it deliberately. Denials show as `mcp.signin` AuditLog rows with the reason.
+
 ## Remove / offboard
 
-- Gate 3: edit `ALLOWED_GITHUB_LOGINS` / `NEBULA_OPERATORS` in SM `preview/nebula` (same
-  merge pattern as the script, removing the login), resync, restart.
+- Gate 3: edit `ALLOWED_GITHUB_LOGINS` / `NEBULA_OPERATORS` / `NEBULA_MCP_USERS` in SM
+  `preview/nebula` (same merge pattern as the script, removing the login), resync, restart.
 - Gate 1: NetBird → Team → Users → delete. Gate 2: suspend in Google Workspace.
 
 ## Notes

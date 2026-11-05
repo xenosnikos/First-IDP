@@ -3,30 +3,10 @@ import { prisma } from "@twizz-idp/db";
 import { authConfig } from "./auth.config";
 import { needsRefresh, refreshGithubToken, type GithubTokenState } from "./github-token";
 
-// Orgs whose active members may sign in. Emergency/per-user fallback:
-// ALLOWED_GITHUB_LOGINS="alice,bob" for collaborators outside both orgs.
-const ALLOWED_ORGS = (process.env.ALLOWED_GITHUB_ORGS ?? "twizz-app")
-  .split(",")
-  .map((s) => s.trim())
-  .filter(Boolean);
+import { isAllowedGithubUser } from "./github-access";
 
-const ALLOWED_LOGINS = (process.env.ALLOWED_GITHUB_LOGINS ?? "")
-  .split(",")
-  .map((s) => s.trim().toLowerCase())
-  .filter(Boolean);
-
-async function isOrgMember(accessToken: string, org: string): Promise<boolean> {
-  // Uses the user's own token: read:org lets them read their own membership.
-  const res = await fetch(`https://api.github.com/user/memberships/orgs/${org}`, {
-    headers: {
-      Authorization: `Bearer ${accessToken}`,
-      Accept: "application/vnd.github+json",
-    },
-  });
-  if (!res.ok) return false;
-  const body = (await res.json()) as { state?: string };
-  return body.state === "active";
-}
+// Who may sign in: ALLOWED_GITHUB_LOGINS, or active members of
+// ALLOWED_GITHUB_ORGS (lib/github-access.ts, shared with the MCP endpoint).
 
 export const { handlers, auth, signIn, signOut } = NextAuth({
   ...authConfig,
@@ -37,15 +17,7 @@ export const { handlers, auth, signIn, signOut } = NextAuth({
       const accessToken = account?.access_token;
       if (!login || !accessToken) return false;
 
-      let allowed = ALLOWED_LOGINS.includes(login);
-      if (!allowed) {
-        for (const org of ALLOWED_ORGS) {
-          if (await isOrgMember(accessToken, org)) {
-            allowed = true;
-            break;
-          }
-        }
-      }
+      const allowed = await isAllowedGithubUser(login, accessToken);
 
       const dbUser = await prisma.user
         .upsert({
