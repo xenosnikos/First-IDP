@@ -774,23 +774,39 @@ Refreshes every 60 s (paused in background tabs); windows 15m / 1h / 6h / 24h.
 
 Teammates drive Nebula from Claude Code. The MCP server is **Nebula itself**,
 not a laptop process: `POST https://nebula.prv.twizz.com/api/mcp` (Streamable
-HTTP, stateless, JSON responses), packaged as the `twizz-nebula` plugin in this
-repo's own marketplace (`.claude-plugin/marketplace.json`, `plugins/twizz-nebula/`).
+HTTP, stateless, JSON responses). The client is the `twizz-nebula` plugin in its own
+repo, **TwizzyNicky/nebula-mcp** (to move to twizz-app): plugin, marketplace,
+`/nebula:setup`, onboarding and the security model (docs/AUTH.md there).
 
-**Auth.** `Authorization: Bearer <the person's own GitHub token>` (the plugin's
-`headersHelper` runs `gh auth token`). `server/mcp/auth.ts` resolves the login
-(`GET /user`) and applies the browser's sign-in rule (`lib/github-access.ts`:
-`ALLOWED_GITHUB_LOGINS` or active `ALLOWED_GITHUB_ORGS` membership), cached
-5 min by SHA-256 of the token, one `mcp.signin` AuditLog row per fresh
-verification. **Who:** two gates — allowed on Nebula at all (the sign-in rule) AND
-on the MCP list: operators always, plus `NEBULA_MCP_USERS` (SM `preview/nebula`;
-`scripts/nebula-allow-login.sh <login> --mcp` / `--revoke-mcp`).
-MCP is deliberately not for every developer; denials are audited with the reason.
-The token is the session's `accessToken`, so GitHub reads run as
-that person exactly like the UI (`withGithub()`); writes still use the platform
-token. Network: VPN-only (prv zone). Its own Ingress (`dashboard-mcp`, path
-`/api/mcp` Exact, gitops `apps/nebula/dashboard.yaml`) skips the browser SSO
-gate, because an MCP client cannot do the Google SSO round-trip; the token check replaces it.
+### N7.1 Auth: three credentials, all the user's own (2026-11-05)
+
+Every request carries three proofs minted by the plugin's `headersHelper` from
+credentials the person set up themselves; `server/mcp/auth.ts` + `identity.ts`
+verify ALL of them and require them to match the person's binding:
+
+| Header | Proof | Verified as |
+|---|---|---|
+| `Authorization: Bearer` | GitHub token (`gh auth token`) | `GET /user` → login; the browser sign-in rule (`lib/github-access.ts`) |
+| `x-nebula-google-token` | Google ID token (`gcloud auth print-identity-token`) | tokeninfo: issuer, gcloud audience, exp, `email_verified`, `@twizz.com` |
+| `x-nebula-aws-sts` | presigned `sts:GetCallerIdentity`, SigV4, ≤ 15 min, **signs `x-nebula-audience`** | shape-checked, then executed against STS with the audience header → ARN under `arn:aws:iam::848281935985:user/nebula-mcp/` |
+
+`NEBULA_MCP_IDENTITIES` (SM `preview/nebula`, `scripts/nebula-mcp-bind.sh`) =
+`{"<login>": {"google", "aws"}}` IS the MCP list: no binding, no MCP, operators included.
+The AWS users (`scripts/nebula-mcp-iam.sh`: path `/nebula-mcp/`, group `nebula-mcp-users`)
+hold no permissions. GetCallerIdentity needs none, and the group allows only self-service
+(password, MFA, own access keys with MFA) and explicitly denies everything else
+(policy-simulated, including an accidentally attached admin policy). Caches: GitHub 5 min;
+verified Google/AWS proofs until the Google token expires (≤ 1 h); SHA-256 keys, nothing stored.
+
+**Traceability.** The session carries `google` + `aws` alongside the login. `mcp.signin`
+rows record all three (or the refusal reason). Every tool call, reads included, writes
+`mcp.tool.<name>` with the three identities, sanitized args (names and hashes only), ms
+and outcome. Writes also get the gate's `nebula.<tool>` rows.
+
+The token is the session's `accessToken`, so GitHub reads run as that person like the UI
+(`withGithub()`); writes still use the platform token. Network: VPN-only (prv zone), with its
+own Ingress (`dashboard-mcp`, path `/api/mcp` Exact, gitops `apps/nebula/dashboard.yaml`) that
+skips the browser SSO gate. The Google ID token check above is the SSO proof for MCP.
 
 **One code path.** Each tool (`server/mcp/tools.ts`) is a tRPC procedure called
 through `appRouter.createCaller({ session, prisma })`: protected / operator /
@@ -831,6 +847,7 @@ behind the VPN, proxied like `staging-edge-sentinel`).
 **Rollout.** (1) merge + build the dashboard image; (2) twizz-gitops: the
 `dashboard-mcp` Ingress + image bump; (3) `AWS_PROFILE=twizz bash
 scripts/nebula-set-sentinel-key.sh`, resync `nebula-env`, restart the dashboard;
-(4) teammates: `/plugin marketplace add xenosnikos/First-IDP`,
-`/plugin install twizz-nebula@twizz-idp` (they need read access to this repo, or
-install from a local clone).
+(4) per person: `nebula-mcp-iam.sh user <name>` → they follow nebula-mcp ONBOARDING.md →
+`nebula-mcp-bind.sh`; install: `/plugin marketplace add TwizzyNicky/nebula-mcp`,
+`/plugin install twizz-nebula@nebula-mcp`. Missing config was filled 2026-11-05 by
+`scripts/nebula-fill-secrets.sh` (staging sentinel key, staging API URL, Vercel).

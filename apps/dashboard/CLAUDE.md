@@ -44,11 +44,11 @@ planner (`components/capacity/capacity-view.tsx`), `/monitor` the read-only prod
 (`components/monitor/monitor-view.tsx`, server `server/nebula/monitor.ts` + pure `monitor-model.ts`, §N6).
 
 ## MCP endpoint (docs/NEBULA.md §N7)
-`src/app/api/mcp/route.ts` (stateless Streamable HTTP) → `server/mcp/auth.ts` (GitHub token →
-login → same allowlist as sign-in via `lib/github-access.ts`) → `server/mcp/tools.ts` (explicit tool
+`src/app/api/mcp/route.ts` (stateless Streamable HTTP) → `server/mcp/auth.ts` + `identity.ts` (HARD gate:
+GitHub token + Google ID token + presigned STS GetCallerIdentity, all matching `NEBULA_MCP_IDENTITIES`; §N7.1) → `server/mcp/tools.ts` (explicit tool
 list; each tool = a tRPC procedure through `appRouter.createCaller`, an Observer tool with an explicit
-NonProd/staging/prod scope, or a GET on sentinel `server/mcp/sentinel.ts`). Access: sign-in rule AND
-`isMcpUser` (operators + `NEBULA_MCP_USERS`). Prod is READ-only: never add a write that takes a cluster/
+NonProd/staging/prod scope, or a GET on sentinel `server/mcp/sentinel.ts`). Every tool call
+writes an `mcp.tool.*` AuditLog row with all three identities. Prod is READ-only: never add a write that takes a cluster/
 tier/target, a capacity/live/Atlas procedure, or a secret VALUE input; the tests pin it.
 
 ## Tests

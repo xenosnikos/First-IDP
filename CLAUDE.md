@@ -35,7 +35,7 @@ and the strictly-authorized MCP toolset. See STATE.md for phase status.
 | `/clusters` | Pods + logs across all three clusters (observe-only for staging/prod); URL-addressable log queries; the Observer panel |
 | `/capacity` | Capacity (docs/NEBULA.md §N5): NonProd/staging-sentinel presets + calculator → gitops PR; staging/prod live sizing editor (§N5.2); prod Atlas tier (§N5.3) — operators, gated |
 | `/monitor` | Monitor (docs/NEBULA.md §N6): prod + staging traffic, CPU/memory, pods, node headroom, Atlas — OK/WATCH/HOT board, 60 s refresh, read-only |
-| `POST /api/mcp` | Nebula MCP endpoint (docs/NEBULA.md §N7): GitHub-token bearer, same RBAC/gate/audit as the UI via `appRouter.createCaller`; NonProd + staging + prod READS, writes non-prod/staging only; MCP list `NEBULA_MCP_USERS` + operators; plugin `plugins/twizz-nebula` (own marketplace `.claude-plugin/`) |
+| `POST /api/mcp` | Nebula MCP endpoint (docs/NEBULA.md §N7): GitHub + Google + AWS identity gate (§N7.1), same RBAC/gate/audit as the UI via `appRouter.createCaller`; NonProd + staging + prod READS, writes non-prod/staging only; MCP list = `NEBULA_MCP_IDENTITIES`; plugin repo TwizzyNicky/nebula-mcp |
 | `/releases` | Release train (docs/NEBULA.md §N4): per service on the train, ECR candidates, what staging runs, open promotion PRs; Promote / Merge (operators, gated) |
 
 The deploy wizard and release board were removed (GitOps replaces both). The Nebula

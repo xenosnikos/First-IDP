@@ -22,15 +22,3 @@ describe("operator allowlist (NEBULA_OPERATORS)", () => {
     expect(isOperator("nick", "alice")).toBe(false);
   });
 });
-
-describe("isMcpUser (NEBULA_MCP_USERS, §N7)", () => {
-  it("operators always; plus the explicit MCP list; nobody else", async () => {
-    const { isMcpUser } = await import("@/lib/nebula/operators");
-    expect(isMcpUser("nick", "", "nick")).toBe(true);
-    expect(isMcpUser("Bob", "bob,carol", "nick")).toBe(true);
-    expect(isMcpUser("nick", "bob", "nick")).toBe(true);
-    expect(isMcpUser("dave", "bob", "nick")).toBe(false);
-    expect(isMcpUser("dave", undefined, "nick")).toBe(false);
-    expect(isMcpUser(null, "bob", "nick")).toBe(false);
-  });
-});

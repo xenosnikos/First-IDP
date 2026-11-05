@@ -28,7 +28,22 @@ export type NebulaMcpDeps = {
   sentinel: SentinelGet;
   /** Per-login scratch for the Observer drill-down (last fetch_logs groups + scope). */
   notes: Record<string, unknown>;
+  /** One AuditLog row per tool call (reads included): full traceability. */
+  audit?: (tool: string, args: Record<string, unknown>, ok: boolean, ms: number, error?: string) => Promise<void>;
 };
+
+/** What a tool-call audit row may carry: names and shapes, never values that could be secrets or file bodies. */
+export function auditArgs(args: Record<string, unknown>): Record<string, unknown> {
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(args ?? {})) {
+    if (k === "confirm") out[k] = v ? "(nonce)" : undefined;
+    else if (k === "vars" || k === "envOverrides") out[k] = v && typeof v === "object" ? Object.keys(v as object) : v;
+    else if (k === "files") out[k] = Array.isArray(v) ? v.map((x) => (x as { path?: string })?.path) : v;
+    else if (k === "twizzYaml") out[k] = typeof v === "string" ? `(${v.length} chars)` : v;
+    else out[k] = typeof v === "string" && v.length > 300 ? `${v.slice(0, 300)}…` : v;
+  }
+  return out;
+}
 
 /** Clusters the READ tools may look at. Writes never take a cluster. */
 export const MCP_CLUSTERS = ["EKS-Twizz-NonProd", "EKS-Moly-staging", "EKS-Moly-Prod"] as const;
@@ -164,7 +179,12 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
   const c = d.caller;
   const reg = <S extends z.ZodRawShape>(name: (typeof MCP_TOOL_NAMES)[number], description: string, shape: S, annotations: Record<string, boolean>, handler: (a: z.objectOutputType<S, z.ZodTypeAny>) => Promise<Content>) =>
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    server.registerTool(name, { description, inputSchema: shape, annotations } as any, (async (a: z.objectOutputType<S, z.ZodTypeAny>) => run(() => handler(a))) as any);
+    server.registerTool(name, { description, inputSchema: shape, annotations } as any, (async (a: z.objectOutputType<S, z.ZodTypeAny>) => {
+      const t0 = Date.now();
+      const out = await run(() => handler(a));
+      await d.audit?.(name, auditArgs(a as Record<string, unknown>), !out.isError, Date.now() - t0, out.isError ? out.content[0]?.text.slice(0, 300) : undefined).catch(() => {});
+      return out;
+    }) as any);
 
   // ── who / what ───────────────────────────────────────────────────────
   reg("nebula_whoami", "Who Nebula thinks you are: GitHub login and whether you are an operator (operators may create release-image envs, clone the staging db, and promote to staging). Call this first.", {}, RO, async () => json(await c.actions.me()));

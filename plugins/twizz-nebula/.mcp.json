@@ -1,9 +1,0 @@
-{
-  "mcpServers": {
-    "nebula": {
-      "type": "http",
-      "url": "https://nebula.prv.twizz.com/api/mcp",
-      "headersHelper": "sh \"${CLAUDE_PLUGIN_ROOT}/scripts/nebula-headers.sh\""
-    }
-  }
-}

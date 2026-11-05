@@ -43,17 +43,26 @@ const jsonRpcError = (status: number, message: string) =>
   });
 
 export async function POST(req: Request): Promise<Response> {
-  const auth = await authenticateMcp(req.headers.get("authorization"), { prisma });
+  const auth = await authenticateMcp(
+    { authorization: req.headers.get("authorization"), google: req.headers.get("x-nebula-google-token"), aws: req.headers.get("x-nebula-aws-sts") },
+    { prisma },
+  );
   if (!auth.ok) return jsonRpcError(auth.status, auth.reason);
+  const { login, google, aws } = auth.session;
 
   const ctx = { session: auth.session, prisma } as unknown as Context;
   const server = new McpServer({ name: "nebula", version: "0.1.0" }, { instructions: INSTRUCTIONS });
   registerNebulaTools(server, {
     caller: appRouter.createCaller(ctx),
-    login: auth.session.login,
+    login,
     observer: observerDeps(),
     sentinel: sentinelGet(),
-    notes: notesFor(auth.session.login),
+    notes: notesFor(login),
+    audit: async (tool, args, ok, ms, error) => {
+      await prisma.auditLog
+        .create({ data: { actor: login, action: `mcp.tool.${tool}`, allowed: ok, detail: JSON.parse(JSON.stringify({ google, aws, args, ms, error })) } })
+        .catch(() => {});
+    },
   });
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });
   await server.connect(transport);
