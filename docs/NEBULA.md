@@ -826,11 +826,13 @@ confirm is phrased for the agent: show the summary, get a yes, re-call with
 | Writes, self-service | `create_env_from_repo` (secret VALUES never accepted: declared secrets are created blank, filled in the UI) |
 | Writes, owner or operator | `rebuild_env`, `set_env_vars` (credential-shaped values refused), `extend_env`, `teardown_env` |
 | Writes, operators | `create_named_env`, `clone_staging_db`, `promote_release` / `merge_promotion` (target fixed to `staging`) |
+| Capacity reads (everyone bound) | `capacity_presets`, `capacity_tier`, `capacity_plan` (named template → live ops + `planHash`), `prod_atlas_plan` |
+| Capacity writes (operator **and** binding scope) | `apply_live_capacity` (`capacity:production` / `capacity:staging`; NAMED templates only: prod `baseline`/`campaign`/`max`, #6 floor + ×3/×0.5 + caps, nonce binds `planHash`), `set_prod_atlas_tier` (`capacity:production`; allowlisted clusters, +2/−1, M10–M200, nonce binds `from`) |
 
-**Production is read-only, by design:** logs, pods, nodes, overview, monitor and (once
-reachable) sentinel alerts. No write tool takes a cluster/tier/target (test-pinned);
-`applyLiveCapacity`, `setProdAtlasTier`, `setAtlasTier` and capacity PRs are not exposed —
-they stay in the UI, operator-only.
+**Production:** reads for every bound person; the only prod writes are capacity, for an operator
+whose binding carries `capacity:production` (`scripts/nebula-mcp-bind.sh … capacity:production`).
+Tools a person may not use are not even listed (`toolsFor`), and each handler re-checks. Custom
+sizes, `setAtlasTier` (NonProd) and capacity PRs stay UI-only.
 
 **Sentinel.** `server/mcp/sentinel.ts`: GET-only, path allowlist, READ key only,
 `x-actor: nebula-mcp:<login>`. Staging: `SENTINEL_STAGING_API_KEY` (copied from SM

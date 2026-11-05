@@ -29,7 +29,7 @@ function fakeFetch(w: World) {
 
 const goodGoogle = { iss: "https://accounts.google.com", aud: "32555940559.apps.googleusercontent.com", email: "nick@twizz.com", email_verified: "true", hd: "twizz.com", exp: String(NOW / 1000 + 3000) };
 const good: World = { login: "Nick", org: "active", google: goodGoogle, arn: ARN };
-const cfg = (bindings = `{"nick":{"google":"nick@twizz.com","aws":"${ARN}"}}`) => identityConfig({ NEBULA_MCP_IDENTITIES: bindings } as unknown as NodeJS.ProcessEnv);
+const cfg = (bindings = `{"nick":{"google":"nick@twizz.com","aws":"${ARN}","scopes":["capacity:production","bogus:scope"]}}`) => identityConfig({ NEBULA_MCP_IDENTITIES: bindings } as unknown as NodeJS.ProcessEnv);
 const prisma = () => ({ auditLog: { create: vi.fn(async () => ({})) } });
 const headers = (o: Partial<{ authorization: string; google: string; aws: string }> = {}) => ({ authorization: `Bearer ${GH}`, google: gtok(), aws: stsUrl(), ...o });
 
@@ -55,6 +55,7 @@ describe("MCP three-credential gate", () => {
     const { r, p } = await auth(good);
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.session).toMatchObject({ login: "nick", google: "nick@twizz.com", aws: ARN, accessToken: GH, user: { email: "nick@twizz.com" } });
+    if (r.ok) expect(r.session.scopes).toEqual(["capacity:production"]); // unknown scopes are dropped
     expect(p.auditLog.create).toHaveBeenCalledWith({ data: expect.objectContaining({ actor: "nick", action: "mcp.signin", allowed: true, detail: expect.objectContaining({ google: "nick@twizz.com", aws: ARN }) }) });
   });
 

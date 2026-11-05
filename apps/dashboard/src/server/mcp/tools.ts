@@ -6,10 +6,14 @@
 //   - an Observer log tool (@twizz-idp/observer) with an explicit scope on
 //     EKS-Twizz-NonProd, EKS-Moly-staging or EKS-Moly-Prod (READS only);
 //   - a GET on the twizz-sentinel read API (staging, or prod once reachable).
-// Production is READ-ONLY here: logs, pods, nodes, cluster overview, monitor,
-// sentinel alerts. No write touches it: no capacity/live/prod-Atlas procedure,
-// and the release train only targets staging (RELEASE_TARGETS). Adding a tool =
-// adding it to MCP_TOOL_NAMES (the test pins the list and its forbidden set).
+// Production: reads (logs, pods, nodes, overview, monitor, sentinel, capacity
+// plans) for every bound person; the ONLY prod writes are capacity, and only for
+// a Nebula operator whose binding also carries the scope (capacity:production):
+// live resize to a NAMED template from gitops (never a custom size; #6 step
+// limits, caps and the baseline floor apply; the nonce binds the plan hash) and
+// the prod Atlas tier (allowlisted clusters, +2/−1, M10–M200). Releases only
+// target staging. Tools a person may not use are not even registered for them
+// (toolsFor), and every handler re-checks. The test pins all of this.
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -18,6 +22,9 @@ import { ENV_KEY_RE, SECRET_SHAPE_RE } from "@twizz-idp/shared";
 import { fetchLogs, getGroupSamples, listPods, logHistogram, nodeMetrics, type ObserverCtx, type ObserverDeps, type ObserverScope, type ObserverTool } from "@twizz-idp/observer";
 import type { appRouter } from "../routers/_app";
 import { SENTINEL_TIERS, isObjectId, type SentinelGet } from "./sentinel";
+import type { McpScope } from "./identity";
+import { ATLAS_TIERS } from "@twizz-idp/shared";
+import { PROD_ATLAS } from "@twizz-idp/actions";
 
 export type AppCaller = ReturnType<typeof appRouter.createCaller>;
 
@@ -28,6 +35,10 @@ export type NebulaMcpDeps = {
   sentinel: SentinelGet;
   /** Per-login scratch for the Observer drill-down (last fetch_logs groups + scope). */
   notes: Record<string, unknown>;
+  /** Nebula's own RBAC (NEBULA_OPERATORS), resolved server-side — never from the client. */
+  operator: boolean;
+  /** Per-person MCP grants from the identity binding. */
+  scopes: McpScope[];
   /** One AuditLog row per tool call (reads included): full traceability. */
   audit?: (tool: string, args: Record<string, unknown>, ok: boolean, ms: number, error?: string) => Promise<void>;
 };
@@ -73,21 +84,37 @@ export const MCP_READ_TOOLS = [
   "sentinel_alert",
   "sentinel_alert_stats",
   "sentinel_events",
+  "capacity_presets",
+  "capacity_tier",
+  "capacity_plan",
+  "prod_atlas_plan",
 ] as const;
 
-export const MCP_WRITE_TOOLS = [
-  "create_env_from_repo",
-  "create_named_env",
-  "clone_staging_db",
-  "rebuild_env",
-  "set_env_vars",
-  "extend_env",
-  "teardown_env",
-  "promote_release",
-  "merge_promotion",
-] as const;
+/** Any bound person (Nebula then applies owner-or-operator per env). */
+export const MCP_SELF_SERVICE_WRITES = ["create_env_from_repo", "rebuild_env", "set_env_vars", "extend_env", "teardown_env"] as const;
+/** Nebula operators only. */
+export const MCP_OPERATOR_WRITES = ["create_named_env", "clone_staging_db", "promote_release", "merge_promotion"] as const;
+/** Operators whose binding carries the matching capacity scope. */
+export const MCP_CAPACITY_WRITES = ["apply_live_capacity", "set_prod_atlas_tier"] as const;
 
+export const MCP_WRITE_TOOLS = [...MCP_SELF_SERVICE_WRITES, ...MCP_OPERATOR_WRITES, ...MCP_CAPACITY_WRITES] as const;
 export const MCP_TOOL_NAMES = [...MCP_READ_TOOLS, ...MCP_WRITE_TOOLS] as const;
+export type McpToolName = (typeof MCP_TOOL_NAMES)[number];
+
+/** Live tiers a person may resize through MCP: operator AND capacity:<tier>. */
+export function liveTiersFor(who: { operator: boolean; scopes: readonly string[] }): Array<"production" | "staging"> {
+  if (!who.operator) return [];
+  return (["production", "staging"] as const).filter((t) => who.scopes.includes(`capacity:${t}`));
+}
+
+/** The tools this person gets — anything else is not even listed. */
+export function toolsFor(who: { operator: boolean; scopes: readonly string[] }): McpToolName[] {
+  const out: McpToolName[] = [...MCP_READ_TOOLS, ...MCP_SELF_SERVICE_WRITES];
+  if (who.operator) out.push(...MCP_OPERATOR_WRITES);
+  if (liveTiersFor(who).length) out.push("apply_live_capacity");
+  if (who.operator && who.scopes.includes("capacity:production")) out.push("set_prod_atlas_tier");
+  return out;
+}
 
 const RESULT_CHARS = 40_000;
 
@@ -177,7 +204,9 @@ const W = { readOnlyHint: false, destructiveHint: false, openWorldHint: true } a
 
 export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
   const c = d.caller;
-  const reg = <S extends z.ZodRawShape>(name: (typeof MCP_TOOL_NAMES)[number], description: string, shape: S, annotations: Record<string, boolean>, handler: (a: z.objectOutputType<S, z.ZodTypeAny>) => Promise<Content>) =>
+  const allowed = new Set<string>(toolsFor(d));
+  const reg = <S extends z.ZodRawShape>(name: McpToolName, description: string, shape: S, annotations: Record<string, boolean>, handler: (a: z.objectOutputType<S, z.ZodTypeAny>) => Promise<Content>) =>
+    allowed.has(name) &&
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     server.registerTool(name, { description, inputSchema: shape, annotations } as any, (async (a: z.objectOutputType<S, z.ZodTypeAny>) => {
       const t0 = Date.now();
@@ -305,6 +334,75 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
     },
     RO,
     async ({ tier: t, ...a }) => json(await sg(t ?? "staging", "events", { ...a, limit: a.limit ?? 25 }, d.login)),
+  );
+
+  // ── capacity (§N5): reads for everyone bound; writes = operator + scope ──
+  const liveTiers = liveTiersFor(d);
+  const presetName = z.string().regex(/^[a-z][a-z0-9-]{1,23}$/).describe("A named template from twizz-gitops capacity/presets.yaml (capacity_presets); custom sizes are UI-only");
+  const atlasTier = z.enum(ATLAS_TIERS as unknown as [string, ...string[]]);
+
+  reg("capacity_presets", "Capacity templates (twizz-gitops capacity/presets.yaml): name, title, description and which tiers each sizes. Production templates: baseline / campaign / max.", {}, RO, async () => {
+    const o = await c.capacity.overview();
+    return json({
+      presets: o.presets.map((p) => ({ name: p.name, title: p.title, description: p.description, tiers: Object.keys(p.tiers) })),
+      presetsError: o.presetsError,
+      openCapacityPrs: o.prs,
+    });
+  });
+
+  reg("capacity_tier", "What a tier runs now: for staging/production the LIVE cluster state (replicas, HPAs, resources, node groups), caps, the paired-service advisory, and the Atlas tier.", { tier: z.enum(["preview", "staging", "production"]) }, RO, async (a) =>
+    json(await c.capacity.tier({ tier: a.tier })),
+  );
+
+  reg(
+    "capacity_plan",
+    "Plan moving a tier to a named template, against a FRESH read of the cluster: the ordered live ops, violations, warnings, cost, and the planHash that apply_live_capacity needs. Read-only.",
+    { tier: z.enum(["preview", "staging", "production"]), preset: presetName },
+    RO,
+    async (a) => {
+      const { exportYaml: _x, ...plan } = (await c.capacity.plan({ tier: a.tier, preset: a.preset })) as Record<string, unknown>;
+      return json(plan);
+    },
+  );
+
+  reg(
+    "prod_atlas_plan",
+    `What resizing ONE prod Atlas cluster would do (${PROD_ATLAS.clusters.join(" / ")}): from → to, changes, cost, warnings, violations. Read-only.`,
+    { cluster: z.enum(PROD_ATLAS.clusters), instanceSize: atlasTier, autoScaling: z.object({ min: atlasTier, max: atlasTier }).optional() },
+    RO,
+    async (a) => json(await c.capacity.prodAtlasPlan({ cluster: a.cluster, size: { instanceSize: a.instanceSize, ...(a.autoScaling ? { autoScaling: a.autoScaling } : {}) } as never })),
+  );
+
+  const needScope = (scope: McpScope) => {
+    if (!d.operator || !d.scopes.includes(scope)) throw new TRPCError({ code: "FORBIDDEN", message: `needs a Nebula operator with the ${scope} MCP scope` });
+  };
+
+  if (liveTiers.length) {
+    reg(
+      "apply_live_capacity",
+      [
+        `OPERATORS with capacity:<tier>: resize ${liveTiers.join("/")} ON THE CLUSTER to a NAMED template (prod: baseline / campaign / max). No custom sizes here.`,
+        "Steps: capacity_plan {tier, preset} → review ops/violations/warnings → call this with the plan's planHash (no confirm) → show the CONFIRMATION summary verbatim → only after an explicit yes, call again with confirm.",
+        "Refused if the cluster moved since the plan (planHash), if any step exceeds ×3/×0.5, a cap, or the baseline floor. Stops at the first failure. Every attempt is audited.",
+      ].join(" "),
+      { tier: z.enum(liveTiers as [string, ...string[]]), preset: presetName, planHash: z.string().regex(/^[0-9a-f]{64}$/), confirm },
+      { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+      async (a) => {
+        needScope(`capacity:${a.tier}` as McpScope);
+        return gateText(await c.actions.applyLiveCapacity({ tier: a.tier as "production" | "staging", preset: a.preset, planHash: a.planHash, confirm: a.confirm }));
+      },
+    );
+  }
+
+  reg(
+    "set_prod_atlas_tier",
+    `OPERATORS with capacity:production: resize ONE prod Atlas cluster (${PROD_ATLAS.clusters.join(" / ")}) within ${PROD_ATLAS.floor}–${PROD_ATLAS.cap}, at most +${PROD_ATLAS.maxStepUp}/−${PROD_ATLAS.maxStepDown} tier per apply. Steps: prod_atlas_plan → this with from = the plan's "from" (no confirm) → show the summary verbatim → explicit yes → again with confirm. Refused if the cluster changed since review.`,
+    { cluster: z.enum(PROD_ATLAS.clusters), instanceSize: atlasTier, autoScaling: z.object({ min: atlasTier, max: atlasTier }).optional(), from: z.string().max(40), confirm },
+    { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
+    async (a) => {
+      needScope("capacity:production");
+      return gateText(await c.actions.setProdAtlasTier({ cluster: a.cluster, size: { instanceSize: a.instanceSize, ...(a.autoScaling ? { autoScaling: a.autoScaling } : {}) } as never, from: a.from, confirm: a.confirm }));
+    },
   );
 
   // ── writes: all through the gate (two-step confirm) ──────────────────

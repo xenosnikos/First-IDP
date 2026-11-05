@@ -3,8 +3,12 @@
 # NEBULA_MCP_IDENTITIES in SM preview/nebula = {"<github login>": {"google": …, "aws": …}}.
 # A binding IS the MCP access list: no binding, no MCP (operators included).
 #
-#   AWS_PROFILE=twizz bash scripts/nebula-mcp-bind.sh <github-login> <google-email> <aws-iam-user-name>
+#   AWS_PROFILE=twizz bash scripts/nebula-mcp-bind.sh <github-login> <google-email> <aws-iam-user-name> [scopes]
 #   AWS_PROFILE=twizz bash scripts/nebula-mcp-bind.sh <github-login> --remove
+#
+# scopes (optional, comma-separated; default none): capacity:production, capacity:staging.
+# They only add MCP capacity writes for someone who is ALSO a Nebula operator
+# (NEBULA_OPERATORS); on anyone else they grant nothing. Re-run to change them.
 #
 # The AWS user must be /nebula-mcp/<name> (scripts/nebula-mcp-iam.sh user <name>), the
 # Google account a verified @twizz.com one, and the GitHub login already allowed on
@@ -25,13 +29,15 @@ if [ "${2:-}" = "--remove" ]; then
 else
   GOOGLE=$(echo "${2:?google email}" | tr '[:upper:]' '[:lower:]')
   AWSUSER=$(echo "${3:?aws iam user name}" | tr '[:upper:]' '[:lower:]')
+  SCOPES=${4:-}
+  for sc in ${SCOPES//,/ }; do [[ "$sc" =~ ^capacity:(production|staging)$ ]] || { echo "unknown scope: $sc" >&2; exit 2; }; done
   [[ "$GOOGLE" =~ ^[a-z0-9._%+-]+@twizz\.com$ ]] || { echo "google must be a @twizz.com address" >&2; exit 2; }
   path=$(aws iam get-user --user-name "$AWSUSER" --query User.Path --output text 2>/dev/null || true)
   [ "$path" = "/nebula-mcp/" ] || { echo "IAM user $AWSUSER not found under /nebula-mcp/ (run scripts/nebula-mcp-iam.sh user $AWSUSER)" >&2; exit 1; }
   allowed=$(aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET" --query SecretString --output text | jq -r '.ALLOWED_GITHUB_LOGINS // "" | ascii_downcase')
   [[ ",$allowed," == *",$LOGIN,"* ]] || echo "note: $LOGIN is not in ALLOWED_GITHUB_LOGINS (fine only if they are an active twizz-app member)" >&2
-  prog='.NEBULA_MCP_IDENTITIES = ((.NEBULA_MCP_IDENTITIES // "{}" | fromjson) + {($login): {google: $google, aws: $arn}} | tojson)'
-  args=(--arg login "$LOGIN" --arg google "$GOOGLE" --arg arn "arn:aws:iam::$ACCOUNT:user/nebula-mcp/$AWSUSER")
+  prog='.NEBULA_MCP_IDENTITIES = ((.NEBULA_MCP_IDENTITIES // "{}" | fromjson) + {($login): {google: $google, aws: $arn, scopes: ($scopes | split(",") | map(select(length > 0)) | unique)}} | tojson)'
+  args=(--arg login "$LOGIN" --arg google "$GOOGLE" --arg arn "arn:aws:iam::$ACCOUNT:user/nebula-mcp/$AWSUSER" --arg scopes "$SCOPES")
 fi
 
 aws secretsmanager get-secret-value --region "$REGION" --secret-id "$SECRET" --query SecretString --output text | jq "${args[@]}" "$prog" > "$T"

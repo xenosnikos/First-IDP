@@ -11,7 +11,7 @@
 import { createHash } from "node:crypto";
 import type { PrismaClient } from "@twizz-idp/db";
 import { githubLoginOf, isAllowedGithubUser } from "@/lib/github-access";
-import { identityConfig, verifyAws, verifyGoogle, type FetchLike as IdFetch, type IdentityConfig } from "./identity";
+import { identityConfig, verifyAws, verifyGoogle, type FetchLike as IdFetch, type IdentityConfig, type McpScope } from "./identity";
 
 export type McpSession = {
   user: { name: string | null; email: string; image: null };
@@ -21,6 +21,8 @@ export type McpSession = {
   via: "mcp";
   google: string;
   aws: string;
+  /** per-person MCP grants from the binding (on top of Nebula RBAC) */
+  scopes: McpScope[];
 };
 
 export type McpAuthResult = { ok: true; session: McpSession } | { ok: false; status: 401 | 403; reason: string };
@@ -134,10 +136,10 @@ export async function authenticateMcp(
   const tk = sha(`${gk}|${gtk}|${ak}`);
   if (!denyCache.has(`ok:${tk}`)) {
     put(denyCache, `ok:${tk}`, now);
-    await audit(login, true, { google, aws });
+    await audit(login, true, { google, aws, scopes: binding.scopes });
   }
   return {
     ok: true,
-    session: { user: { name: gh.r.name ?? login, email: google, image: null }, login, accessToken: token, expires: new Date(now + GH_TTL_MS).toISOString(), via: "mcp", google, aws },
+    session: { user: { name: gh.r.name ?? login, email: google, image: null }, login, accessToken: token, expires: new Date(now + GH_TTL_MS).toISOString(), via: "mcp", google, aws, scopes: binding.scopes },
   };
 }

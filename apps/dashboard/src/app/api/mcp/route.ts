@@ -12,6 +12,7 @@ import { authenticateMcp } from "@/server/mcp/auth";
 import { registerNebulaTools } from "@/server/mcp/tools";
 import { sentinelGet } from "@/server/mcp/sentinel";
 import { observerDeps } from "@/server/nebula/observer";
+import { isOperator } from "@/lib/nebula/operators";
 import type { Context } from "@/server/context";
 
 export const runtime = "nodejs";
@@ -48,19 +49,23 @@ export async function POST(req: Request): Promise<Response> {
     { prisma },
   );
   if (!auth.ok) return jsonRpcError(auth.status, auth.reason);
-  const { login, google, aws } = auth.session;
+  const { login, google, aws, scopes } = auth.session;
+  // authority comes from the IDP, resolved here — never from anything the client sends
+  const operator = isOperator(login);
 
   const ctx = { session: auth.session, prisma } as unknown as Context;
   const server = new McpServer({ name: "nebula", version: "0.1.0" }, { instructions: INSTRUCTIONS });
   registerNebulaTools(server, {
     caller: appRouter.createCaller(ctx),
     login,
+    operator,
+    scopes,
     observer: observerDeps(),
     sentinel: sentinelGet(),
     notes: notesFor(login),
     audit: async (tool, args, ok, ms, error) => {
       await prisma.auditLog
-        .create({ data: { actor: login, action: `mcp.tool.${tool}`, allowed: ok, detail: JSON.parse(JSON.stringify({ google, aws, args, ms, error })) } })
+        .create({ data: { actor: login, action: `mcp.tool.${tool}`, allowed: ok, detail: JSON.parse(JSON.stringify({ google, aws, operator, scopes, args, ms, error })) } })
         .catch(() => {});
     },
   });

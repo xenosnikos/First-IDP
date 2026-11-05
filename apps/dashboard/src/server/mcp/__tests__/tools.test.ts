@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { MCP_CLUSTERS, MCP_TOOL_NAMES, MCP_WRITE_TOOLS, gateText, registerNebulaTools, scopeOf, type AppCaller, type NebulaMcpDeps } from "../tools";
+import { MCP_CAPACITY_WRITES, MCP_CLUSTERS, MCP_OPERATOR_WRITES, MCP_READ_TOOLS, MCP_SELF_SERVICE_WRITES, MCP_TOOL_NAMES, MCP_WRITE_TOOLS, toolsFor, gateText, registerNebulaTools, scopeOf, type AppCaller, type NebulaMcpDeps } from "../tools";
 import { isAllowedSentinelPath, sentinelEndpoint } from "../sentinel";
 
 // A caller that records every procedure call: tools must only reach the
@@ -28,6 +28,8 @@ async function connect(deps: Partial<NebulaMcpDeps> & { caller: AppCaller }) {
   const server = new McpServer({ name: "nebula", version: "test" });
   registerNebulaTools(server, {
     login: "nick",
+    operator: true,
+    scopes: ["capacity:production", "capacity:staging"],
     notes: {},
     observer: {
       getPodLogs: vi.fn(async () => ({ status: "complete" as const, lines: [] })),
@@ -46,23 +48,54 @@ async function connect(deps: Partial<NebulaMcpDeps> & { caller: AppCaller }) {
 const textOf = (r: unknown) => ((r as { content: Array<{ text: string }> }).content[0]?.text ?? "");
 
 describe("nebula MCP surface", () => {
-  it("registers exactly the pinned tool list", async () => {
+  it("an operator with both capacity scopes gets exactly the pinned tool list", async () => {
     const client = await connect({ caller: fakeCaller().caller });
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([...MCP_TOOL_NAMES].sort());
   });
 
-  it("never wraps a live-capacity / Atlas / capacity-PR procedure (prod is read-only)", () => {
+  it("tools a person may not use are not even listed", async () => {
+    const names = async (operator: boolean, scopes: string[]) => (await (await connect({ caller: fakeCaller().caller, operator, scopes: scopes as never })).listTools()).tools.map((t) => t.name).sort();
+    const everyone = [...MCP_READ_TOOLS, ...MCP_SELF_SERVICE_WRITES].sort();
+    expect(await names(false, [])).toEqual(everyone);
+    expect(await names(false, ["capacity:production"])).toEqual(everyone); // a scope without operator grants nothing
+    expect(await names(true, [])).toEqual([...everyone, ...MCP_OPERATOR_WRITES].sort()); // operator without a scope: no capacity writes
+    expect(toolsFor({ operator: true, scopes: ["capacity:staging"] })).toContain("apply_live_capacity");
+    expect(toolsFor({ operator: true, scopes: ["capacity:staging"] })).not.toContain("set_prod_atlas_tier");
+  });
+
+  it("live capacity: only the tiers the person is scoped for, only NAMED templates (no custom size)", async () => {
+    const client = await connect({ caller: fakeCaller().caller, scopes: ["capacity:staging"] as never });
+    const t = (await client.listTools()).tools.find((x) => x.name === "apply_live_capacity")!;
+    const props = (t.inputSchema as { properties: Record<string, { enum?: string[] }> }).properties;
+    expect(props.tier.enum).toEqual(["staging"]);
+    expect(Object.keys(props)).not.toContain("custom");
+    const r = await client.callTool({ name: "apply_live_capacity", arguments: { tier: "production", preset: "max", planHash: "a".repeat(64) } });
+    expect(r.isError).toBe(true);
+  });
+
+  it("live capacity forwards the preset + planHash to the gated procedure, never a custom size", async () => {
+    const { caller, calls } = fakeCaller();
+    const client = await connect({ caller });
+    await client.callTool({ name: "apply_live_capacity", arguments: { tier: "production", preset: "campaign", planHash: "b".repeat(64) } });
+    const call = calls.find((c) => c.proc === "actions.applyLiveCapacity")!;
+    expect(call.input).toEqual({ tier: "production", preset: "campaign", planHash: "b".repeat(64), confirm: undefined });
+  });
+
+  it("never wraps the capacity-PR / NonProd Atlas procedures, and capacity writes appear only behind needScope", () => {
     const src = readFileSync(path.join(__dirname, "../tools.ts"), "utf8");
-    for (const forbidden of ["applyLiveCapacity", "setProdAtlasTier", "setAtlasTier", "applyCapacityPreset", "mergeCapacityPr"]) {
-      expect(src).not.toContain(`.${forbidden}(`);
+    for (const forbidden of ["setAtlasTier", "applyCapacityPreset", "mergeCapacityPr"]) expect(src).not.toContain(`.${forbidden}(`);
+    for (const proc of ["applyLiveCapacity", "setProdAtlasTier"]) {
+      const at = src.indexOf(`c.actions.${proc}(`);
+      expect(at).toBeGreaterThan(0);
+      expect(src.lastIndexOf("needScope(", at)).toBeGreaterThan(src.lastIndexOf("reg(", at));
     }
   });
 
-  it("no write tool takes a cluster, tier or target argument", async () => {
+  it("no non-capacity write tool takes a cluster, tier or target argument", async () => {
     const client = await connect({ caller: fakeCaller().caller });
     const { tools } = await client.listTools();
-    for (const t of tools.filter((x) => (MCP_WRITE_TOOLS as readonly string[]).includes(x.name))) {
+    for (const t of tools.filter((x) => (MCP_WRITE_TOOLS as readonly string[]).includes(x.name) && !(MCP_CAPACITY_WRITES as readonly string[]).includes(x.name))) {
       const props = Object.keys((t.inputSchema as { properties?: object }).properties ?? {});
       expect(props, t.name).not.toContain("cluster");
       expect(props, t.name).not.toContain("tier");

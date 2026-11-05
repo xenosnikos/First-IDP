@@ -16,7 +16,11 @@
 
 export type FetchLike = (url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; text(): Promise<string> }>;
 
-export type McpBinding = { google: string; aws: string };
+/** Extra, per-person grants on top of Nebula's own RBAC (operator etc.). Only these exist. */
+export const MCP_SCOPES = ["capacity:production", "capacity:staging"] as const;
+export type McpScope = (typeof MCP_SCOPES)[number];
+
+export type McpBinding = { google: string; aws: string; scopes: McpScope[] };
 export type McpBindings = Record<string, McpBinding>;
 
 export const ACCOUNT_ID = "848281935985";
@@ -49,14 +53,18 @@ export function identityConfig(env: NodeJS.ProcessEnv = process.env): IdentityCo
   };
 }
 
-/** `{"login":{"google":"a@twizz.com","aws":"arn:aws:iam::…:user/nebula-mcp/a"}}`; bad JSON = no bindings (fail closed). */
+/** `{"login":{"google":"a@twizz.com","aws":"arn:aws:iam::…:user/nebula-mcp/a","scopes":["capacity:production"]}}`;
+ * bad JSON = no bindings (fail closed); unknown scopes are dropped. */
 export function parseBindings(raw: string | undefined): McpBindings {
   if (!raw) return {};
   try {
-    const obj = JSON.parse(raw) as Record<string, { google?: unknown; aws?: unknown }>;
+    const obj = JSON.parse(raw) as Record<string, { google?: unknown; aws?: unknown; scopes?: unknown }>;
     const out: McpBindings = {};
     for (const [login, b] of Object.entries(obj ?? {})) {
-      if (typeof b?.google === "string" && typeof b?.aws === "string" && b.google && b.aws) out[login.toLowerCase()] = { google: b.google.toLowerCase(), aws: b.aws };
+      if (typeof b?.google === "string" && typeof b?.aws === "string" && b.google && b.aws) {
+        const scopes = Array.isArray(b.scopes) ? (b.scopes.filter((s) => (MCP_SCOPES as readonly unknown[]).includes(s)) as McpScope[]) : [];
+        out[login.toLowerCase()] = { google: b.google.toLowerCase(), aws: b.aws, scopes: [...new Set(scopes)] };
+      }
     }
     return out;
   } catch {
