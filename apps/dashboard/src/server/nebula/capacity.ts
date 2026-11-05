@@ -3,7 +3,9 @@
 // CloudWatch Container Insights for staging/prod (no kube path there).
 import { awsService, atlasTierService, prodAtlasTierService } from "@twizz-idp/core";
 import {
+  BASELINE_TEMPLATE,
   LIVE_TARGETS,
+  type LivePlanOpts,
   type LiveState,
   type LiveTier,
   AtlasTierAdapter,
@@ -145,6 +147,17 @@ async function observeKube(t: CapacityTarget) {
 }
 
 /** Live state of a Moly cluster (staging ns default/jobs, prod). Never throws. */
+/** How a live plan is checked (§N5.2). A NAMED template is planned as a
+ * template, floored by the tier's `baseline` template (read from gitops, never
+ * from the client); a hand edit (`custom`, or no preset) gets the normal rules.
+ * The plan query and the apply mutation both call this, so their hashes agree. */
+export async function liveTemplateOpts(tier: LiveTier, input: { preset?: string; custom?: unknown }): Promise<LivePlanOpts> {
+  if (input.custom || !input.preset) return {};
+  const presets = await loadPresets(namedEnvDeps().promotions);
+  const floor = presets.find((p) => p.name === BASELINE_TEMPLATE)?.tiers[tier]?.live;
+  return { template: { name: input.preset, ...(floor ? { floor } : {}) } };
+}
+
 export async function readLive(tier: LiveTier): Promise<{ state: LiveState } | { error: string }> {
   try {
     return { state: await liveClusterPort(LIVE_TARGETS[tier]).read() };

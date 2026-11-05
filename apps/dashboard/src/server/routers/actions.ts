@@ -65,7 +65,7 @@ import { isOperator } from "@/lib/nebula/operators";
 import { argoWord, ttlWord } from "@/lib/nebula/status";
 import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
-import { atlasPort, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, targetFor } from "../nebula/capacity";
+import { atlasPort, liveTemplateOpts, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, targetFor } from "../nebula/capacity";
 import { liveClusterPort } from "../nebula/live-cluster";
 import { resolveSize } from "./capacity";
 
@@ -498,9 +498,9 @@ export const actionsRouter = router({
       const { label, size } = await resolveSize(tier, input);
       if (!size.live) throw new TRPCError({ code: "BAD_REQUEST", message: `"${label}" has no live sizing for ${tier}` });
       const t = LIVE_TARGETS[tier];
-      const r = await readLive(tier);
+      const [r, opts] = await Promise.all([readLive(tier), liveTemplateOpts(tier, input)]);
       if ("error" in r) throw new TRPCError({ code: "PRECONDITION_FAILED", message: `${t.cluster} not readable: ${r.error}` });
-      const plan = planLive(t, r.state, size.live);
+      const plan = planLive(t, r.state, size.live, opts);
       if (plan.planHash !== planHash) throw new TRPCError({ code: "CONFLICT", message: `${t.cluster} changed since you reviewed the plan — reload it` });
       if (plan.violations.length) throw new TRPCError({ code: "BAD_REQUEST", message: plan.violations.join("\n") });
       if (!plan.ops.length) throw new TRPCError({ code: "BAD_REQUEST", message: `${t.cluster} already matches "${label}"` });
@@ -512,7 +512,7 @@ export const actionsRouter = router({
         `- applied live on the cluster (no PR); refused if anything moves before you confirm; stops at the first failure`,
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
-      return shape(await gate("apply_live_capacity", fields, confirm, summary, () => applyLive(liveClusterPort(t), t, size.live!, planHash)));
+      return shape(await gate("apply_live_capacity", fields, confirm, summary, () => applyLive(liveClusterPort(t), t, size.live!, planHash, opts)));
     }),
 
   // ── Build-on-provision: any twizz-app repo/branch, self-service ───────

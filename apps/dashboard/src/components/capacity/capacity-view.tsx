@@ -176,14 +176,13 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(380px, 1fr))", gap: 16, alignItems: "start" }}>
         <CurrentPane data={tierQ.data} loading={tierQ.isLoading} />
 
-        <Section title={tier === "production" ? "Configure" : "Template"}>
-          {tier === "production" ? (
+        <Section title="Template">
+          {tier === "production" && (
             <div style={{ fontSize: 12, color: "var(--n-ink-muted)", lineHeight: 1.6, marginBottom: 4 }}>
-              No presets on prod: what is set on the cluster is the desired configuration. Change it below — the editor starts from what runs and sends only what you change.
+              Pick a template to plan it against what runs, then apply it (one confirm). A template may scale straight back down to its own values, never below Baseline. For anything else, edit the live sizing below.
             </div>
-          ) : (
-          <>
-          <div style={{ ...label, margin: "6px 0 8px" }}>presets · capacity/presets.yaml</div>
+          )}
+          <div style={{ ...label, margin: "6px 0 8px" }}>{tier === "production" ? "templates" : "presets"} · capacity/presets.yaml</div>
           {overview.isLoading && <span style={{ color: "var(--n-ink-muted)" }}>reading twizz-gitops…</span>}
           {presets.map((p) => {
             const active = choice?.mode === "preset" && choice.name === p.name;
@@ -199,7 +198,12 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
               </button>
             );
           })}
+          {tier === "production" && !overview.isLoading && presets.length === 0 && (
+            <div style={{ fontSize: 11, color: "var(--n-ink-muted)" }}><Pill word="UNKNOWN" /> no template in capacity/presets.yaml has a production section</div>
+          )}
 
+          {tier !== "production" && (
+          <>
           <div style={{ ...label, margin: "18px 0 8px" }}>traffic calculator · capacity/profiles.yaml</div>
           <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
             <Field label="steady rps"><input style={inputStyle} inputMode="numeric" value={traffic.rps} onChange={(e) => setTraffic({ ...traffic, rps: e.target.value })} /></Field>
