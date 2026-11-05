@@ -14,6 +14,7 @@
 // the prod Atlas tier (allowlisted clusters, +2/−1, M10–M200). Releases only
 // target staging. Tools a person may not use are not even registered for them
 // (toolsFor), and every handler re-checks. The test pins all of this.
+import { randomUUID } from "node:crypto";
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -40,7 +41,9 @@ export type NebulaMcpDeps = {
   /** Per-person MCP grants from the identity binding. */
   scopes: McpScope[];
   /** One AuditLog row per tool call (reads included): full traceability. */
-  audit?: (tool: string, args: Record<string, unknown>, ok: boolean, ms: number, error?: string) => Promise<void>;
+  audit?: (tool: string, args: Record<string, unknown>, ok: boolean, ms: number, error?: string, intentId?: string) => Promise<void>;
+  /** Durable intent row written BEFORE a confirmed write runs; must throw if it can't be stored. */
+  intent?: (tool: string, args: Record<string, unknown>, intentId: string) => Promise<void>;
 };
 
 /** What a tool-call audit row may carry: names and shapes, never values that could be secrets or file bodies. */
@@ -210,8 +213,21 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     server.registerTool(name, { description, inputSchema: shape, annotations } as any, (async (a: z.objectOutputType<S, z.ZodTypeAny>) => {
       const t0 = Date.now();
+      const args = auditArgs(a as Record<string, unknown>);
+      // a confirmed write (the call that executes) needs a durable intent row FIRST:
+      // if the audit store can't take it, nothing runs (Codex review)
+      let intentId: string | undefined;
+      if ((MCP_WRITE_TOOLS as readonly string[]).includes(name) && (a as { confirm?: unknown }).confirm) {
+        intentId = randomUUID();
+        try {
+          if (!d.intent) throw new Error("no intent recorder");
+          await d.intent(name, args, intentId);
+        } catch (e) {
+          return text(`REFUSED: the audit store is unavailable, so this write was not attempted (${String((e as Error)?.message ?? e).slice(0, 120)}). Try again later.`, true);
+        }
+      }
       const out = await run(() => handler(a));
-      await d.audit?.(name, auditArgs(a as Record<string, unknown>), !out.isError, Date.now() - t0, out.isError ? out.content[0]?.text.slice(0, 300) : undefined).catch(() => {});
+      await d.audit?.(name, args, !out.isError, Date.now() - t0, out.isError ? out.content[0]?.text.slice(0, 300) : undefined, intentId).catch(() => {});
       return out;
     }) as any);
 

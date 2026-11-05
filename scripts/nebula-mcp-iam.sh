@@ -5,8 +5,9 @@
 # presigns sts:GetCallerIdentity (which needs no permission) and Nebula checks
 # the ARN. So the IAM users (path /nebula-mcp/, group nebula-mcp-users) may do
 # nothing except manage their OWN password, MFA and access keys — key creation
-# requires MFA — and an explicit Deny on everything else means even a policy
-# attached by mistake grants nothing. Idempotent.
+# requires MFA — and explicit Denies (everything else; any credential action on
+# another user; key changes without MFA) mean even a policy attached by mistake
+# can't be used to escalate. Idempotent.
 #
 #   AWS_PROFILE=twizz bash scripts/nebula-mcp-iam.sh                 # group + policy
 #   AWS_PROFILE=twizz bash scripts/nebula-mcp-iam.sh user <name>     # + IAM user /nebula-mcp/<name> with a
@@ -21,6 +22,7 @@ GROUP=nebula-mcp-users
 IAM_PATH=/nebula-mcp/
 POLICY_NAME=NebulaMcpSelfServiceOnly
 SELF="arn:aws:iam::$ACCOUNT:user${IAM_PATH}\${aws:username}"
+MFA="arn:aws:iam::$ACCOUNT:mfa/\${aws:username}*"
 
 T=$(mktemp)
 trap 'rm -f "$T"' EXIT
@@ -28,23 +30,27 @@ cat > "$T" <<EOF
 {
   "Version": "2012-10-17",
   "Statement": [
-    { "Sid": "PasswordPolicyView", "Effect": "Allow", "Action": ["iam:GetAccountPasswordPolicy", "iam:GetAccountSummary"], "Resource": "*" },
-    { "Sid": "OwnUserView", "Effect": "Allow",
+    { "Sid": "AccountLevelReads", "Effect": "Allow", "Action": ["iam:GetAccountPasswordPolicy", "iam:GetAccountSummary", "iam:ListVirtualMFADevices"], "Resource": "*" },
+    { "Sid": "OwnUserSelfService", "Effect": "Allow",
       "Action": ["iam:GetUser", "iam:GetLoginProfile", "iam:ChangePassword", "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed", "iam:ListMFADevices",
-                 "iam:ListSigningCertificates", "iam:ListSSHPublicKeys", "iam:ListServiceSpecificCredentials"],
+                 "iam:EnableMFADevice", "iam:ResyncMFADevice", "iam:ListSigningCertificates", "iam:ListSSHPublicKeys", "iam:ListServiceSpecificCredentials"],
       "Resource": "$SELF" },
-    { "Sid": "OwnVirtualMfa", "Effect": "Allow", "Action": ["iam:CreateVirtualMFADevice", "iam:DeleteVirtualMFADevice"],
-      "Resource": "arn:aws:iam::$ACCOUNT:mfa/\${aws:username}*" },
-    { "Sid": "OwnMfaEnable", "Effect": "Allow", "Action": ["iam:EnableMFADevice", "iam:ResyncMFADevice", "iam:ListVirtualMFADevices"], "Resource": "*" },
+    { "Sid": "OwnVirtualMfa", "Effect": "Allow", "Action": ["iam:CreateVirtualMFADevice", "iam:DeleteVirtualMFADevice"], "Resource": "$MFA" },
     { "Sid": "OwnAccessKeysWithMfa", "Effect": "Allow", "Action": ["iam:CreateAccessKey", "iam:UpdateAccessKey", "iam:DeleteAccessKey"],
       "Resource": "$SELF", "Condition": { "Bool": { "aws:MultiFactorAuthPresent": "true" } } },
     { "Sid": "DenyEverythingElse", "Effect": "Deny",
-      "NotAction": ["iam:GetAccountPasswordPolicy", "iam:GetAccountSummary", "iam:GetUser", "iam:GetLoginProfile", "iam:ChangePassword",
+      "NotAction": ["iam:GetAccountPasswordPolicy", "iam:GetAccountSummary", "iam:ListVirtualMFADevices", "iam:GetUser", "iam:GetLoginProfile", "iam:ChangePassword",
                     "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed", "iam:CreateAccessKey", "iam:UpdateAccessKey", "iam:DeleteAccessKey",
-                    "iam:ListMFADevices", "iam:ListVirtualMFADevices", "iam:CreateVirtualMFADevice", "iam:DeleteVirtualMFADevice",
-                    "iam:EnableMFADevice", "iam:ResyncMFADevice", "iam:ListSigningCertificates", "iam:ListSSHPublicKeys",
-                    "iam:ListServiceSpecificCredentials", "sts:GetCallerIdentity", "sts:GetSessionToken"],
-      "Resource": "*" }
+                    "iam:ListMFADevices", "iam:CreateVirtualMFADevice", "iam:DeleteVirtualMFADevice", "iam:EnableMFADevice", "iam:ResyncMFADevice",
+                    "iam:ListSigningCertificates", "iam:ListSSHPublicKeys", "iam:ListServiceSpecificCredentials", "sts:GetCallerIdentity", "sts:GetSessionToken"],
+      "Resource": "*" },
+    { "Sid": "DenyCredentialActionsOnAnyoneElse", "Effect": "Deny",
+      "Action": ["iam:GetUser", "iam:GetLoginProfile", "iam:ChangePassword", "iam:ListAccessKeys", "iam:GetAccessKeyLastUsed", "iam:CreateAccessKey",
+                 "iam:UpdateAccessKey", "iam:DeleteAccessKey", "iam:ListMFADevices", "iam:EnableMFADevice", "iam:ResyncMFADevice",
+                 "iam:CreateVirtualMFADevice", "iam:DeleteVirtualMFADevice", "iam:ListSigningCertificates", "iam:ListSSHPublicKeys", "iam:ListServiceSpecificCredentials"],
+      "NotResource": ["$SELF", "$MFA"] },
+    { "Sid": "DenyKeyChangesWithoutMfa", "Effect": "Deny", "Action": ["iam:CreateAccessKey", "iam:UpdateAccessKey"], "Resource": "*",
+      "Condition": { "BoolIfExists": { "aws:MultiFactorAuthPresent": "false" } } }
   ]
 }
 EOF

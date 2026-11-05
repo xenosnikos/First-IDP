@@ -127,3 +127,53 @@ describe("MCP three-credential gate", () => {
     expect(count("https://api.github.com/user")).toBe(4);
   });
 });
+
+describe("gate hardening (Codex review 2026-11-05)", () => {
+  beforeEach(() => {
+    _resetMcpAuthCache();
+    process.env.ALLOWED_GITHUB_LOGINS = "";
+    process.env.ALLOWED_GITHUB_ORGS = "twizz-app";
+  });
+
+  it("incomplete or malformed requests make NO outbound call and write NO audit row", async () => {
+    for (const h of [headers({ google: "" }), headers({ aws: "" }), headers({ aws: stsUrl({ "X-Amz-SignedHeaders": "host" }) }), headers({ google: "not-a-jwt" })]) {
+      const f = fakeFetch(good);
+      const p = prisma();
+      const r = await authenticateMcp(h, { prisma: p as never, fetch: f as never, now: () => NOW, config: cfg() });
+      expect(r).toMatchObject({ ok: false, status: 401 });
+      expect(f).not.toHaveBeenCalled();
+      expect(p.auditLog.create).not.toHaveBeenCalled();
+    }
+  });
+
+  it("an unknown GitHub token is refused without an audit row (nothing to attribute it to)", async () => {
+    const { r, p } = await auth({ ...good, login: null });
+    expect(r).toMatchObject({ ok: false, status: 401 });
+    expect(p.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it("a cached AWS proof is not accepted past its own signed expiry", async () => {
+    const f = fakeFetch(good);
+    let now = NOW;
+    const deps = { prisma: prisma() as never, fetch: f as never, now: () => now, config: cfg() };
+    expect((await authenticateMcp(headers(), deps)).ok).toBe(true);
+    now = Date.parse("2026-11-05T19:14:01Z"); // proof signed 18:59:00 + 900 s → expired 19:14:00
+    const r = await authenticateMcp(headers(), deps);
+    expect(r).toMatchObject({ ok: false, status: 401, reason: expect.stringMatching(/expired/) });
+  });
+
+  it("concurrent identical requests share one verification", async () => {
+    const f = fakeFetch(good);
+    const deps = { prisma: prisma() as never, fetch: f as never, now: () => NOW, config: cfg() };
+    const rs = await Promise.all(Array.from({ length: 5 }, () => authenticateMcp(headers(), deps)));
+    expect(rs.every((r) => r.ok)).toBe(true);
+    const count = (p: string) => f.mock.calls.filter((c) => (c[0] as string).startsWith(p)).length;
+    expect([count("https://api.github.com/user"), count("https://oauth2"), count("https://sts.")]).toEqual([2, 1, 1]);
+  });
+
+  it("duplicate query parameters in the STS proof are refused", async () => {
+    const u = Buffer.from(stsUrl(), "base64url").toString() + "&Action=AssumeRole";
+    const { r } = await auth(good, headers({ aws: Buffer.from(u).toString("base64url") }));
+    expect(r).toMatchObject({ ok: false, reason: expect.stringMatching(/duplicate/) });
+  });
+});

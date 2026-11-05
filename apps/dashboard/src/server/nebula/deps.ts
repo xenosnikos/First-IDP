@@ -83,5 +83,6 @@ export function gateFor(prisma: PrismaClient, actor: string): Gate {
     nonces: new PrismaNonceStore(prisma.actionNonce),
     audit: createAudit({ actor, getAuditLog: async () => auditLogDelegate(prisma) }),
     actionPrefix: "nebula.",
+    actor,
   });
 }

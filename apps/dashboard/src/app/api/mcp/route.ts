@@ -63,10 +63,14 @@ export async function POST(req: Request): Promise<Response> {
     observer: observerDeps(),
     sentinel: sentinelGet(),
     notes: notesFor(login),
-    audit: async (tool, args, ok, ms, error) => {
+    audit: async (tool, args, ok, ms, error, intentId) => {
       await prisma.auditLog
-        .create({ data: { actor: login, action: `mcp.tool.${tool}`, allowed: ok, detail: JSON.parse(JSON.stringify({ google, aws, operator, scopes, args, ms, error })) } })
-        .catch(() => {});
+        .create({ data: { actor: login, action: `mcp.tool.${tool}`, allowed: ok, resource: intentId, detail: JSON.parse(JSON.stringify({ google, aws, operator, scopes, args, ms, error, intentId })) } })
+        .catch((e) => console.error(`[mcp] outcome audit failed for ${tool} intent=${intentId}:`, e));
+    },
+    // no .catch: a failure here must stop the write (tools.ts refuses it)
+    intent: async (tool, args, intentId) => {
+      await prisma.auditLog.create({ data: { actor: login, action: `mcp.intent.${tool}`, allowed: true, resource: intentId, detail: JSON.parse(JSON.stringify({ google, aws, operator, scopes, args, intentId })) } });
     },
   });
   const transport = new WebStandardStreamableHTTPServerTransport({ sessionIdGenerator: undefined, enableJsonResponse: true });

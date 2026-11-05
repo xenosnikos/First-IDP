@@ -3,7 +3,9 @@
 // (server/mcp/auth.ts) so the browser and an MCP client admit exactly the
 // same people. No Prisma, no Next: plain fetch, injectable for tests.
 
-export type FetchLike = (url: string, init?: { headers?: Record<string, string> }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+export type FetchLike = (url: string, init?: { headers?: Record<string, string>; signal?: AbortSignal }) => Promise<{ ok: boolean; status: number; json(): Promise<unknown> }>;
+
+const TIMEOUT_MS = 10_000;
 
 const list = (raw: string | undefined, fallback = "") =>
   (raw ?? fallback)
@@ -25,7 +27,7 @@ const ghHeaders = (token: string) => ({ Authorization: `Bearer ${token}`, Accept
 
 export async function isOrgMember(accessToken: string, org: string, f: FetchLike = fetch): Promise<boolean> {
   // The user's own token: read:org lets them read their own membership.
-  const res = await f(`https://api.github.com/user/memberships/orgs/${encodeURIComponent(org)}`, { headers: ghHeaders(accessToken) });
+  const res = await f(`https://api.github.com/user/memberships/orgs/${encodeURIComponent(org)}`, { headers: ghHeaders(accessToken), signal: AbortSignal.timeout(TIMEOUT_MS) });
   if (!res.ok) return false;
   const body = (await res.json()) as { state?: string };
   return body.state === "active";
@@ -42,7 +44,7 @@ export async function isAllowedGithubUser(login: string, accessToken: string, f:
 
 /** The login a token belongs to, or null if GitHub refuses the token. */
 export async function githubLoginOf(accessToken: string, f: FetchLike = fetch): Promise<{ login: string; name: string | null } | null> {
-  const res = await f("https://api.github.com/user", { headers: ghHeaders(accessToken) });
+  const res = await f("https://api.github.com/user", { headers: ghHeaders(accessToken), signal: AbortSignal.timeout(TIMEOUT_MS) });
   if (!res.ok) return null;
   const body = (await res.json()) as { login?: string; name?: string | null };
   return body.login ? { login: body.login.toLowerCase(), name: body.name ?? null } : null;

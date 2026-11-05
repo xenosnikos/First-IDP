@@ -37,6 +37,7 @@ async function connect(deps: Partial<NebulaMcpDeps> & { caller: AppCaller }) {
       getLivePods: vi.fn(async () => []),
     },
     sentinel: vi.fn(async () => ({ ok: true })),
+    intent: vi.fn(async () => {}),
     ...deps,
   });
   const [a, b] = InMemoryTransport.createLinkedPair();
@@ -197,5 +198,31 @@ describe("nebula MCP surface", () => {
     expect(isAllowedSentinelPath("alerts/0123456789abcdef01234567/triage")).toBe(false);
     expect(isAllowedSentinelPath("ip-blocklist")).toBe(false);
     expect(isAllowedSentinelPath("alerts/../replay/event")).toBe(false);
+  });
+});
+
+describe("durable intent before a confirmed write (Codex review 2026-11-05)", () => {
+  it("refuses the write and never calls Nebula if the intent row can't be stored", async () => {
+    const { caller, calls } = fakeCaller();
+    const client = await connect({ caller, intent: async () => { throw new Error("db down"); } });
+    const r = await client.callTool({ name: "teardown_env", arguments: { name: "feat-x", confirm: "nonce-1234567" } });
+    expect(r.isError).toBe(true);
+    expect(textOf(r)).toContain("REFUSED");
+    expect(calls).toHaveLength(0);
+  });
+
+  it("the first (unconfirmed) call needs no intent; the confirmed call writes intent first, then the outcome with the same id", async () => {
+    const order: string[] = [];
+    const client = await connect({
+      caller: fakeCaller().caller,
+      intent: async (_t, _a, i) => { order.push(`intent:${i}`); },
+      audit: async (_t, _a, _ok, _ms, _e, i) => { order.push(`outcome:${i ?? "-"}`); },
+    });
+    await client.callTool({ name: "teardown_env", arguments: { name: "feat-x" } });
+    await client.callTool({ name: "teardown_env", arguments: { name: "feat-x", confirm: "nonce-1234567" } });
+    expect(order[0]).toBe("outcome:-");
+    const id = order[1].slice("intent:".length);
+    expect(id).toMatch(/^[0-9a-f-]{36}$/);
+    expect(order[2]).toBe(`outcome:${id}`);
   });
 });

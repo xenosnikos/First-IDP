@@ -11,7 +11,7 @@
 import { createHash } from "node:crypto";
 import type { PrismaClient } from "@twizz-idp/db";
 import { githubLoginOf, isAllowedGithubUser } from "@/lib/github-access";
-import { identityConfig, verifyAws, verifyGoogle, type FetchLike as IdFetch, type IdentityConfig, type McpScope } from "./identity";
+import { checkStsUrl, decodeStsProof, googleTokenShapeOk, identityConfig, verifyAws, verifyGoogle, type FetchLike as IdFetch, type IdentityConfig, type McpScope } from "./identity";
 
 export type McpSession = {
   user: { name: string | null; email: string; image: null };
@@ -42,6 +42,15 @@ const ghCache = new Map<string, GhEntry>();
 const googleCache = new Map<string, IdEntry>();
 const awsCache = new Map<string, IdEntry>();
 const denyCache = new Map<string, number>();
+/** identical concurrent verifications share one outbound call */
+const inflight = new Map<string, Promise<unknown>>();
+function once<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const hit = inflight.get(key) as Promise<T> | undefined;
+  if (hit) return hit;
+  const p = fn().finally(() => inflight.delete(key));
+  inflight.set(key, p);
+  return p;
+}
 
 function put<V>(m: Map<string, V>, k: string, v: V) {
   if (m.size >= MAX) m.delete(m.keys().next().value!);
@@ -69,8 +78,15 @@ export async function authenticateMcp(
   const now = deps.now?.() ?? Date.now();
   const f = (deps.fetch ?? fetch) as Fetch;
   const cfg = deps.config ?? identityConfig();
+  // 0. local shape checks for ALL THREE proofs before any outbound call or audit row:
+  //    an incomplete or malformed request costs nothing but this function
   const token = bearerOf(h.authorization);
   if (!token) return { ok: false, status: 401, reason: "missing or malformed Authorization: Bearer <GitHub token>" };
+  if (!googleTokenShapeOk(h.google)) return { ok: false, status: 401, reason: "missing Google identity (x-nebula-google-token) — `gcloud auth login <you>@twizz.com`" };
+  const stsUrl = decodeStsProof(h.aws);
+  if (!stsUrl) return { ok: false, status: 401, reason: "missing AWS identity (x-nebula-aws-sts) — configure the AWS profile in the plugin settings" };
+  const stsBad = checkStsUrl(stsUrl, now);
+  if (stsBad) return { ok: false, status: 401, reason: stsBad };
 
   const audit = async (actor: string, allowed: boolean, detail: Record<string, unknown>) => {
     await deps.prisma.auditLog.create({ data: { actor, action: "mcp.signin", allowed, detail: { via: "mcp", ...detail } } }).catch(() => {});
@@ -89,15 +105,19 @@ export async function authenticateMcp(
   const gk = sha(token);
   let gh = ghCache.get(gk);
   if (!gh || now - gh.at > (gh.r.ok ? GH_TTL_MS : DENY_TTL_MS)) {
-    const who = await githubLoginOf(token, f as never).catch(() => null);
-    const r: GhEntry["r"] = !who
-      ? { ok: false, status: 401, reason: "GitHub rejected the token (expired or revoked?) — re-run `gh auth login`" }
-      : (await isAllowedGithubUser(who.login, token, f as never).catch(() => false))
-        ? { ok: true, login: who.login, name: who.name }
-        : { ok: false, status: 403, reason: `${who.login} is not allowed on Nebula (ALLOWED_GITHUB_LOGINS / org membership)` };
+    const { who, r } = await once(`gh:${gk}`, async () => {
+      const who = await githubLoginOf(token, f as never).catch(() => null);
+      const r: GhEntry["r"] = !who
+        ? { ok: false, status: 401, reason: "GitHub rejected the token (expired or revoked?) — re-run `gh auth login`" }
+        : (await isAllowedGithubUser(who.login, token, f as never).catch(() => false))
+          ? { ok: true, login: who.login, name: who.name }
+          : { ok: false, status: 403, reason: `${who.login} is not allowed on Nebula (ALLOWED_GITHUB_LOGINS / org membership)` };
+      return { who, r };
+    });
     gh = { at: now, r };
     put(ghCache, gk, gh);
-    if (!r.ok) return deny(who?.login ?? "unknown", r.status, r.reason);
+    // no audit row for a token GitHub doesn't recognise: there is no identity to attribute it to
+    if (!r.ok) return who ? deny(who.login, r.status, r.reason) : { ok: false, status: r.status, reason: r.reason };
   }
   if (!gh.r.ok) return { ok: false, status: gh.r.status, reason: gh.r.reason };
   const login = gh.r.login;
@@ -112,7 +132,7 @@ export async function authenticateMcp(
   const gc = gtk ? googleCache.get(gtk) : undefined;
   if (gc && gc.until > now) google = gc.value;
   else {
-    const v = await verifyGoogle(h.google, cfg, f as unknown as IdFetch, now).catch((e) => ({ ok: false as const, reason: `Google verification failed: ${String((e as Error).message ?? e)}` }));
+    const v = await once(`g:${gtk}`, () => verifyGoogle(h.google, cfg, f as unknown as IdFetch, now)).catch((e) => ({ ok: false as const, reason: `Google verification failed: ${String((e as Error).message ?? e)}` }));
     if (!v.ok) return deny(login, 401, v.reason, { stage: "google" });
     google = v.email;
     put(googleCache, gtk, { until: Math.min(v.exp, now + ID_TTL_MS), value: v.email });
@@ -125,10 +145,12 @@ export async function authenticateMcp(
   const ac = ak ? awsCache.get(ak) : undefined;
   if (ac && ac.until > now) aws = ac.value;
   else {
-    const v = await verifyAws(h.aws, cfg, f as unknown as IdFetch, now).catch((e) => ({ ok: false as const, reason: `AWS verification failed: ${String((e as Error).message ?? e)}` }));
+    const v = await once(`a:${ak}`, () => verifyAws(h.aws, cfg, f as unknown as IdFetch, now)).catch((e) => ({ ok: false as const, reason: `AWS verification failed: ${String((e as Error).message ?? e)}` }));
     if (!v.ok) return deny(login, 401, v.reason, { stage: "aws", google });
     aws = v.arn;
-    put(awsCache, ak, { until: now + ID_TTL_MS, value: v.arn });
+    // never trust a proof past its own signed expiry (Codex review): Claude Code re-runs the
+    // headersHelper on a 401, so an expired proof just means fresh headers, not a broken session
+    put(awsCache, ak, { until: Math.min(v.exp, now + ID_TTL_MS), value: v.arn });
   }
   if (aws !== binding.aws) return deny(login, 403, `AWS identity ${aws} is not the one bound to ${login}`, { google, aws });
 

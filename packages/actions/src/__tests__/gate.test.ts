@@ -151,3 +151,53 @@ describe("PrismaNonceStore", () => {
     expect(rows.size).toBe(1);
   });
 });
+
+describe("nonce: atomic + actor-bound (Codex review 2026-11-05)", () => {
+  // a Prisma-like delegate with real single-row DELETE semantics
+  function fakeDb() {
+    const rows = new Map<string, { nonce: string; fingerprint: string; expiresAt: Date }>();
+    return {
+      rows,
+      create: async ({ data }: { data: { nonce: string; fingerprint: string; expiresAt: Date } }) => { rows.set(data.nonce, data); return data; },
+      findUnique: async ({ where }: { where: { nonce: string } }) => rows.get(where.nonce) ?? null,
+      deleteMany: async ({ where }: { where: { nonce?: string; fingerprint?: string; expiresAt?: { lt?: Date; gte?: Date } } }) => {
+        let count = 0;
+        for (const [k, r] of rows) {
+          if (where.nonce !== undefined && r.nonce !== where.nonce) continue;
+          if (where.fingerprint !== undefined && r.fingerprint !== where.fingerprint) continue;
+          if (where.expiresAt?.lt && !(r.expiresAt < where.expiresAt.lt)) continue;
+          if (where.expiresAt?.gte && !(r.expiresAt >= where.expiresAt.gte)) continue;
+          rows.delete(k);
+          count++;
+        }
+        return { count };
+      },
+    };
+  }
+
+  it("two concurrent confirms with the same nonce: exactly one runs the action", async () => {
+    const { PrismaNonceStore } = await import("../confirm");
+    const { createGate } = await import("../gate");
+    const db = fakeDb();
+    let runs = 0;
+    const gate = createGate({ policy: { write_tools: { t: { allow: {} } } } as never, nonces: new PrismaNonceStore(db), audit: async () => {}, actor: "nick" });
+    const r1 = await gate("t", { a: "1" }, undefined, "s", async () => ++runs);
+    const nonce = (r1 as { confirm: string }).confirm;
+    const [x, y] = await Promise.all([gate("t", { a: "1" }, nonce, "s", async () => ++runs), gate("t", { a: "1" }, nonce, "s", async () => ++runs)]);
+    expect(runs).toBe(1);
+    expect([x, y].filter((r) => "done" in r)).toHaveLength(1);
+  });
+
+  it("a nonce issued to one actor is refused for another", async () => {
+    const { PrismaNonceStore } = await import("../confirm");
+    const { createGate } = await import("../gate");
+    const db = fakeDb();
+    const store = new PrismaNonceStore(db);
+    const policy = { write_tools: { t: { allow: {} } } } as never;
+    const mine = createGate({ policy, nonces: store, audit: async () => {}, actor: "nick" });
+    const theirs = createGate({ policy, nonces: store, audit: async () => {}, actor: "mallory" });
+    const nonce = ((await mine("t", { a: "1" }, undefined, "s", async () => 1)) as { confirm: string }).confirm;
+    const r = await theirs("t", { a: "1" }, nonce, "s", async () => 1);
+    expect(r).toMatchObject({ denied: true });
+  });
+});

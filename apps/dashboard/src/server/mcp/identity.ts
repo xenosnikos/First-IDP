@@ -76,8 +76,13 @@ type Ok<T> = { ok: true } & T;
 type Bad = { ok: false; reason: string };
 
 // ── Google ────────────────────────────────────────────────────────────
+/** Shape-only check, no network: a JWT-looking token of sane size. */
+export function googleTokenShapeOk(idToken: string | null | undefined): idToken is string {
+  return !!idToken && idToken.length <= 4096 && /^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(idToken);
+}
+
 export async function verifyGoogle(idToken: string | null | undefined, cfg: IdentityConfig, f: FetchLike, now = Date.now()): Promise<Ok<{ email: string; exp: number }> | Bad> {
-  if (!idToken || !/^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$/.test(idToken) || idToken.length > 4096) return { ok: false, reason: "missing Google identity (x-nebula-google-token) — `gcloud auth login <you>@twizz.com`" };
+  if (!googleTokenShapeOk(idToken)) return { ok: false, reason: "missing Google identity (x-nebula-google-token) — `gcloud auth login <you>@twizz.com`" };
   const res = await f(`https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`, { signal: AbortSignal.timeout(10_000) });
   if (!res.ok) return { ok: false, reason: "Google rejected the identity token (expired?) — reconnect the MCP server" };
   const c = JSON.parse(await res.text()) as { iss?: string; aud?: string; email?: string; email_verified?: string | boolean; hd?: string; exp?: string };
@@ -105,8 +110,20 @@ export function decodeStsProof(b64: string | null | undefined): URL | null {
   }
 }
 
+/** When a vetted presign stops being valid (ms epoch), or null if the URL does not parse. */
+export function stsProofExpiry(u: URL): number | null {
+  const d = /^(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})Z$/.exec(u.searchParams.get("X-Amz-Date") ?? "");
+  const expires = Number(u.searchParams.get("X-Amz-Expires"));
+  if (!d || !(expires > 0)) return null;
+  return Date.UTC(+d[1], +d[2] - 1, +d[3], +d[4], +d[5], +d[6]) + expires * 1000;
+}
+
 /** Shape checks before Nebula sends anything to the URL (it must be STS, GetCallerIdentity, short-lived, audience-bound). */
 export function checkStsUrl(u: URL, now = Date.now()): string | null {
+  // exactly one of each query parameter: no duplicates for STS and this check to read differently
+  const keys = [...u.searchParams.keys()];
+  if (new Set(keys).size !== keys.length) return "AWS proof has duplicate query parameters";
+  if (u.username || u.password || u.hash) return "AWS proof is not an STS URL";
   const q = u.searchParams;
   if (u.protocol !== "https:" || !STS_HOST.test(u.hostname) || u.port || (u.pathname !== "/" && u.pathname !== "")) return "AWS proof is not an STS URL";
   if (q.get("Action") !== "GetCallerIdentity" || q.get("Version") !== "2011-06-15") return "AWS proof must be sts:GetCallerIdentity";
@@ -133,17 +150,18 @@ export function arnFromSts(body: string): string | null {
   return /<Arn>([^<]+)<\/Arn>/.exec(body)?.[1] ?? null;
 }
 
-export async function verifyAws(proof: string | null | undefined, cfg: IdentityConfig, f: FetchLike, now = Date.now()): Promise<Ok<{ arn: string }> | Bad> {
+export async function verifyAws(proof: string | null | undefined, cfg: IdentityConfig, f: FetchLike, now = Date.now()): Promise<Ok<{ arn: string; exp: number }> | Bad> {
   const u = decodeStsProof(proof);
   if (!u) return { ok: false, reason: "missing AWS identity (x-nebula-aws-sts) — configure the AWS profile in the plugin settings" };
   const bad = checkStsUrl(u, now);
   if (bad) return { ok: false, reason: bad };
-  const res = await f(u.toString(), { headers: { "x-nebula-audience": cfg.audience, accept: "application/json" }, signal: AbortSignal.timeout(10_000) });
+  // redirect: "error" — STS never redirects; following one would send the request elsewhere
+  const res = await f(u.toString(), { headers: { "x-nebula-audience": cfg.audience, accept: "application/json" }, signal: AbortSignal.timeout(10_000), redirect: "error" } as never);
   const body = await res.text();
   if (!res.ok) return { ok: false, reason: `AWS rejected the identity proof (${res.status}) — expired key, wrong clock, or minted for another audience` };
   const arn = arnFromSts(body);
   if (!arn) return { ok: false, reason: "AWS identity proof returned no ARN" };
   const want = `arn:aws:iam::${cfg.awsAccount}:user${cfg.awsUserPath}`;
   if (!arn.startsWith(want)) return { ok: false, reason: `AWS identity ${arn} is not a Nebula MCP user (expected ${want}<name>: an IAM user with no permissions)` };
-  return { ok: true, arn };
+  return { ok: true, arn, exp: stsProofExpiry(u)! };
 }
