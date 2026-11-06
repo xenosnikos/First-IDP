@@ -66,7 +66,7 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
 - `pipeline` - getStatus, getStepLogs, list, listAll (DB reads; GitHub Actions wiring lands in Phase 3)
 - `secret` - list, listKeys (names only, never values)
 - `logs` - getPodLogs (legacy per-environment log viewer)
-- `clusters` - overview, logs, logHistogram (queries only, by construction)
+- `clusters` - overview, logs, logHistogram (queries only, by construction); archiveSearch (operators; sentinel S3/Athena archive, audited + redacted, §N8)
 - `nebula` - listEnvironments, listProjects (read-only Nebula views)
 - `observer` - status, configuratorStatus (runs stream over `POST /api/observer` and
   `POST /api/configurator`, SSE; both audited and capped)

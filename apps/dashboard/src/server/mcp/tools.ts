@@ -15,6 +15,7 @@
 // target staging. Tools a person may not use are not even registered for them
 // (toolsFor), and every handler re-checks. The test pins all of this.
 import { randomUUID } from "node:crypto";
+import { searchFingerprint } from "@/lib/nebula/fingerprint";
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
@@ -54,6 +55,8 @@ export function auditArgs(args: Record<string, unknown>): Record<string, unknown
     else if (k === "vars" || k === "envOverrides") out[k] = v && typeof v === "object" ? Object.keys(v as object) : v;
     else if (k === "files") out[k] = Array.isArray(v) ? v.map((x) => (x as { path?: string })?.path) : v;
     else if (k === "twizzYaml") out[k] = typeof v === "string" ? `(${v.length} chars)` : v;
+    // a search term may BE a leaked secret: keep a fingerprint, not the value
+    else if (k === "contains") out[k] = typeof v === "string" ? searchFingerprint(v) : v;
     else out[k] = typeof v === "string" && v.length > 300 ? `${v.slice(0, 300)}…` : v;
   }
   return out;
@@ -104,7 +107,7 @@ export const MCP_SELF_SERVICE_WRITES = ["create_env_from_repo", "rebuild_env", "
 /** Nebula operators only. */
 export const MCP_OPERATOR_WRITES = ["create_named_env", "clone_staging_db", "promote_release", "merge_promotion"] as const;
 /** Operator-only READS (other people's audited activity). */
-export const MCP_OPERATOR_READS = ["recent_changes"] as const;
+export const MCP_OPERATOR_READS = ["recent_changes", "sentinel_archive_search"] as const;
 /** Operators whose binding carries the matching capacity scope. */
 export const MCP_CAPACITY_WRITES = ["apply_live_capacity", "set_prod_atlas_tier"] as const;
 
@@ -466,6 +469,21 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
     { from: z.string().datetime(), to: z.string().datetime().optional() },
     RO,
     async (a) => json(await c.capacity.recentChanges({ from: a.from, ...(a.to ? { to: a.to } : {}) })),
+  );
+
+  reg(
+    "sentinel_archive_search",
+    "OPERATORS: search the twizz-sentinel raw-log archive (S3 + Athena; prod or staging app lines kept 365 days — older than CloudWatch keeps). ≤ 7 days per search, optional literal text (contains) and pod-name prefix, newest first, ≤ 1000 lines; secrets redacted. Use for incidents older than a day or two; fetch_logs is faster for the last hours. Read-only; audited.",
+    {
+      env: z.enum(["prod", "staging"]),
+      from: z.string().datetime(),
+      to: z.string().datetime(),
+      contains: z.string().min(3).max(200).optional(),
+      pod: z.string().min(1).max(253).regex(/^[a-z0-9][a-z0-9.-]*$/).optional(),
+      limit: z.number().int().min(1).max(1000).optional(),
+    },
+    RO,
+    async (a) => json(await c.clusters.archiveSearch({ ...a, limit: a.limit ?? 200 })),
   );
 
   const needScope = (scope: McpScope) => {

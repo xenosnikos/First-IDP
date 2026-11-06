@@ -8,3 +8,4 @@ export * from "./atlas";
 export * from "./introspect";
 export * from "./eks-auth";
 export * from "./metrics";
+export * from "./archive";

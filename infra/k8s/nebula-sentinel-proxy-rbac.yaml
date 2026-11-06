@@ -1,0 +1,28 @@
+# Nebula → prod twizz-sentinel read API (docs/NEBULA.md §N8). Prod sentinel has no
+# ingress; Nebula reaches it through the EKS-Moly-Prod API server's SERVICE PROXY as
+# the group `nebula-capacity` (the dashboard IRSA role's access entry,
+# infra/src/capacity-access.ts). This grants exactly: GET through the proxy of ONE
+# service in ns sentinel. No pods, no secrets, no other service, no write verbs.
+# The sentinel API still requires its READ key (SENTINEL_PROD_API_KEY); admin routes
+# refuse it server-side. Applied by scripts/nebula-sentinel-proxy-access.sh.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: nebula-sentinel-proxy
+  namespace: sentinel
+  labels: { app.kubernetes.io/part-of: nebula-capacity }
+rules:
+  - apiGroups: [""]
+    resources: [services/proxy]
+    resourceNames: ["twizz-sentinel:http"]
+    verbs: [get]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: nebula-sentinel-proxy
+  namespace: sentinel
+  labels: { app.kubernetes.io/part-of: nebula-capacity }
+roleRef: { apiGroup: rbac.authorization.k8s.io, kind: Role, name: nebula-sentinel-proxy }
+subjects:
+  - { apiGroup: rbac.authorization.k8s.io, kind: Group, name: nebula-capacity }

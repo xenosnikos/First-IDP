@@ -1,0 +1,5 @@
+secretsprovider: awskms://alias/twizz-idp-pulumi?region=eu-west-1
+encryptedkey: AQICAHh4pc1LEemZP5PEu0oBaT27t/YPlSf5rgzRQjtpiYlEMAHY7G5kKRGcgpGOJXNBP4GhAAAAfjB8BgkqhkiG9w0BBwagbzBtAgEAMGgGCSqGSIb3DQEHATAeBglghkgBZQMEAS4wEQQMh5EvWQ7dxiEudbk8AgEQgDvdUsCuJmVUPw1RKYPJUTOwaKF/nj2nDt/8HL/sWjBA4LlkXckoxziVjqehPTUmHFDKji7Yd5p1oliy0Q==
+config:
+  aws:region: eu-west-1
+  aws:profile: twizz
