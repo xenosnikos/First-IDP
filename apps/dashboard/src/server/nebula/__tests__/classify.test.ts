@@ -10,14 +10,14 @@ const LIVE: LiveApp[] = [
   app({ name: "root", namespace: "argocd", project: "default" }),
   app({ name: "nebula", namespace: "nebula", project: "nebula" }),
   app({ name: "env-smoke", namespace: "env-smoke", labels: { "twizz-idp/named-env": "true", "twizz-idp/service": "moly-backend" }, ownerKind: "ApplicationSet", ownerName: "named-envs", sync: "OutOfSync" }),
-  app({ name: "twizz-admin-pr-139", namespace: "pr-twizz-admin-139", labels: { "twizz-idp/repo": "twizz-admin", "twizz-idp/pr": "139" }, ownerKind: "ApplicationSet", ownerName: "twizz-admin-preview" }),
+  app({ name: "twizz-admin-pr-139", namespace: "pr-twizz-admin-139", labels: { "twizz-idp/repo": "front-admin", "twizz-idp/pr": "139" }, ownerKind: "ApplicationSet", ownerName: "twizz-admin-preview" }),
   app({ name: "shared-ffmpeg-service", namespace: "shared", health: "Degraded" }),
   app({ name: "twizz-support", namespace: "twizz-support", project: "twizz-support", sourceRepoUrls: ["git@github.com:xenosnikos/twizz-support.git"] }),
   app({ name: "shared-lolygram-discovery", namespace: "shared", health: "Degraded" }),
   app({ name: "shared-alertservice", namespace: "shared", health: "Degraded" }),
   app({ name: "some-external-thing", namespace: "ext", sourceRepoUrls: ["https://github.com/someone-else/random.git"] }),
 ];
-const APPSETS = [{ name: "twizz-admin-preview", prOwner: "twizz-app", prRepo: "twizz-admin" }, { name: "moly-backend-preview", prOwner: "twizz-app", prRepo: "Moly-backend" }, { name: "named-envs" }];
+const APPSETS = [{ name: "twizz-admin-preview", prOwner: "twizz-app", prRepo: "front-admin" }, { name: "moly-backend-preview", prOwner: "twizz-app", prRepo: "Moly-backend" }, { name: "named-envs" }];
 
 describe("classifyApp / prLink", () => {
   it("named → NAMED, appset-owned with a pr label → PR PREVIEW, everything else → GITOPS APP", () => {
@@ -27,7 +27,7 @@ describe("classifyApp / prLink", () => {
     expect(classifyApp(LIVE[5])).toBe("GITOPS APP");
   });
   it("builds the PR link from the appset's generator repo", () => {
-    expect(prLink(LIVE[3], APPSETS)).toEqual({ repo: "twizz-app/twizz-admin", number: "139", url: "https://github.com/twizz-app/twizz-admin/pull/139" });
+    expect(prLink(LIVE[3], APPSETS)).toEqual({ repo: "twizz-app/front-admin", number: "139", url: "https://github.com/twizz-app/front-admin/pull/139" });
     expect(prLink(LIVE[4], APPSETS)).toBeUndefined();
   });
 });
@@ -59,7 +59,7 @@ describe("buildProjectViews", () => {
   const org = [
     { slug: "twizz-app/Moly-backend", name: "Moly-backend", url: "https://github.com/twizz-app/Moly-backend" },
     { slug: "twizz-app/frontend", name: "frontend", url: "https://github.com/twizz-app/frontend" },
-    { slug: "twizz-app/twizz-admin", name: "twizz-admin", url: "https://github.com/twizz-app/twizz-admin" },
+    { slug: "twizz-app/front-admin", name: "front-admin", url: "https://github.com/twizz-app/front-admin" },
   ];
   const views = buildProjectViews(org, apps, APPSETS, [{ id: "p1", githubRepoUrl: "https://github.com/twizz-app/frontend" }]);
   const by = (slug: string) => views.find((v) => v.slug.toLowerCase() === slug.toLowerCase())!;
@@ -72,7 +72,7 @@ describe("buildProjectViews", () => {
     expect(isProjectRepo("xenosnikos/other", "twizz-app")).toBe(false);
     expect(by("twizz-app/Moly-backend").words).toEqual(["DEPLOYED", "PREVIEWABLE"]);
     expect(by("twizz-app/Moly-backend").apps).toEqual(["env-smoke"]);
-    expect(by("twizz-app/twizz-admin").words).toEqual(["DEPLOYED", "PREVIEWABLE"]);
+    expect(by("twizz-app/front-admin").words).toEqual(["DEPLOYED", "PREVIEWABLE"]);
     expect(by("twizz-app/frontend").words).toEqual(["REGISTERED"]);
     expect(by("twizz-app/frontend").registry).toEqual({ name: "frontend", kind: "frontend", status: "PLANNED" });
   });

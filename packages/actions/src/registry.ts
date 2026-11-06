@@ -120,12 +120,12 @@ export const REGISTRY: readonly ServiceEntry[] = [
   {
     name: "business",
     kind: "frontend",
-    repo: "twizz-app/business",
+    repo: "twizz-app/front-business", // renamed from twizz-app/business
     ecrRepo: "twizz-business",
     valuesFile: GITOPS_VALUES("business"),
     status: "PLANNED",
     build: { workflow: "nebula-build.yml", framework: "vite", apiEnvVar: "VITE_BACKEND_URL", serve: "static", notes: "Vite 6 + React 19" },
-    detect: { service: "business", repo: "business" },
+    detect: { service: "business", repo: "front-business" },
   },
   {
     name: "moly-admin",
@@ -140,12 +140,12 @@ export const REGISTRY: readonly ServiceEntry[] = [
   {
     name: "twizz-admin",
     kind: "frontend",
-    repo: "twizz-app/twizz-admin",
+    repo: "twizz-app/front-admin", // renamed from twizz-app/twizz-admin (service/ECR/release stay twizz-admin)
     ecrRepo: "twizz-admin",
     valuesFile: GITOPS_VALUES("twizz-admin"),
     status: "PLANNED",
     build: { workflow: "nebula-build.yml", framework: "next", apiEnvVar: "NEXT_PUBLIC_API_URL", serve: "next-standalone", notes: "Next 15; already previewed per PR by the joint appset" },
-    detect: { service: "twizz-admin", repo: "twizz-admin" },
+    detect: { service: "twizz-admin", repo: "front-admin" },
     // Staging admin runs in-cluster next to the staging sentinel (same chart as
     // the joint preview); production admin stays on Vercel.
     releaseTrain: { staging: STAGING("twizz-admin", "admin") },

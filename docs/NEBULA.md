@@ -360,9 +360,9 @@ Verified via the GitHub API (2026-09-09), default branches:
 | repo | framework | API endpoint var | notes |
 |---|---|---|---|
 | `twizz-app/frontend` | CRA 5 + craco | `REACT_APP_API_ENDPOINT` (+ `REACT_APP_SOCKET_ENDPOINT` per `docs/enablement/frontend`) | static build → nginx |
-| `twizz-app/business` | Vite 6 + React 19 | `VITE_BACKEND_URL` | static build → nginx |
+| `twizz-app/front-business` (was `business`) | Vite 6 + React 19 | `VITE_BACKEND_URL` | static build → nginx |
 | `twizz-app/moly_admin` | Next **9.4.4** + custom Node server | `NEXT_PUBLIC_API_ENDPOINT` (browser) + `API_ENDPOINT` (server) | oldest; standalone output unsupported on Next 9 → `next build` + `node server` image |
-| `twizz-app/twizz-admin` | Next 15 | `NEXT_PUBLIC_API_URL` (+ `NEXT_PUBLIC_APP_URL`, `NEXTAUTH_URL`) | already previewed by the joint PR appset; standalone |
+| `twizz-app/front-admin` (was `twizz-admin`) | Next 15 | `NEXT_PUBLIC_API_URL` (+ `NEXT_PUBLIC_APP_URL`, `NEXTAUTH_URL`) | already previewed by the joint PR appset; standalone |
 
 None of the four has a `nebula-build.yml` yet; each has only `deploy.yml`
 (Vercel). The endpoint is a **build-time** value in all four, which is exactly
