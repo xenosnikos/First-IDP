@@ -97,6 +97,20 @@ new aws.iam.RolePolicy("prod-sentinel-archive-embeddings", {
 });
 
 // Nebula (twizz-nebula-dashboard): READ the archive through the sentinel workgroup only
+// staging sentinel (twizz-idp infra/src/staging.ts, state lost — referenced by name): write ITS
+// prefix only. Titan embeddings are already in its own policy.
+new aws.iam.RolePolicy("staging-sentinel-archive", {
+  role: "twizz-staging-sentinel",
+  name: "twizz-staging-sentinel-archive",
+  policy: pulumi.jsonStringify({
+    Version: "2012-10-17",
+    Statement: [
+      { Sid: "ArchiveWriteStagingPrefix", Effect: "Allow", Action: ["s3:PutObject", "s3:AbortMultipartUpload"], Resource: pulumi.interpolate`${archive.arn}/env=staging/*` },
+      { Sid: "ArchiveBucketProbe", Effect: "Allow", Action: ["s3:GetBucketLocation"], Resource: archive.arn },
+    ],
+  }),
+});
+
 new aws.iam.RolePolicy("nebula-sentinel-archive-read", {
   role: "twizz-nebula-dashboard",
   name: "twizz-nebula-dashboard-sentinel-archive-read",
