@@ -117,11 +117,14 @@ describe("PrismaNonceStore", () => {
       },
       async deleteMany({ where }) {
         let count = 0;
+        // every condition must hold (AND), like a SQL DELETE … WHERE
         for (const [k, v] of rows) {
-          if ((where.nonce && k === where.nonce) || (where.expiresAt && v.expiresAt < where.expiresAt.lt)) {
-            rows.delete(k);
-            count++;
-          }
+          if (where.nonce !== undefined && k !== where.nonce) continue;
+          if (where.fingerprint !== undefined && v.fingerprint !== where.fingerprint) continue;
+          if (where.expiresAt?.lt && !(v.expiresAt < where.expiresAt.lt)) continue;
+          if (where.expiresAt?.gte && !(v.expiresAt >= where.expiresAt.gte)) continue;
+          rows.delete(k);
+          count++;
         }
         return { count };
       },
