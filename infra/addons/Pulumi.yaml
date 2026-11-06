@@ -1,0 +1,10 @@
+name: twizz-idp-addons
+main: index.ts
+runtime:
+  name: nodejs
+  options:
+    packagemanager: pnpm
+description: >-
+  twizz-idp platform add-ons (2026-11-06): resources added after the original infra/ state was lost.
+  Each one references existing infrastructure by name/ID and never manages the core stack's resources.
+  Backend: s3://twizz-idp-pulumi-state-848281935985 (scripts/pulumi-backend-bootstrap.sh).

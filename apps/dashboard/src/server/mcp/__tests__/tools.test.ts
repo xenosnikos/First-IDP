@@ -124,8 +124,9 @@ describe("nebula MCP surface", () => {
     expect(sentinel.mock.calls[1]).toEqual(["production", "alerts", { severity: "critical", limit: 25 }, "nick"]);
   });
 
-  it("production sentinel answers 'not reachable' until it has an endpoint", () => {
-    expect(sentinelEndpoint("production", {} as NodeJS.ProcessEnv)).toMatchObject({ missing: expect.stringContaining("not reachable") });
+  it("production sentinel: no key = not configured; key only = the prod API server's service proxy", () => {
+    expect(sentinelEndpoint("production", {} as NodeJS.ProcessEnv)).toMatchObject({ missing: expect.stringContaining("not configured") });
+    expect(sentinelEndpoint("production", { SENTINEL_PROD_API_KEY: "k" } as never)).toEqual({ base: "/api/v1/namespaces/sentinel/services/twizz-sentinel:http/proxy", key: "k", via: "kube-proxy" });
     expect(sentinelEndpoint("production", { NEBULA_SENTINEL_PROD_URL: "https://x/", SENTINEL_PROD_API_KEY: "k" } as never)).toEqual({ base: "https://x", key: "k" });
     expect(sentinelEndpoint("staging", { SENTINEL_STAGING_API_KEY: "k" } as never)).toEqual({ base: "https://sentinel-stg.prv.twizz.com", key: "k" });
   });
@@ -293,6 +294,14 @@ describe("events + incidents (verify / watch / changes / prompts)", () => {
     const names = (await (await connect({ caller: fakeCaller().caller, operator: false, scopes: [] })).listTools()).tools.map((t) => t.name);
     for (const n of ["capacity_verify", "event_watch"]) expect(names).toContain(n);
     expect(names).not.toContain("recent_changes"); // other people's activity: operators only
+    expect(names).not.toContain("sentinel_archive_search"); // raw prod lines: operators only
+  });
+
+  it("sentinel_archive_search forwards to the operator-only archive query with a default limit", async () => {
+    const { caller, calls } = fakeCaller({ "clusters.archiveSearch": { status: "complete", rows: [] } });
+    const client = await connect({ caller });
+    await client.callTool({ name: "sentinel_archive_search", arguments: { env: "prod", from: "2026-11-05T22:00:00Z", to: "2026-11-05T23:00:00Z", contains: "timeout" } });
+    expect(calls).toContainEqual({ proc: "clusters.archiveSearch", input: { env: "prod", from: "2026-11-05T22:00:00Z", to: "2026-11-05T23:00:00Z", contains: "timeout", limit: 200 } });
   });
 
   it("capacity_verify takes exactly one target and forwards it", async () => {
@@ -448,5 +457,35 @@ describe("watchVerdict (Codex review)", () => {
     expect(watchVerdict({ ...base, signals: [{ label: "Atlas connections", word: "HOT" }] }).status).toBe("ACT");
     expect(watchVerdict({ ...base, edgeData: false })).toMatchObject({ status: "UNKNOWN" });
     expect(watchVerdict({ ...base, podData: "timeout" })).toMatchObject({ status: "WATCH", reasons: [expect.stringMatching(/data gap: pod\/node metrics timeout/)] });
+  });
+});
+
+describe("prod sentinel through the kube service proxy", () => {
+  it("sends the read key + actor to the proxy path and unwraps data", async () => {
+    const prev = { ...process.env };
+    process.env.SENTINEL_PROD_API_KEY = "k";
+    delete process.env.NEBULA_SENTINEL_PROD_URL;
+    try {
+      const { sentinelGet } = await import("../sentinel");
+      const kube = vi.fn(async () => ({ status: 200, text: JSON.stringify({ data: [{ id: 1 }] }) }));
+      const fetchSpy = vi.fn();
+      const out = await sentinelGet(fetchSpy as never, kube)("production", "alerts", { limit: 5 }, "nick");
+      expect(out).toEqual([{ id: 1 }]);
+      expect(fetchSpy).not.toHaveBeenCalled();
+      expect(kube).toHaveBeenCalledWith("/api/v1/namespaces/sentinel/services/twizz-sentinel:http/proxy/api/v1/alerts?limit=5", expect.objectContaining({ "x-api-key": "k", "x-actor": "nebula-mcp:nick" }));
+      kube.mockResolvedValueOnce({ status: 403, text: "forbidden" });
+      await expect(sentinelGet(fetchSpy as never, kube)("production", "status", {}, "nick")).rejects.toThrow(/production sentinel 403/);
+    } finally {
+      process.env = prev;
+    }
+  });
+});
+
+describe("audit rows never carry a search term", () => {
+  it("contains → length + fingerprint", async () => {
+    const { auditArgs } = await import("../tools");
+    const out = auditArgs({ contains: "ghp_SECRETSECRETSECRETSECRET", env: "prod" });
+    expect(String(out.contains)).toMatch(/^\(28 chars, sha256:[0-9a-f]{12}\)$/);
+    expect(JSON.stringify(out)).not.toContain("SECRET");
   });
 });

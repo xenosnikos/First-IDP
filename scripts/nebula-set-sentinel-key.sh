@@ -5,9 +5,10 @@
 # SENTINEL_STAGING_API_KEY (ExternalSecret nebula-env extracts every key).
 #
 #   AWS_PROFILE=twizz bash scripts/nebula-set-sentinel-key.sh
-#   # production (once twizz-sentinel runs on EKS-Moly-Prod AND has an endpoint
-#   # Nebula can reach — values-prod.yaml has no ingress today):
-#   NEBULA_SENTINEL_PROD_URL=https://… AWS_PROFILE=twizz bash scripts/nebula-set-sentinel-key.sh --prod
+#   # production: prod sentinel has no ingress; Nebula goes through the EKS-Moly-Prod API
+#   # server's service proxy (scripts/nebula-sentinel-proxy-access.sh, §N8), so no URL.
+#   # NEBULA_SENTINEL_PROD_URL=https://… overrides with a direct endpoint.
+#   AWS_PROFILE=twizz bash scripts/nebula-set-sentinel-key.sh --prod
 #
 # Then resync + restart (the pod reads env at start):
 #   kubectl --kubeconfig ~/.kube/twizz-nonprod.yaml -n nebula annotate externalsecret nebula-env force-sync=$(date +%s) --overwrite
@@ -24,8 +25,7 @@ URL_KEY=""
 if [ "${1:-}" = "--prod" ]; then
   SRC=prod/twizz-sentinel
   KEY=SENTINEL_PROD_API_KEY
-  URL_KEY=NEBULA_SENTINEL_PROD_URL
-  : "${NEBULA_SENTINEL_PROD_URL:?--prod needs NEBULA_SENTINEL_PROD_URL (the endpoint Nebula reaches prod sentinel on)}"
+  [ -n "${NEBULA_SENTINEL_PROD_URL:-}" ] && URL_KEY=NEBULA_SENTINEL_PROD_URL
 fi
 
 T=$(mktemp)

@@ -65,8 +65,8 @@ describe("createEnvFromRepo", () => {
     const be = { name: "api-main", kind: "backend" as const, service: "twizz-sentinel", owner: "x", imageTag: "nb-api-main-aaaaaaaaaaaa", expiresAt: "2026-09-17T12:00:00.000Z", db: { mode: "none" as const, generation: 0 }, frontendOrigins: [] as string[] };
     const { manifestToYaml } = await import("../named-envs");
     d.gitops.files.set("named-envs/api-main.yaml", manifestToYaml(be));
-    await expect(createEnvFromRepo(d, { ...base, name: "biz-feat", repo: "twizz-app/business", kind: "frontend", db: "none", config: frontendCfg, envVars: {}, attachTo: "api-main" })).rejects.toThrow(/attachUrl/);
-    const r = await createEnvFromRepo(d, { ...base, name: "biz-feat", repo: "twizz-app/business", kind: "frontend", db: "none", config: frontendCfg, envVars: {}, attachTo: "api-main", attachUrl: "https://api-main.prv.twizz.com" });
+    await expect(createEnvFromRepo(d, { ...base, name: "biz-feat", repo: "twizz-app/front-business", kind: "frontend", db: "none", config: frontendCfg, envVars: {}, attachTo: "api-main" })).rejects.toThrow(/attachUrl/);
+    const r = await createEnvFromRepo(d, { ...base, name: "biz-feat", repo: "twizz-app/front-business", kind: "frontend", db: "none", config: frontendCfg, envVars: {}, attachTo: "api-main", attachUrl: "https://api-main.prv.twizz.com" });
     expect(d.builds.dispatched[0].buildArgs).toEqual({ VITE_BACKEND_URL: "https://api-main.prv.twizz.com", VITE_SELF: "https://biz-feat.prv.twizz.com" });
     expect(d.gitops.atomic[0]).toContain("named-envs/api-main.yaml");
     expect(parseManifest(d.gitops.files.get("named-envs/api-main.yaml")!).frontendOrigins).toEqual(["https://biz-feat.prv.twizz.com"]);

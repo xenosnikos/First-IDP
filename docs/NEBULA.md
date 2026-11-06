@@ -360,9 +360,9 @@ Verified via the GitHub API (2026-09-09), default branches:
 | repo | framework | API endpoint var | notes |
 |---|---|---|---|
 | `twizz-app/frontend` | CRA 5 + craco | `REACT_APP_API_ENDPOINT` (+ `REACT_APP_SOCKET_ENDPOINT` per `docs/enablement/frontend`) | static build → nginx |
-| `twizz-app/business` | Vite 6 + React 19 | `VITE_BACKEND_URL` | static build → nginx |
+| `twizz-app/front-business` (was `business`) | Vite 6 + React 19 | `VITE_BACKEND_URL` | static build → nginx |
 | `twizz-app/moly_admin` | Next **9.4.4** + custom Node server | `NEXT_PUBLIC_API_ENDPOINT` (browser) + `API_ENDPOINT` (server) | oldest; standalone output unsupported on Next 9 → `next build` + `node server` image |
-| `twizz-app/twizz-admin` | Next 15 | `NEXT_PUBLIC_API_URL` (+ `NEXT_PUBLIC_APP_URL`, `NEXTAUTH_URL`) | already previewed by the joint PR appset; standalone |
+| `twizz-app/front-admin` (was `twizz-admin`) | Next 15 | `NEXT_PUBLIC_API_URL` (+ `NEXT_PUBLIC_APP_URL`, `NEXTAUTH_URL`) | already previewed by the joint PR appset; standalone |
 
 None of the four has a `nebula-build.yml` yet; each has only `deploy.yml`
 (Vercel). The endpoint is a **build-time** value in all four, which is exactly
@@ -975,3 +975,53 @@ scripts/nebula-set-sentinel-key.sh`, resync `nebula-env`, restart the dashboard;
 `nebula-mcp-bind.sh`; install: `/plugin marketplace add TwizzyNicky/nebula-mcp`,
 `/plugin install twizz-nebula@nebula-mcp`. Missing config was filled 2026-11-05 by
 `scripts/nebula-fill-secrets.sh` (staging sentinel key, staging API URL, Vercel).
+
+## N8 — Prod sentinel + the sentinel log archive (2026-11-06)
+
+Nebula reads production twizz-sentinel (alerts, cases, similar-alert vectors) and the raw-log
+archive of prod and staging. Everything here is read-only.
+
+**Prod sentinel API.** Prod sentinel (ns `sentinel` on EKS-Moly-Prod, gitops
+`apps/twizz-sentinel/values-prod.yaml`) has no ingress. Nebula goes through the prod API
+server's **service proxy**: `GET /api/v1/namespaces/sentinel/services/twizz-sentinel:http/proxy/api/v1/<path>`
+with a fresh EKS token from the dashboard's IRSA role (group `nebula-capacity`, already on the
+prod allowlist via the Nebula NAT). The connection is TLS, pinned to the cluster CA.
+- RBAC: `infra/k8s/nebula-sentinel-proxy-rbac.yaml` grants `get services/proxy` on
+  `twizz-sentinel:http` in ns `sentinel` and nothing else. It is applied and verified by
+  `scripts/nebula-sentinel-proxy-access.sh`.
+- The chart NetworkPolicy admits `allowFromCIDRs` (the VPC, `192.168.0.0/16`) on port `http`
+  only, because the API server's ENIs sit in the cluster subnets.
+- The sentinel API still requires its READ key: `SENTINEL_PROD_API_KEY` in SM
+  `preview/nebula`, copied from `prod/twizz-sentinel` by `nebula-set-sentinel-key.sh --prod`.
+  Its admin routes refuse that key.
+- `NEBULA_SENTINEL_PROD_URL` overrides the proxy with a direct endpoint.
+- MCP: the `sentinel_*` tools with `tier: production`.
+
+**Archive.** Prod and staging sentinel write raw app log lines to
+`s3://twizz-sentinel-logs-848281935985/env=<env>/dt=YYYY-MM-DD/*.jsonl.gz`:
+- `{ts, pod, msg}` per line, SSE-KMS, 365-day lifecycle;
+- prod writes `env=prod/*` only.
+
+Athena workgroup `sentinel` (10 GiB scan cutoff, results expire after 7 d) queries the Glue
+table `sentinel_logs.sentinel_app_logs`, which uses partition projection on env + dt. Owned by
+`infra/addons` (see infra/CLAUDE.md, State).
+- `@twizz-idp/core` `searchArchive` runs ONE fixed query template, with every caller value
+  bound as an Athena execution parameter. Limits: at most 7 days, 1000 rows; LIKE wildcards
+  in `contains` are escaped.
+- `clusters.archiveSearch` (tRPC) is for **operators only**. It writes an AuditLog row
+  `nebula.archive_search` before the query runs (denials are logged too), and every line is
+  redacted with the Observer's redactor.
+- MCP: the operator read `sentinel_archive_search`.
+- The dashboard role reads `env=prod/*` and `env=staging/*` and writes `athena-results/*`.
+
+**Similar alerts (vectors).** Prod sentinel embeds alerts with Bedrock
+`amazon.titan-embed-text-v2:0` (eu-west-1, `EMBEDDINGS_SIMILAR_THRESHOLD` 0.92; IAM inline
+policy `twizz-prod-sentinel-archive-embeddings`). `sentinel_alert {include: "similar"}` returns
+them through the proxy.
+
+**Turn-on order:**
+1. `pulumi up` in `infra/addons` (done 2026-11-06).
+2. The prod helm upgrade with the new `values-prod`. This runs over the SOCKS tunnel and
+   starts the archive and embeddings.
+3. `nebula-sentinel-proxy-access.sh`.
+4. `nebula-set-sentinel-key.sh --prod`, then resync `nebula-env` and restart the dashboard.
