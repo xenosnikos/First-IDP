@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { LIVE_TARGETS } from "../live-capacity";
-import { assessLive, caseSizing, estimateLive, findBursts, parseCases, rpsPerPod } from "../traffic";
+import { assessLive, caseSizing, estimateLive, findBursts, parseCases, recommendTemplate, rpsPerPod, verifyLive } from "../traffic";
 import type { LiveProfile, LiveTierSize } from "@twizz-idp/shared";
 
 // The production profile as calibrated from case 2026-11-05-midnight-burst.
@@ -89,5 +89,36 @@ describe("findBursts", () => {
     const t0 = 0;
     const series = Array.from({ length: 60 }, (_, k) => [t0 + k * 60_000, 150 + (k % 7) * 20] as [number, number]);
     expect(findBursts(series)).toEqual([]);
+  });
+});
+
+describe("verifyLive (rollout validation)", () => {
+  const want: LiveTierSize = { workloads: { "moly-backend-deployment": { replicas: 80 } }, nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: 8, desired: 10, max: 14 } } };
+  const ng = { name: "eks-prod-node-group-m5-2x-extra", min: 8, desired: 10, max: 14 };
+  const nodes = (n: number) => Array.from({ length: n }, () => ({ nodegroup: ng.name }));
+  it("READY when spec matches and everything is ready", () => {
+    expect(verifyLive({ workloads: [{ name: "moly-backend-deployment", replicas: 80, ready: 80 }], nodegroups: [ng], nodes: nodes(10) }, want).verdict).toBe("READY");
+  });
+  it("PROGRESSING while pods or nodes are still coming", () => {
+    const r = verifyLive({ workloads: [{ name: "moly-backend-deployment", replicas: 80, ready: 61 }], nodegroups: [ng], nodes: nodes(7) }, want);
+    expect(r.verdict).toBe("PROGRESSING");
+    expect(r.workloads[0].note).toMatch(/19 pod/);
+    expect(r.nodegroups[0].note).toMatch(/3 node/);
+  });
+  it("MISMATCH when the spec isn't what was planned", () => {
+    expect(verifyLive({ workloads: [{ name: "moly-backend-deployment", replicas: 40, ready: 40 }], nodegroups: [ng], nodes: nodes(10) }, want).verdict).toBe("MISMATCH");
+  });
+});
+
+describe("recommendTemplate", () => {
+  const tpl = (name: string, pods: number, nodes: number) => ({ name, size: { workloads: { "moly-backend-deployment": { replicas: pods } }, nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: nodes, desired: nodes, max: nodes } } } as LiveTierSize });
+  const T3 = [tpl("max", 120, 15), tpl("baseline", 40, 5), tpl("campaign", 80, 10)];
+  it("picks the smallest template that is OK at the load", () => {
+    expect(recommendTemplate(PROFILE, T3, 600)?.name).toBe("baseline");
+    expect(recommendTemplate(PROFILE, T3, 2327)?.name).toBe("campaign");
+    expect(recommendTemplate(PROFILE, T3, 3600)?.name).toBe("max");
+  });
+  it("returns null when no template holds (then it's an estimate, or more than the caps)", () => {
+    expect(recommendTemplate(PROFILE, T3, 9000)).toBeNull();
   });
 });

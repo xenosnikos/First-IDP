@@ -65,7 +65,7 @@ import { isOperator } from "@/lib/nebula/operators";
 import { argoWord, ttlWord } from "@/lib/nebula/status";
 import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
-import { atlasPort, liveTemplateOpts, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, targetFor } from "../nebula/capacity";
+import { atlasPort, liveTemplateOpts, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, requireReviewedCapacityFiles, targetFor } from "../nebula/capacity";
 import { liveClusterPort } from "../nebula/live-cluster";
 import { resolveSize } from "./capacity";
 
@@ -496,6 +496,16 @@ export const actionsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const { tier, planHash, confirm } = input;
       if ([input.preset, input.custom, input.estimate].filter((x) => x !== undefined).length !== 1) throw new TRPCError({ code: "BAD_REQUEST", message: "size by exactly one of: preset, custom, estimate" });
+      // PRODUCTION from gitops files: those files must be owner-reviewed (Nebula-enforced; the repo can't)
+      if (tier === "production" && !input.custom) {
+        const files = ["capacity/presets.yaml", ...(input.estimate ? ["capacity/profiles.yaml"] : [])];
+        try {
+          await requireReviewedCapacityFiles(files);
+        } catch (e) {
+          await auditDenial(ctx.prisma, ctx.login, "apply_live_capacity", String((e as Error).message), files.join(" "));
+          throw new TRPCError({ code: "PRECONDITION_FAILED", message: String((e as Error).message) });
+        }
+      }
       const { label, size } = await resolveSize(tier, input);
       if (!size.live) throw new TRPCError({ code: "BAD_REQUEST", message: `"${label}" has no live sizing for ${tier}` });
       const t = LIVE_TARGETS[tier];

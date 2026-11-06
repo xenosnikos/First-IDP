@@ -287,3 +287,64 @@ describe("traffic estimate hardening (Codex review 2026-11-06)", () => {
     expect(insightsTime("not a time")).toBeNull();
   });
 });
+
+describe("events + incidents (verify / watch / changes / prompts)", () => {
+  it("are reads every bound person gets", async () => {
+    const names = (await (await connect({ caller: fakeCaller().caller, operator: false, scopes: [] })).listTools()).tools.map((t) => t.name);
+    for (const n of ["capacity_verify", "event_watch", "recent_changes"]) expect(names).toContain(n);
+  });
+
+  it("capacity_verify takes exactly one target and forwards it", async () => {
+    const { caller, calls } = fakeCaller({ "capacity.verify": { check: { verdict: "READY" } } });
+    const client = await connect({ caller });
+    expect((await client.callTool({ name: "capacity_verify", arguments: { tier: "production" } })).isError).toBe(true);
+    await client.callTool({ name: "capacity_verify", arguments: { tier: "production", preset: "campaign" } });
+    await client.callTool({ name: "capacity_verify", arguments: { tier: "production", estimateRps: 2500 } });
+    expect(calls.filter((c) => c.proc === "capacity.verify").map((c) => c.input)).toEqual([
+      { tier: "production", preset: "campaign" },
+      { tier: "production", estimate: { rps: 2500, peakFactor: 1, headroom: 1.2 } },
+    ]);
+  });
+
+  it("event_watch returns the verdict and only the last 10 minutes of detail", async () => {
+    const minutes = Array.from({ length: 30 }, (_, i) => ({ t: String(i), rps: i }));
+    const client = await connect({ caller: fakeCaller({ "capacity.watch": { status: "WATCH", minutes } }).caller });
+    const out = JSON.parse(textOf(await client.callTool({ name: "event_watch", arguments: { tier: "production" } })));
+    expect(out.status).toBe("WATCH");
+    expect(out.lastMinutes).toHaveLength(10);
+    expect(out.minutes).toBeUndefined();
+  });
+
+  it("prompts: prepare_marketing_event (verify before the event) and diagnose_outage (changes before conclusions; no prod restarts)", async () => {
+    const client = await connect({ caller: fakeCaller().caller });
+    const names = (await client.listPrompts()).prompts.map((p) => p.name);
+    expect(names).toEqual(expect.arrayContaining(["plan_capacity_for_traffic", "prepare_marketing_event", "diagnose_outage"]));
+    const prep = (( await client.getPrompt({ name: "prepare_marketing_event", arguments: { expectedPeakRps: "2500" } })).messages[0].content as { text: string }).text;
+    expect(prep.indexOf("capacity_verify")).toBeGreaterThan(prep.indexOf("apply_live_capacity"));
+    expect(prep).toMatch(/explicit yes/);
+    const diag = ((await client.getPrompt({ name: "diagnose_outage", arguments: { symptom: "slow at midnight" } })).messages[0].content as { text: string }).text;
+    expect(diag.indexOf("recent_changes")).toBeLessThan(diag.indexOf("Conclude"));
+    expect(diag).toMatch(/NOT Nebula actions/);
+  });
+});
+
+describe("capacity file provenance (Nebula-enforced review)", () => {
+  const gh = (o: { sha?: string; pulls?: Array<{ number: number; merged_at: string | null; base: { ref: string } }>; mergedBy?: string | null; throws?: boolean }) =>
+    ({
+      repos: {
+        listCommits: async () => { if (o.throws) throw new Error("GitHub down"); return { data: o.sha ? [{ sha: o.sha }] : [] }; },
+        listPullRequestsAssociatedWithCommit: async () => ({ data: o.pulls ?? [] }),
+      },
+      pulls: { get: async () => ({ data: { merged_by: o.mergedBy === null ? null : { login: o.mergedBy ?? "TwizzyNicky" } } }) },
+    }) as never;
+  const merged = [{ number: 7, merged_at: "2026-11-06T08:00:00Z", base: { ref: "main" } }];
+
+  it("ok only for a PR merged into main by a capacity owner; refused for direct pushes, other mergers, and errors", async () => {
+    const { capacityFileProvenance } = await import("../../nebula/capacity");
+    process.env.NEBULA_CAPACITY_OWNERS = "twizzynicky";
+    expect(await capacityFileProvenance("capacity/a.yaml", gh({ sha: "a".repeat(40), pulls: merged }))).toMatchObject({ ok: true, pr: 7, mergedBy: "twizzynicky" });
+    expect(await capacityFileProvenance("capacity/b.yaml", gh({ sha: "b".repeat(40), pulls: [] }))).toMatchObject({ ok: false, reason: expect.stringMatching(/pushed directly/) });
+    expect(await capacityFileProvenance("capacity/c.yaml", gh({ sha: "c".repeat(40), pulls: merged, mergedBy: "someone-else" }))).toMatchObject({ ok: false, reason: expect.stringMatching(/not a capacity owner/) });
+    expect(await capacityFileProvenance("capacity/d.yaml", gh({ throws: true }))).toMatchObject({ ok: false, reason: expect.stringMatching(/could not verify/) });
+  });
+});

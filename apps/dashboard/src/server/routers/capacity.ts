@@ -1,8 +1,9 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { AtlasSize, CAPACITY_TIERS, EstimateInput, EstimateLiveInput, TierSize, type CapacityTier, type LiveTierSize } from "@twizz-idp/shared";
-import { BASELINE_TEMPLATE, LIVE_TARGETS, PROD_ATLAS, assessLive, caseSizing, describeLiveOp, estimateLive, planProdAtlas, estimateTier, exportPlan, hashSize, isLiveTier, listCapacityPrs, liveAsSize, nearestPreset, planCapacity, planLive, type LiveTier } from "@twizz-idp/actions";
+import { BASELINE_TEMPLATE, LIVE_TARGETS, PROD_ATLAS, assessLive, caseSizing, recommendTemplate, verifyLive, describeLiveOp, estimateLive, planProdAtlas, estimateTier, exportPlan, hashSize, isLiveTier, listCapacityPrs, liveAsSize, nearestPreset, planCapacity, planLive, type LiveTier } from "@twizz-idp/actions";
 import { capacityCases, trafficPeaks, trafficWindow } from "../nebula/traffic";
+import { monitorSnapshot } from "../nebula/monitor";
 import { router, protectedProcedure } from "../trpc";
 import { namedEnvDeps } from "../nebula/deps";
 import { currentFor, liveTemplateOpts, nodePoolUsedCpu, observe, presetsAndProfiles, prodAtlasPort, readLive, readProdAtlas, targetFor } from "../nebula/capacity";
@@ -205,6 +206,109 @@ export const capacityRouter = router({
         }),
     };
   }),
+
+  /** Rollout validation (§N5.4): is the live cluster at the target of a template or an
+   * estimate — spec, ready pods, joined nodes — and how does it hold at the load right now? */
+  verify: protectedProcedure
+    .input(z.object({ tier: z.enum(["staging", "production"]), preset: z.string().max(24).optional(), estimate: EstimateLiveInput.optional() }).refine((v) => (v.preset === undefined) !== (v.estimate === undefined), "give exactly one of preset or estimate"))
+    .query(async ({ input }) => {
+      const { label, size } = await resolveSize(input.tier, input);
+      if (!size.live) throw new TRPCError({ code: "BAD_REQUEST", message: `"${label}" has no live sizing for ${input.tier}` });
+      const live = await readLive(input.tier);
+      if ("error" in live) throw new TRPCError({ code: "PRECONDITION_FAILED", message: `${LIVE_TARGETS[input.tier].cluster} not readable: ${live.error}` });
+      const check = verifyLive(live.state, size.live);
+      const now = Date.now();
+      const { profiles } = await presetsAndProfiles();
+      const profile = profiles?.tiers[input.tier]?.live;
+      const w = await trafficWindow(input.tier, new Date(now - 10 * 60_000).toISOString(), new Date(now).toISOString(), profile).catch(() => null);
+      const peak = w ? Math.max(0, ...w.minutes.map((m) => m.rps)) : null;
+      return {
+        tier: input.tier,
+        target: label,
+        readAt: live.state.readAt,
+        check,
+        loadNow: { peakRps10m: peak, p95MsLast: w?.minutes.filter((m) => m.p95Ms !== null).at(-1)?.p95Ms ?? null, assessment: profile && peak !== null ? assessLive(profile, liveAsSize(LIVE_TARGETS[input.tier], live.state), peak) : null },
+      };
+    }),
+
+  /** Event watch (§N5.4): the last N minutes, the monitor's signals, and OK / WATCH / ACT
+   * with the next step if capacity is short. Read-only: acting is apply_live_capacity. */
+  watch: protectedProcedure.input(z.object({ tier: z.enum(["staging", "production"]), minutes: z.number().int().min(5).max(60).default(15) })).query(async ({ input }) => {
+    const now = Date.now();
+    const [{ presets, profiles }, live, snap] = await Promise.all([presetsAndProfiles(), readLive(input.tier), monitorSnapshot(input.tier, "15m").catch((e) => ({ error: String((e as Error).message ?? e) }))]);
+    const profile = profiles?.tiers[input.tier]?.live;
+    const w = await trafficWindow(input.tier, new Date(now - input.minutes * 60_000).toISOString(), new Date(now).toISOString(), profile);
+    const withRps = w.minutes.filter((m) => m.rps > 0);
+    const peak = Math.max(0, ...withRps.map((m) => m.rps));
+    const p95s = w.minutes.map((m) => m.p95Ms).filter((v): v is number => v !== null);
+    const p95Last = p95s.at(-1) ?? null;
+    const p95Max = p95s.length ? Math.max(...p95s) : null;
+    const nodesLast = [...w.minutes].reverse().find((m) => m.nodes)?.nodes ?? null;
+    const running = "state" in live ? liveAsSize(LIVE_TARGETS[input.tier], live.state) : null;
+    const atPeak = profile && running ? assessLive(profile, running, peak) : null;
+    const atMargin = profile && running ? assessLive(profile, running, peak * 1.3) : null;
+    const reasons: string[] = [];
+    let status: "OK" | "WATCH" | "ACT" = "OK";
+    if (atPeak?.verdict === "SATURATED" || (p95Last !== null && p95Last > 1000) || (nodesLast && nodesLast.cpuMaxPct >= 90)) {
+      status = "ACT";
+      reasons.push(...[atPeak?.verdict === "SATURATED" ? `what runs is SATURATED at the current peak (${peak} req/s)` : "", p95Last !== null && p95Last > 1000 ? `p95 ${p95Last} ms` : "", nodesLast && nodesLast.cpuMaxPct >= 90 ? `a node at ${nodesLast.cpuMaxPct}% CPU` : ""].filter(Boolean));
+    } else if (atMargin?.verdict !== "OK" || (p95Last !== null && p95Last > 500) || (nodesLast && nodesLast.cpuAvgPct >= 70)) {
+      status = "WATCH";
+      reasons.push(...[atMargin && atMargin.verdict !== "OK" ? `no 30% margin over the current peak (${atMargin.verdict} at ${Math.round(peak * 1.3)} req/s)` : "", p95Last !== null && p95Last > 500 ? `p95 ${p95Last} ms` : "", nodesLast && nodesLast.cpuAvgPct >= 70 ? `nodes at ${nodesLast.cpuAvgPct}% avg CPU` : ""].filter(Boolean));
+    }
+    const templates = presets.filter((p) => p.tiers[input.tier]?.live).map((p) => ({ name: p.name, size: p.tiers[input.tier]!.live! }));
+    const next = status !== "OK" && profile ? recommendTemplate(profile, templates, Math.max(peak * 1.3, 1)) : null;
+    return {
+      tier: input.tier,
+      window: { from: w.from, to: w.to, minutes: input.minutes },
+      status,
+      reasons,
+      edge: { peakRps: peak, lastRps: withRps.at(-1)?.rps ?? null, p95MsLast: p95Last, p95MsMax: p95Max, err5xx: w.minutes.reduce((a, m) => a + m.err5xx, 0) },
+      nodes: nodesLast,
+      running,
+      atPeak,
+      atPeakPlus30: atMargin,
+      recommend: next ? { template: next.name, assessment: next.assessment, then: `capacity_plan {tier: "${input.tier}", preset: "${next.name}"} → apply_live_capacity` } : status !== "OK" ? { template: null, then: `no named template holds ${Math.round(peak * 1.3)} req/s: capacity_estimate {tier: "${input.tier}", rps: ${Math.round(peak * 1.3)}}` } : null,
+      signals: "error" in snap ? { error: snap.error } : snap.signals,
+      minutes: w.minutes,
+      podMetrics: w.podMetrics,
+    };
+  }),
+
+  /** What changed (§N5.4): Nebula's audited writes (capacity, promotions, envs, …) and the
+   * image pushes of the prod services in a window — the first question of any outage. */
+  recentChanges: protectedProcedure
+    .input(z.object({ from: z.string().datetime(), to: z.string().datetime().optional() }))
+    .query(async ({ ctx, input }) => {
+      const from = new Date(input.from);
+      const to = input.to ? new Date(input.to) : new Date();
+      if (!(to > from)) throw new TRPCError({ code: "BAD_REQUEST", message: "`to` must be after `from`" });
+      if (to.getTime() - from.getTime() > 7 * 24 * 3600_000) throw new TRPCError({ code: "BAD_REQUEST", message: "at most 7 days" });
+      const rows = await ctx.prisma.auditLog.findMany({
+        where: { createdAt: { gte: from, lte: to }, allowed: true, OR: [{ action: { startsWith: "nebula." } }, { action: { startsWith: "mcp.intent." } }], NOT: { action: { startsWith: "nebula.observer." } } },
+        orderBy: { createdAt: "asc" },
+        take: 200,
+        select: { createdAt: true, actor: true, action: true, resource: true, detail: true },
+      });
+      const PROD_REPOS = ["molybackend", "lolygramdiscovery", "alertservice", "invoicegen", "sendgridwebhook", "emailservice", "paymentserv", "twizz-sentinel", "twizz-admin"];
+      const images = namedEnvDeps().images;
+      const pushes = (
+        await Promise.all(
+          PROD_REPOS.map(async (repo) =>
+            (await images.listImages(repo).catch(() => []))
+              .filter((i) => i.pushedAt && i.pushedAt >= from && i.pushedAt <= to)
+              .map((i) => ({ at: i.pushedAt!.toISOString(), repo, tags: i.tags.slice(0, 3) })),
+          ),
+        )
+      ).flat().sort((a, b) => a.at.localeCompare(b.at));
+      return {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        nebulaWrites: rows.map((r) => ({ at: r.createdAt.toISOString(), actor: r.actor, action: r.action, resource: r.resource, summary: String((r.detail as { summary?: string } | null)?.summary ?? "").split("\n")[0].slice(0, 200) })),
+        imagePushes: pushes,
+        note: "prod Moly services deploy outside Nebula (CodeBuild → ECR → rollout): an image push shortly before an incident is a likely deploy",
+      };
+    }),
 
   /** Traffic calculator: rps → a custom size + the nearest named preset. */
   estimate: protectedProcedure.input(EstimateInput.extend({ tier: tierSchema })).query(async ({ input }) => {

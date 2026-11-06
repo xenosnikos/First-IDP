@@ -18,9 +18,11 @@ import {
   atlasMonthly,
   isProdAtlasCluster,
   prodAtlasOptions,
+  GITOPS,
 } from "@twizz-idp/actions";
+import type { Octokit } from "@octokit/rest";
 import { ATLAS_TIERS, type AtlasSize, type AtlasTier, type CapacityTier } from "@twizz-idp/shared";
-import { namedEnvDeps } from "./deps";
+import { namedEnvDeps, octokit } from "./deps";
 import { readCapacityKube, readClusterSnapshot } from "./kube";
 import { liveClusterPort } from "./live-cluster";
 
@@ -198,4 +200,53 @@ export async function readProdAtlas(): Promise<{ clusters: ProdAtlasRow[] } | { 
   } catch (e) {
     return { error: errMsg(e) };
   }
+}
+
+// ── provenance of the capacity files (Codex review 2026-11-06) ─────────────
+// twizz-gitops is a private personal repo: GitHub offers no branch protection or
+// rulesets there, and `main` also takes Nebula's own direct commits (named envs).
+// So Nebula enforces it: a PRODUCTION capacity write needs the latest commit to each
+// capacity file it relies on to come from a PR merged by a capacity owner
+// (NEBULA_CAPACITY_OWNERS, default the platform owner). Fail closed.
+export const CAPACITY_OWNERS = () =>
+  (process.env.NEBULA_CAPACITY_OWNERS || "twizzynicky")
+    .split(",")
+    .map((s) => s.trim().toLowerCase())
+    .filter(Boolean);
+
+export type Provenance = { path: string; ok: boolean; sha?: string; pr?: number; mergedBy?: string; reason?: string };
+const provenanceCache = new Map<string, { at: number; v: Provenance }>();
+
+export async function capacityFileProvenance(path: string, gh: Octokit = octokit()): Promise<Provenance> {
+  const hit = provenanceCache.get(path);
+  if (hit && Date.now() - hit.at < 5 * 60_000) return hit.v;
+  let v: Provenance;
+  try {
+    const { owner, repo, branch } = GITOPS;
+    const commits = await gh.repos.listCommits({ owner, repo, sha: branch, path, per_page: 1 });
+    const sha = commits.data[0]?.sha;
+    if (!sha) v = { path, ok: false, reason: `${path} has no commits on ${branch}` };
+    else {
+      const pulls = await gh.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+      const merged = pulls.data.find((p) => p.merged_at && p.base.ref === branch);
+      if (!merged) v = { path, ok: false, sha, reason: `the last change to ${path} (${sha.slice(0, 7)}) was pushed directly, not merged through a PR` };
+      else {
+        const full = await gh.pulls.get({ owner, repo, pull_number: merged.number });
+        const by = full.data.merged_by?.login?.toLowerCase();
+        v = by && CAPACITY_OWNERS().includes(by) ? { path, ok: true, sha, pr: merged.number, mergedBy: by } : { path, ok: false, sha, pr: merged.number, mergedBy: by, reason: `${path} was last changed by PR #${merged.number}, merged by ${by ?? "unknown"} — not a capacity owner (${CAPACITY_OWNERS().join(", ")})` };
+      }
+    }
+  } catch (e) {
+    v = { path, ok: false, reason: `could not verify ${path} on GitHub: ${errMsg(e)}` };
+  }
+  provenanceCache.set(path, { at: Date.now(), v });
+  return v;
+}
+
+/** Throws unless every file was last changed by an owner-merged PR. */
+export async function requireReviewedCapacityFiles(paths: string[]): Promise<Provenance[]> {
+  const all = await Promise.all(paths.map((p) => capacityFileProvenance(p)));
+  const bad = all.filter((p) => !p.ok);
+  if (bad.length) throw new Error(`refused: production capacity relies on files that are not owner-reviewed — ${bad.map((b) => b.reason).join("; ")}`);
+  return all;
 }
