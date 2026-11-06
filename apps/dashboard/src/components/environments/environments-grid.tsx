@@ -7,7 +7,7 @@ import { Pill } from "@/components/nebula/pill";
 import { Button } from "@/components/nebula/button";
 import { PageHeader } from "@/components/nebula/plate";
 import { GateDialog } from "@/components/nebula/gate-dialog";
-import { useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
+import { mayHaveWritten, useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
 import type { StatusWord } from "@/lib/nebula/status";
 import { PreviewCard, type NamedEnvView } from "./preview-card";
 import { PendingCard, type PendingEnvView } from "./pending-card";
@@ -68,7 +68,7 @@ export function EnvironmentsGrid({ operator, login }: { operator: boolean; login
     void gated.request({ action: a });
   };
   const closeGate = () => {
-    const wasDone = gated.phase.kind === "done";
+    const wasDone = mayHaveWritten(gated.phase);
     gated.reset();
     setAction(null);
     if (wasDone) utils.nebula.listEnvironments.invalidate();

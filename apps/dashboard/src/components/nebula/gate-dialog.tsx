@@ -36,6 +36,7 @@ export function GateDialog<R>({
         {phase.kind === "done" && <Pill word="PASS" />}
         {phase.kind === "denied" && <Pill word="DENIED" />}
         {phase.kind === "error" && <Pill word="FAIL" />}
+        {phase.kind === "unknown" && <Pill word="UNKNOWN" />}
       </div>
 
       {phase.kind === "issuing" && <p style={{ color: "var(--n-ink-muted)" }}>Asking the gate (policy → nonce)…</p>}
@@ -70,6 +71,18 @@ export function GateDialog<R>({
           <p style={{ color: "var(--n-fail)", margin: "0 0 14px", wordBreak: "break-word" }}>{phase.message}</p>
           <p style={{ color: "var(--n-ink-muted)", fontSize: 11, margin: "0 0 14px" }}>The gate fails closed: the audit row records the failure and nothing partial is retried on your behalf.</p>
           <div style={{ display: "flex", justifyContent: "flex-end" }}><Button onClick={onClose}>Close</Button></div>
+        </>
+      )}
+
+      {phase.kind === "unknown" && (
+        <>
+          <p style={{ margin: "0 0 10px", wordBreak: "break-word" }}>
+            The connection dropped before the server answered ({phase.message}). The change <strong>may already be applied</strong> — the server keeps going once you confirm.
+          </p>
+          <p style={{ color: "var(--n-ink-muted)", fontSize: 11, margin: "0 0 14px" }}>
+            Close to re-read the current state and check it before trying again. A retry is safe: this token was single-use, so a new request plans against what runs now (and the audit log has the outcome).
+          </p>
+          <div style={{ display: "flex", justifyContent: "flex-end" }}><Button variant="ion" onClick={onClose}>Close and re-check</Button></div>
         </>
       )}
 

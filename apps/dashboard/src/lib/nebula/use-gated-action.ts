@@ -19,7 +19,22 @@ export type GatePhase<R = unknown> =
   | { kind: "confirming"; summary: string }
   | { kind: "done"; result: R }
   | { kind: "denied"; reason: string }
-  | { kind: "error"; message: string };
+  | { kind: "error"; message: string }
+  /** the confirm call lost its response (network drop, proxy 5xx): the server may have
+   * applied it — never report that as a failure */
+  | { kind: "unknown"; message: string };
+
+/** True when the server never answered with a tRPC error: the request may have run.
+ * A tRPC error response carries `shape`; a dropped connection ("Failed to fetch", nginx
+ * 499) or a non-JSON proxy reply (502/504) does not. */
+export function responseLost(e: unknown): boolean {
+  return !(e && typeof e === "object" && "shape" in e && (e as { shape?: unknown }).shape);
+}
+
+/** The write may have happened: done, or confirm outcome unknown. Callers refresh on this. */
+export function mayHaveWritten(phase: GatePhase<unknown>): boolean {
+  return phase.kind === "done" || phase.kind === "unknown";
+}
 
 export function useGatedAction<A extends object, R = unknown>(run: (args: A & { confirm?: string }) => Promise<GateResult>) {
   const [phase, setPhase] = useState<GatePhase<R>>({ kind: "idle" });
@@ -53,7 +68,8 @@ export function useGatedAction<A extends object, R = unknown>(run: (args: A & { 
     try {
       setPhase(settle(await run({ ...args, confirm: phase.confirm })));
     } catch (e) {
-      setPhase({ kind: "error", message: (e as Error).message ?? String(e) });
+      const message = (e as Error).message ?? String(e);
+      setPhase(responseLost(e) ? { kind: "unknown", message } : { kind: "error", message });
     }
   }, [args, phase, run, settle]);
 

@@ -9,7 +9,7 @@ import { Pill } from "@/components/nebula/pill";
 import { Button } from "@/components/nebula/button";
 import { Field, PageHeader, Row, inputStyle } from "@/components/nebula/plate";
 import { GateDialog } from "@/components/nebula/gate-dialog";
-import { useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
+import { mayHaveWritten, useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
 
 type Out = inferRouterOutputs<AppRouter>["capacity"];
 type TierView = Out["tier"];
@@ -104,7 +104,7 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
     void gated.request({ action: a });
   };
   const closeGate = () => {
-    const wasDone = gated.phase.kind === "done";
+    const wasDone = mayHaveWritten(gated.phase);
     gated.reset();
     setAction(null);
     if (wasDone) {
