@@ -301,3 +301,16 @@ describe("named templates with a baseline floor", () => {
     await expect(applyLive(new FakePort(at(MAX)), T, BASELINE, hash)).rejects.toThrow(/changed since you reviewed/);
   });
 });
+
+describe("plan hash ignores volatile rollout progress (Codex re-review)", () => {
+  it("same spec, different rollout observations → same hash; a spec change → different hash", () => {
+    const want = { workloads: { "moly-backend-deployment": { replicas: 48 } }, nodegroups: {} } as LiveTierSize;
+    const a = PROD();
+    const b = PROD();
+    for (const w of b.workloads) Object.assign(w, { ready: Math.max(0, w.ready - 3), rollout: { observed: false, updated: 1, available: 2, total: w.replicas + 4, unavailable: 2 } });
+    expect(planLive(T, a, want).planHash).toBe(planLive(T, b, want).planHash);
+    const c = PROD();
+    c.workloads.find((w) => w.name === "moly-backend-deployment")!.replicas = 30;
+    expect(planLive(T, c, want).planHash).not.toBe(planLive(T, a, want).planHash);
+  });
+});

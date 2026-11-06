@@ -233,7 +233,7 @@ export type RolloutCheck = {
 /** Compare the live state with a target size. MISMATCH = the spec isn't what was planned
  * (the apply stopped, or something else changed it); PROGRESSING = spec right, pods or
  * nodes still coming; READY = spec right and everything ready. */
-export function verifyLive(state: { workloads: Array<{ name: string; replicas: number; ready: number; rollout?: { observed: boolean; updated: number; available: number } }>; nodegroups: Array<{ name: string; min: number; desired: number; max: number }>; nodes: Array<{ nodegroup?: string; ready?: boolean; schedulable?: boolean }> }, size: LiveTierSize): RolloutCheck {
+export function verifyLive(state: { workloads: Array<{ name: string; replicas: number; ready: number; rollout?: { observed: boolean; updated: number; available: number; total?: number; unavailable?: number } }>; nodegroups: Array<{ name: string; min: number; desired: number; max: number }>; nodes: Array<{ nodegroup?: string; ready?: boolean; schedulable?: boolean }> }, size: LiveTierSize): RolloutCheck {
   let mismatch = false;
   let progressing = false;
   const workloads = Object.entries(size.workloads ?? {}).map(([name, want]) => {
@@ -252,10 +252,20 @@ export function verifyLive(state: { workloads: Array<{ name: string; replicas: n
       progressing = true;
       return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: "the deployment controller hasn't observed the new spec yet" };
     }
-    const available = ro ? Math.min(ro.updated, ro.available) : w.ready;
-    if (available < w.replicas) {
+    // `kubectl rollout status` semantics: every desired replica updated, no old replicas left
+    // (total == desired), all available, none unavailable — old pods can't mask new ones
+    if (ro) {
+      const notUpdated = w.replicas - ro.updated;
+      const oldLeft = (ro.total ?? w.replicas) - w.replicas;
+      const notAvailable = Math.max(w.replicas - ro.available, ro.unavailable ?? 0);
+      if (notUpdated > 0 || oldLeft > 0 || notAvailable > 0) {
+        progressing = true;
+        const bits = [notUpdated > 0 ? `${notUpdated} pod(s) not updated` : "", oldLeft > 0 ? `${oldLeft} old pod(s) still running` : "", notAvailable > 0 ? `${notAvailable} pod(s) not available` : ""].filter(Boolean);
+        return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: bits.join(", ") };
+      }
+    } else if (w.ready < w.replicas) {
       progressing = true;
-      return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: `${w.replicas - available} pod(s) not updated+available yet` };
+      return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: `${w.replicas - w.ready} pod(s) not ready yet` };
     }
     return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: true };
   });

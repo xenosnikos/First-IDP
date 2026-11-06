@@ -329,68 +329,101 @@ describe("events + incidents (verify / watch / changes / prompts)", () => {
   });
 });
 
-describe("capacity file provenance: pinned, proven (Codex reviews)", () => {
-  const SHA = (c: string) => c.repeat(40);
-  type PR = { number: number; merged_at: string | null; base: { ref: string; repo: { full_name: string } }; merge_commit_sha: string; merged_by: string | null; commits: string[] };
-  const gh = (o: { head?: string; lastCommit?: Record<string, string>; prs?: PR[]; content?: Record<string, string>; throws?: boolean }) =>
-    ({
-      git: { getRef: async () => ({ data: { object: { sha: o.head ?? SHA("h") } } }) },
+describe("capacity file provenance: blob-level proof at a pinned head (Codex reviews)", () => {
+  const P = "capacity/presets.yaml";
+  // a tiny git: commits with parents and the presets blob at each commit
+  type Commit = { parents: string[]; blob: string | null };
+  type PR = { number: number; merge: string; commits: string[]; mergedBy?: string; baseRepo?: string };
+  function fakeGh(o: { commits: Record<string, Commit>; head: string; prs: PR[]; lastTouch: string; throws?: boolean }) {
+    const ancestors = (sha: string, seen = new Set<string>()): Set<string> => {
+      if (seen.has(sha)) return seen;
+      seen.add(sha);
+      for (const p of o.commits[sha]?.parents ?? []) ancestors(p, seen);
+      return seen;
+    };
+    return {
+      git: {
+        getRef: async () => ({ data: { object: { sha: o.head } } }),
+        getCommit: async ({ commit_sha }: { commit_sha: string }) => ({ data: { parents: (o.commits[commit_sha]?.parents ?? []).map((sha) => ({ sha })) } }),
+      },
       repos: {
-        listCommits: async ({ path }: { path: string }) => {
+        listCommits: async () => {
           if (o.throws) throw new Error("GitHub down");
-          const c = o.lastCommit?.[path];
-          return { data: c ? [{ sha: c }] : [] };
+          return { data: [{ sha: o.lastTouch }] };
         },
-        listPullRequestsAssociatedWithCommit: async ({ commit_sha }: { commit_sha: string }) => ({ data: (o.prs ?? []).filter((p) => p.merge_commit_sha === commit_sha || p.commits.includes(commit_sha)) }),
-        getContent: async ({ path, ref }: { path: string; ref: string }) => ({ data: { type: "file", sha: `blob-${path}-${ref.slice(0, 1)}`, content: Buffer.from(o.content?.[path] ?? "presets: []").toString("base64") } }),
+        listPullRequestsAssociatedWithCommit: async ({ commit_sha }: { commit_sha: string }) => ({
+          data: o.prs.filter((p) => p.merge === commit_sha || p.commits.includes(commit_sha)).map((p) => ({ number: p.number, merged_at: "2026-11-06T08:00:00Z", base: { ref: "main", repo: { full_name: p.baseRepo ?? "TwizzyNicky/twizz-gitops" } } })),
+        }),
+        compareCommitsWithBasehead: async ({ basehead }: { basehead: string }) => {
+          const [base, head] = basehead.split("...");
+          return { data: { status: base === head ? "identical" : ancestors(head).has(base) ? "ahead" : "diverged" } };
+        },
+        getContent: async ({ ref }: { ref: string }) => {
+          const blob = o.commits[ref]?.blob;
+          if (!blob) throw Object.assign(new Error("Not Found"), { status: 404 });
+          return { data: { type: "file", sha: blob, content: Buffer.from(`presets: [] # ${blob}`).toString("base64") } };
+        },
       },
       pulls: {
         get: async ({ pull_number }: { pull_number: number }) => {
-          const p = (o.prs ?? []).find((x) => x.number === pull_number)!;
-          return { data: { merged_by: p.merged_by ? { login: p.merged_by } : null, merge_commit_sha: p.merge_commit_sha } };
+          const p = o.prs.find((x) => x.number === pull_number)!;
+          return { data: { merged_by: { login: p.mergedBy ?? "TwizzyNicky" }, merge_commit_sha: p.merge } };
         },
-        listCommits: async ({ pull_number }: { pull_number: number }) => ({ data: ((o.prs ?? []).find((x) => x.number === pull_number)?.commits ?? []).map((sha) => ({ sha })) }),
       },
-    }) as never;
-  const pr = (o: Partial<PR> & { number: number }): PR => ({ merged_at: "2026-11-06T08:00:00Z", base: { ref: "main", repo: { full_name: "TwizzyNicky/twizz-gitops" } }, merge_commit_sha: SHA("m"), merged_by: "TwizzyNicky", commits: [], ...o });
-  const P = "capacity/presets.yaml";
+    } as never;
+  }
+  let n = 0;
+  const head = () => `h${++n}`.padEnd(40, "0"); // fresh cache key per scenario
 
-  it("accepts a squash merge by an owner (the last commit IS the merge commit)", async () => {
+  it("accepts a squash merge by an owner that introduced the bytes at head", async () => {
     const { capacityFileProvenance } = await import("../../nebula/capacity");
     process.env.NEBULA_CAPACITY_OWNERS = "twizzynicky";
-    const v = await capacityFileProvenance(P, SHA("1"), gh({ lastCommit: { [P]: SHA("m") }, prs: [pr({ number: 7 })] }));
-    expect(v).toMatchObject({ ok: true, pr: 7, mergedBy: "twizzynicky" });
+    const H = head();
+    const gh = fakeGh({ head: H, lastTouch: H, prs: [{ number: 7, merge: H, commits: ["f"] }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } });
+    expect(await capacityFileProvenance(P, H, gh)).toMatchObject({ ok: true, pr: 7, mergedBy: "twizzynicky" });
   });
 
-  it("accepts a merge-commit PR whose own commit last touched the file", async () => {
+  it("accepts a merge-commit PR (last touch is the PR's own commit; the merge brought it to main)", async () => {
     const { capacityFileProvenance } = await import("../../nebula/capacity");
-    expect(await capacityFileProvenance(P, SHA("2"), gh({ lastCommit: { [P]: SHA("c") }, prs: [pr({ number: 8, commits: [SHA("c")] })] }))).toMatchObject({ ok: true, pr: 8 });
+    const H = head();
+    const gh = fakeGh({ head: H, lastTouch: "f1", prs: [{ number: 8, merge: H, commits: ["f1"] }], commits: { p0: { parents: [], blob: "A" }, f1: { parents: ["p0"], blob: "B" }, [H]: { parents: ["p0", "f1"], blob: "B" } } });
+    expect(await capacityFileProvenance(P, H, gh)).toMatchObject({ ok: true, pr: 8 });
   });
 
-  it("refuses: direct push, a non-owner merger, a PR into another repo, and a PR that only CONTAINS the commit", async () => {
+  it("REFUSES a direct push laundered through a stacked owner-merged PR that merely contains it", async () => {
     const { capacityFileProvenance } = await import("../../nebula/capacity");
-    expect(await capacityFileProvenance(P, SHA("3"), gh({ lastCommit: { [P]: SHA("d") }, prs: [] }))).toMatchObject({ ok: false, reason: expect.stringMatching(/pushed directly/) });
-    expect(await capacityFileProvenance(P, SHA("4"), gh({ lastCommit: { [P]: SHA("m") }, prs: [pr({ number: 9, merged_by: "mallory" })] }))).toMatchObject({ ok: false, reason: expect.stringMatching(/capacity owner/) });
-    expect(await capacityFileProvenance(P, SHA("5"), gh({ lastCommit: { [P]: SHA("m") }, prs: [pr({ number: 10, base: { ref: "main", repo: { full_name: "evil/twizz-gitops" } } })] }))).toMatchObject({ ok: false });
-    // association returns a PR whose merge commit and commits are NOT the file's last commit
-    const containing = { lastCommit: { [P]: SHA("x") }, prs: [pr({ number: 11, merge_commit_sha: SHA("y"), commits: [SHA("z")] })] };
-    const g = gh(containing) as unknown as { repos: { listPullRequestsAssociatedWithCommit: unknown } };
-    g.repos.listPullRequestsAssociatedWithCommit = async () => ({ data: containing.prs });
-    expect(await capacityFileProvenance(P, SHA("6"), g as never)).toMatchObject({ ok: false, reason: expect.stringMatching(/not the merge or one of the commits/) });
+    const H = head();
+    // x = direct push to main changing presets (A→B); PR 9 (owner-merged later) lists x among its commits but its merge changes nothing in presets
+    const gh = fakeGh({ head: H, lastTouch: "x", prs: [{ number: 9, merge: H, commits: ["x", "y"] }], commits: { p0: { parents: [], blob: "A" }, x: { parents: ["p0"], blob: "B" }, y: { parents: ["x"], blob: "B" }, [H]: { parents: ["x", "y"], blob: "B" } } });
+    expect(await capacityFileProvenance(P, H, gh)).toMatchObject({ ok: false, reason: expect.stringMatching(/not introduced by a PR/) });
+  });
+
+  it("refuses: a direct push after an approved merge, a non-owner merger, a PR into another repo", async () => {
+    const { capacityFileProvenance } = await import("../../nebula/capacity");
+    let H = head();
+    expect(await capacityFileProvenance(P, H, fakeGh({ head: H, lastTouch: H, prs: [{ number: 7, merge: "m", commits: [] }], commits: { p0: { parents: [], blob: "A" }, m: { parents: ["p0"], blob: "B" }, [H]: { parents: ["m"], blob: "C" } } }))).toMatchObject({ ok: false, reason: expect.stringMatching(/pushed directly/) });
+    H = head();
+    expect(await capacityFileProvenance(P, H, fakeGh({ head: H, lastTouch: H, prs: [{ number: 10, merge: H, commits: [], mergedBy: "mallory" }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } }))).toMatchObject({ ok: false });
+    H = head();
+    expect(await capacityFileProvenance(P, H, fakeGh({ head: H, lastTouch: H, prs: [{ number: 11, merge: H, commits: [], baseRepo: "evil/twizz-gitops" }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } }))).toMatchObject({ ok: false, reason: expect.stringMatching(/pushed directly/) });
   });
 
   it("errors fail closed and are not cached", async () => {
     const { capacityFileProvenance } = await import("../../nebula/capacity");
-    expect(await capacityFileProvenance(P, SHA("7"), gh({ throws: true }))).toMatchObject({ ok: false, reason: expect.stringMatching(/could not verify/) });
-    expect(await capacityFileProvenance(P, SHA("7"), gh({ lastCommit: { [P]: SHA("m") }, prs: [pr({ number: 7 })] }))).toMatchObject({ ok: true });
+    const H = head();
+    const good = { head: H, lastTouch: H, prs: [{ number: 7, merge: H, commits: [] }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } };
+    expect(await capacityFileProvenance(P, H, fakeGh({ ...good, throws: true }))).toMatchObject({ ok: false, reason: expect.stringMatching(/could not verify/) });
+    expect(await capacityFileProvenance(P, H, fakeGh(good))).toMatchObject({ ok: true });
   });
 
-  it("pinReviewedCapacity reads the bytes AT the pinned head and throws if any file is unproven", async () => {
+  it("pinReviewedCapacity sizes from the bytes at the pinned head and refuses if any file is unproven", async () => {
     const { pinReviewedCapacity } = await import("../../nebula/capacity");
-    const ok = await pinReviewedCapacity([P], gh({ head: SHA("8"), lastCommit: { [P]: SHA("m") }, prs: [pr({ number: 7 })], content: { [P]: "presets: []" } }));
-    expect(ok.head).toBe(SHA("8"));
-    expect(ok.files[P]).toMatchObject({ content: "presets: []", blob: `blob-${P}-8` });
-    await expect(pinReviewedCapacity([P, "capacity/profiles.yaml"], gh({ head: SHA("9"), lastCommit: { [P]: SHA("m") }, prs: [pr({ number: 7 })] }))).rejects.toThrow(/not owner-reviewed/);
+    const H = head();
+    const pin = await pinReviewedCapacity([P], fakeGh({ head: H, lastTouch: H, prs: [{ number: 7, merge: H, commits: [] }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } }));
+    expect(pin.head).toBe(H);
+    expect(pin.files[P]).toMatchObject({ blob: "B", content: "presets: [] # B" });
+    const H2 = head();
+    await expect(pinReviewedCapacity([P], fakeGh({ head: H2, lastTouch: "x", prs: [], commits: { [H2]: { parents: [], blob: "B" } } }))).rejects.toThrow(/not owner-reviewed/);
   });
 });
 

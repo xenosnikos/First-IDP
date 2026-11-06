@@ -9,9 +9,13 @@ import { isOperator } from "@/lib/nebula/operators";
 import type { ImageInfo } from "@twizz-idp/actions";
 
 const imageCache = new Map<string, { at: number; v: ImageInfo[] }>();
+let oldestImageRead = Infinity;
 async function cachedImages(repo: string, load: () => Promise<ImageInfo[]>): Promise<ImageInfo[]> {
   const hit = imageCache.get(repo);
-  if (hit && Date.now() - hit.at < 5 * 60_000) return hit.v;
+  if (hit && Date.now() - hit.at < 5 * 60_000) {
+    oldestImageRead = Math.min(oldestImageRead, hit.at);
+    return hit.v;
+  }
   const v = await load();
   imageCache.set(repo, { at: Date.now(), v });
   return v;
@@ -331,6 +335,7 @@ export const capacityRouter = router({
       const PROD_REPOS = ["molybackend", "lolygramdiscovery", "alertservice", "invoicegen", "sendgridwebhook", "emailservice", "paymentserv", "twizz-sentinel", "twizz-admin"];
       const images = namedEnvDeps().images;
       const repoErrors: Array<{ repo: string; error: string }> = [];
+      oldestImageRead = Infinity;
       const pushes = (
         await Promise.all(
           PROD_REPOS.map(async (repo) => {
@@ -352,6 +357,7 @@ export const capacityRouter = router({
         imagePushes: pushes,
         truncated: truncated ? "only the first 200 Nebula writes in this window are shown: narrow it" : undefined,
         repoErrors: repoErrors.length ? repoErrors : undefined,
+        imagesAsOf: Number.isFinite(oldestImageRead) ? new Date(oldestImageRead).toISOString() : new Date().toISOString(),
         note: "prod Moly services deploy outside Nebula (CodeBuild → ECR → rollout): an image push shortly before an incident is a likely deploy",
       };
     }),

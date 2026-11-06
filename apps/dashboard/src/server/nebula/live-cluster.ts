@@ -44,7 +44,7 @@ const str = (v: unknown) => (v === undefined || v === null ? undefined : String(
 type DeployItem = {
   metadata?: { name?: string; namespace?: string; generation?: number };
   spec?: { replicas?: number; template?: { spec?: { containers?: Array<{ name?: string; resources?: { requests?: Record<string, unknown>; limits?: Record<string, unknown> } }> } } };
-  status?: { readyReplicas?: number; updatedReplicas?: number; availableReplicas?: number; observedGeneration?: number };
+  status?: { replicas?: number; readyReplicas?: number; updatedReplicas?: number; availableReplicas?: number; unavailableReplicas?: number; observedGeneration?: number };
 };
 type HpaItem = {
   metadata?: { name?: string };
@@ -86,7 +86,7 @@ export function liveClusterPort(t: LiveTarget): LiveClusterPort {
             replicas: d.spec?.replicas ?? 0,
             ready: d.status?.readyReplicas ?? 0,
             // rollout completion (capacity_verify): the controller saw this spec, and every replica is updated + available
-            rollout: { observed: (d.status?.observedGeneration ?? 0) >= (d.metadata?.generation ?? 0), updated: d.status?.updatedReplicas ?? 0, available: d.status?.availableReplicas ?? 0 },
+            rollout: { observed: (d.status?.observedGeneration ?? 0) >= (d.metadata?.generation ?? 0), updated: d.status?.updatedReplicas ?? 0, available: d.status?.availableReplicas ?? 0, total: d.status?.replicas ?? 0, unavailable: d.status?.unavailableReplicas ?? 0 },
             container: ct?.name ?? name,
             resources,
             cpuRequestsOnAll: (d.spec?.template?.spec?.containers ?? []).every((c) => !!c.resources?.requests?.cpu),

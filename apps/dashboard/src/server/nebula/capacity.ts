@@ -223,24 +223,47 @@ export const CAPACITY_OWNERS = () =>
 export type Provenance = { path: string; ok: boolean; commit?: string; pr?: number; mergedBy?: string; reason?: string };
 const provenanceCache = new Map<string, Provenance>();
 
-/** Is commit `sha` proven to come from a PR merged into GITOPS main by an owner? */
-async function provePrOrigin(gh: Octokit, sha: string): Promise<{ ok: true; pr: number; mergedBy: string } | { ok: false; reason: string }> {
+/** Blob sha of `path` at `ref`, or null if the file isn't there. */
+async function blobAt(gh: Octokit, path: string, ref: string): Promise<string | null> {
+  const { owner, repo } = GITOPS;
+  try {
+    const { data } = await gh.repos.getContent({ owner, repo, path, ref });
+    return Array.isArray(data) || data.type !== "file" ? null : data.sha;
+  } catch (e) {
+    if ((e as { status?: number }).status === 404) return null;
+    throw e;
+  }
+}
+
+/** Proof that the bytes of `path` at H were INTRODUCED by a PR an owner merged into this repo's
+ * main (Codex reviews): for a candidate PR (associated with C, the last commit touching the path
+ * as of H), with merge commit M:
+ *   - M is on main's history up to H (M is H or an ancestor of H),
+ *   - the file's blob at M equals its blob at H (nothing changed it after the merge), and
+ *   - the blob at M's first parent differs (THIS merge brought the change, not an earlier one).
+ * Commit-list membership alone is not accepted (a stacked PR can contain an older commit). */
+async function provePrOrigin(gh: Octokit, path: string, c: string, head: string): Promise<{ ok: true; pr: number; mergedBy: string } | { ok: false; reason: string }> {
   const { owner, repo, branch } = GITOPS;
   const fullName = `${owner}/${repo}`.toLowerCase();
-  const pulls = await gh.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+  const pulls = await gh.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: c });
   const candidates = pulls.data.filter((p) => p.merged_at && p.base.ref === branch && p.base.repo?.full_name?.toLowerCase() === fullName);
-  if (!candidates.length) return { ok: false, reason: `commit ${sha.slice(0, 7)} was pushed directly, not merged through a PR into ${fullName}:${branch}` };
+  if (!candidates.length) return { ok: false, reason: `commit ${c.slice(0, 7)} was pushed directly, not merged through a PR into ${fullName}:${branch}` };
   const owners = CAPACITY_OWNERS();
+  const atHead = await blobAt(gh, path, head);
   for (const p of candidates) {
     const full = (await gh.pulls.get({ owner, repo, pull_number: p.number })).data;
     const by = full.merged_by?.login?.toLowerCase();
-    if (!by || !owners.includes(by)) continue;
-    // the PR must have INTRODUCED this commit, not merely contain it
-    if (full.merge_commit_sha === sha) return { ok: true, pr: p.number, mergedBy: by };
-    const commits = await gh.pulls.listCommits({ owner, repo, pull_number: p.number, per_page: 100 });
-    if (commits.data.some((c) => c.sha === sha)) return { ok: true, pr: p.number, mergedBy: by };
+    const m = full.merge_commit_sha;
+    if (!by || !owners.includes(by) || !m) continue;
+    const cmp = await gh.repos.compareCommitsWithBasehead({ owner, repo, basehead: `${m}...${head}` });
+    if (cmp.data.status !== "ahead" && cmp.data.status !== "identical") continue; // M not on H's history
+    const [atM, parents] = await Promise.all([blobAt(gh, path, m), gh.git.getCommit({ owner, repo, commit_sha: m }).then((r) => r.data.parents)]);
+    if (!atM || atM !== atHead) continue; // changed after this merge
+    const before = parents[0] ? await blobAt(gh, path, parents[0].sha) : null;
+    if (before === atM) continue; // this merge didn't change the file
+    return { ok: true, pr: p.number, mergedBy: by };
   }
-  return { ok: false, reason: `commit ${sha.slice(0, 7)} is not the merge or one of the commits of a PR merged by a capacity owner (${owners.join(", ")})` };
+  return { ok: false, reason: `${path} at ${head.slice(0, 7)} was not introduced by a PR a capacity owner (${owners.join(", ")}) merged into ${branch}` };
 }
 
 export async function capacityFileProvenance(path: string, head: string, gh: Octokit = octokit()): Promise<Provenance> {
@@ -254,7 +277,7 @@ export async function capacityFileProvenance(path: string, head: string, gh: Oct
     const commit = commits.data[0]?.sha;
     if (!commit) v = { path, ok: false, reason: `${path} has no history as of ${head.slice(0, 7)}` };
     else {
-      const proof = await provePrOrigin(gh, commit);
+      const proof = await provePrOrigin(gh, path, commit, head);
       v = proof.ok ? { path, ok: true, commit, pr: proof.pr, mergedBy: proof.mergedBy } : { path, ok: false, commit, reason: `${path}: ${proof.reason}` };
     }
   } catch (e) {

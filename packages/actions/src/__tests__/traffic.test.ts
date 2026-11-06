@@ -144,3 +144,13 @@ describe("verifyLive + recommendTemplate (Codex review)", () => {
     expect(recommendTemplate(PROFILE, all, 300, running)?.name).toBe("campaign");
   });
 });
+
+describe("verifyLive surge rollout (Codex re-review)", () => {
+  it("old replicas can't mask new ones: not READY while old pods run or updated ones are unavailable", () => {
+    const size = { workloads: { "moly-backend-deployment": { replicas: 80 } }, nodegroups: {} } as LiveTierSize;
+    const w = (r: { updated: number; available: number; total: number; unavailable: number }) => verifyLive({ workloads: [{ name: "moly-backend-deployment", replicas: 80, ready: 80, rollout: { observed: true, ...r } }], nodegroups: [], nodes: [] }, size);
+    expect(w({ updated: 80, available: 80, total: 100, unavailable: 0 }).workloads[0].note).toMatch(/20 old pod/);
+    expect(w({ updated: 80, available: 80, total: 80, unavailable: 5 }).verdict).toBe("PROGRESSING");
+    expect(w({ updated: 80, available: 80, total: 80, unavailable: 0 }).verdict).toBe("READY");
+  });
+});
