@@ -8,6 +8,7 @@ import { createNetbirdRouter } from "./netbird";
 import { createAdminGate } from "./admin-gate";
 import { createStagingAccess, registerStagingCluster } from "./staging";
 import { createCapacityAccess } from "./capacity-access";
+import { createNonprodObservability } from "./observability";
 import * as pulumi from "@pulumi/pulumi";
 
 const tags = { Project: "twizz-idp" };
@@ -23,6 +24,9 @@ const eks = createEksCluster(
 );
 
 const iam = createIamRoles(eks.oidcProviderArn, eks.oidcProviderUrl, tags);
+
+// Container Insights on NonProd: pod logs for the Observer / MCP log tools (docs/NEBULA.md §N7).
+export const nonprodObservability = createNonprodObservability(eks.cluster.eksCluster.name, tags, { dependsOn: [eks.cluster] });
 
 const cfg = new pulumi.Config();
 

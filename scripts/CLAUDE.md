@@ -3,5 +3,6 @@
 - bootstrap-cluster.sh: One-time EKS namespace setup (Pulumi is primary)
 - seed-secrets.sh: Initial AWS Secrets Manager seeding
 - migrate-prod-to-argocd.sh: Phase 6 production migration (NOT READY)
-- nebula-allow-login.sh / nebula-set-observer-key.sh / nebula-set-atlas-keys.sh / create-nebula-secret.sh: Nebula sign-in allowlist, Observer key, Atlas API keys (Digest-verified before storing; capacity §N5), nebula SM blob (run with `!`; SM writes)
+- nebula-allow-login.sh / nebula-set-observer-key.sh / nebula-set-atlas-keys.sh / nebula-set-sentinel-key.sh / create-nebula-secret.sh: Nebula sign-in allowlist, Observer key, Atlas API keys (Digest-verified before storing; capacity §N5), staging sentinel READ key for the MCP endpoint (§N7), nebula SM blob (run with `!`; SM writes)
 - staging-sentinel-bootstrap.sh: release-train staging tier one-time setup (SM `staging/twizz-sentinel` + `staging/twizz-admin`, ns `sentinel` on EKS-Moly-staging, admin k8s Secret mirror); `--rotate` mints new keys
+- nebula-mcp-iam.sh (group nebula-mcp-users: self-service only + deny-all; `user <name>` = IAM user /nebula-mcp/<name> + one-time password) / nebula-mcp-bind.sh (NEBULA_MCP_IDENTITIES: login → google + aws) / nebula-fill-secrets.sh (staging sentinel key, staging API URL, Vercel): the Nebula MCP identity gate, docs/NEBULA.md §N7.1

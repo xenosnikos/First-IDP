@@ -769,3 +769,87 @@ Refreshes every 60 s (paused in background tabs); windows 15m / 1h / 6h / 24h.
   database = Atlas measurements on each cluster's primary (prod key / NonProd key for staging).
 - **Freshness / cost**: CloudWatch 1-min data lags ~1–2 min. One snapshot per (tier, window) is
   cached 30 s and shared by all viewers; a prod snapshot is ~50 GetMetricData metrics (≈ $0.0005).
+
+## N7 — Nebula over MCP: the `twizz-nebula` plugin (2026-11-05)
+
+Teammates drive Nebula from Claude Code. The MCP server is **Nebula itself**,
+not a laptop process: `POST https://nebula.prv.twizz.com/api/mcp` (Streamable
+HTTP, stateless, JSON responses). The client is the `twizz-nebula` plugin in its own
+repo, **TwizzyNicky/nebula-mcp** (to move to twizz-app): plugin, marketplace,
+`/nebula:setup`, onboarding and the security model (docs/AUTH.md there).
+
+### N7.1 Auth: three credentials, all the user's own (2026-11-05)
+
+Every request carries three proofs minted by the plugin's `headersHelper` from
+credentials the person set up themselves; `server/mcp/auth.ts` + `identity.ts`
+verify ALL of them and require them to match the person's binding:
+
+| Header | Proof | Verified as |
+|---|---|---|
+| `Authorization: Bearer` | GitHub token (`gh auth token`) | `GET /user` → login; the browser sign-in rule (`lib/github-access.ts`) |
+| `x-nebula-google-token` | Google ID token (`gcloud auth print-identity-token`) | tokeninfo: issuer, gcloud audience, exp, `email_verified`, `@twizz.com` |
+| `x-nebula-aws-sts` | presigned `sts:GetCallerIdentity`, SigV4, ≤ 15 min, **signs `x-nebula-audience`** | shape-checked, then executed against STS with the audience header → ARN under `arn:aws:iam::848281935985:user/nebula-mcp/` |
+
+`NEBULA_MCP_IDENTITIES` (SM `preview/nebula`, `scripts/nebula-mcp-bind.sh`) =
+`{"<login>": {"google", "aws"}}` IS the MCP list: no binding, no MCP, operators included.
+The AWS users (`scripts/nebula-mcp-iam.sh`: path `/nebula-mcp/`, group `nebula-mcp-users`)
+hold no permissions. GetCallerIdentity needs none, and the group allows only self-service
+(password, MFA, own access keys with MFA) and explicitly denies everything else
+(policy-simulated, including an accidentally attached admin policy). Caches: GitHub 5 min;
+verified Google/AWS proofs until the Google token expires (≤ 1 h); SHA-256 keys, nothing stored.
+
+**Traceability.** The session carries `google` + `aws` alongside the login. `mcp.signin`
+rows record all three (or the refusal reason). Every tool call, reads included, writes
+`mcp.tool.<name>` with the three identities, sanitized args (names and hashes only), ms
+and outcome. Writes also get the gate's `nebula.<tool>` rows.
+
+The token is the session's `accessToken`, so GitHub reads run as that person like the UI
+(`withGithub()`); writes still use the platform token. Network: VPN-only (prv zone), with its
+own Ingress (`dashboard-mcp`, path `/api/mcp` Exact, gitops `apps/nebula/dashboard.yaml`) that
+skips the browser SSO gate. The Google ID token check above is the SSO proof for MCP.
+
+**One code path.** Each tool (`server/mcp/tools.ts`) is a tRPC procedure called
+through `appRouter.createCaller({ session, prisma })`: protected / operator /
+owner-or-operator checks, the `@twizz-idp/actions` gate (policy → nonce →
+AuditLog) and every server-side validation are the UI's. The gate's two-step
+confirm is phrased for the agent: show the summary, get a yes, re-call with
+`confirm=<nonce>`.
+
+**Scope (pinned by `server/mcp/__tests__/tools.test.ts`).**
+
+| | Tools |
+|---|---|
+| Reads | `nebula_whoami`, `list_envs`, `list_projects`, `list_repos`, `list_branches`, `branch_head`, `repo_config`, `release_train`, `release_images`, `cluster_overview` (all three clusters), `list_ci_runs`, `ci_run`, `ci_job_logs` |
+| Logs (Observer tools, explicit scope) | `list_pods`, `log_histogram`, `fetch_logs`, `get_group_samples`, `node_metrics`: cluster ∈ {EKS-Twizz-NonProd, EKS-Moly-staging, **EKS-Moly-Prod**}, any namespace, window ≤ 24 h — prod is READ-ONLY |
+| Monitor | `monitor {tier: production \| staging}` (§N6 snapshot) |
+| twizz-sentinel (read key) | `sentinel_status`, `sentinel_alerts`, `sentinel_alert`, `sentinel_alert_stats`, `sentinel_events`, each `tier: staging (default) \| production` |
+| Writes, self-service | `create_env_from_repo` (secret VALUES never accepted: declared secrets are created blank, filled in the UI) |
+| Writes, owner or operator | `rebuild_env`, `set_env_vars` (credential-shaped values refused), `extend_env`, `teardown_env` |
+| Writes, operators | `create_named_env`, `clone_staging_db`, `promote_release` / `merge_promotion` (target fixed to `staging`) |
+| Capacity reads (everyone bound) | `capacity_presets`, `capacity_tier`, `capacity_plan` (named template → live ops + `planHash`), `prod_atlas_plan` |
+| Capacity writes (operator **and** binding scope) | `apply_live_capacity` (`capacity:production` / `capacity:staging`; NAMED templates only: prod `baseline`/`campaign`/`max`, #6 floor + ×3/×0.5 + caps, nonce binds `planHash`), `set_prod_atlas_tier` (`capacity:production`; allowlisted clusters, +2/−1, M10–M200, nonce binds `from`) |
+
+**Production:** reads for every bound person; the only prod writes are capacity, for an operator
+whose binding carries `capacity:production` (`scripts/nebula-mcp-bind.sh … capacity:production`).
+Tools a person may not use are not even listed (`toolsFor`), and each handler re-checks. Custom
+sizes, `setAtlasTier` (NonProd) and capacity PRs stay UI-only.
+
+**Sentinel.** `server/mcp/sentinel.ts`: GET-only, path allowlist, READ key only,
+`x-actor: nebula-mcp:<login>`. Staging: `SENTINEL_STAGING_API_KEY` (copied from SM
+`staging/twizz-sentinel` by `scripts/nebula-set-sentinel-key.sh`), base
+`NEBULA_SENTINEL_STAGING_URL` (default `https://sentinel-stg.prv.twizz.com`, proxied by
+Nebula's own `staging-edge-sentinel` Ingress). Production: `NEBULA_SENTINEL_PROD_URL` +
+`SENTINEL_PROD_API_KEY` (`--prod`); unset → the tools answer "not reachable".
+**State 2026-11-05:** prod sentinel is NOT installed — `values-prod.yaml` (gitops #5) and
+`deploy/prod/bootstrap-prod.sh` exist, but no IAM role `twizz-prod-sentinel`, no SM
+`prod/twizz-sentinel`, no pods on EKS-Moly-Prod; and values-prod has no ingress, so even
+once installed Nebula needs an endpoint (e.g. an internal ingress on prod's ingress-nginx
+behind the VPN, proxied like `staging-edge-sentinel`).
+
+**Rollout.** (1) merge + build the dashboard image; (2) twizz-gitops: the
+`dashboard-mcp` Ingress + image bump; (3) `AWS_PROFILE=twizz bash
+scripts/nebula-set-sentinel-key.sh`, resync `nebula-env`, restart the dashboard;
+(4) per person: `nebula-mcp-iam.sh user <name>` → they follow nebula-mcp ONBOARDING.md →
+`nebula-mcp-bind.sh`; install: `/plugin marketplace add TwizzyNicky/nebula-mcp`,
+`/plugin install twizz-nebula@nebula-mcp`. Missing config was filled 2026-11-05 by
+`scripts/nebula-fill-secrets.sh` (staging sentinel key, staging API URL, Vercel).

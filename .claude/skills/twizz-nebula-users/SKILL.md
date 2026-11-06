@@ -46,10 +46,20 @@ Projects, Clusters, Observer, Configurator) need only gate 3.
 `AWS_PROFILE=twizz bash scripts/nebula-allow-login.sh <github-login> --operator`, then the
 resync + restart above. Keep the list short; every write is audited under their login.
 
+## MCP access (twizz-nebula plugin, docs/NEBULA.md §N7)
+
+Invitation-only, on top of sign-in, and a HARD three-identity gate (GitHub + Google @twizz.com
++ AWS IAM user under /nebula-mcp/ with no permissions). Invite: `nebula-mcp-iam.sh user <name>`
+(one-time console password, sent privately) → they follow TwizzyNicky/nebula-mcp ONBOARDING.md
+(MFA, mint their own key, `/nebula:setup`) → `nebula-mcp-bind.sh <login> <email> <name>`, then
+resync + restart. Revoke: `nebula-mcp-bind.sh <login> --remove` (and deactivate their key).
+MCP users can read prod logs/monitor: grant deliberately. Denials are `mcp.signin` rows with the
+reason; every tool call is an `mcp.tool.*` row with all three identities.
+
 ## Remove / offboard
 
-- Gate 3: edit `ALLOWED_GITHUB_LOGINS` / `NEBULA_OPERATORS` in SM `preview/nebula` (same
-  merge pattern as the script, removing the login), resync, restart.
+- Gate 3: edit `ALLOWED_GITHUB_LOGINS` / `NEBULA_OPERATORS` / `NEBULA_MCP_IDENTITIES` in SM
+  `preview/nebula` (same merge pattern as the script, removing the login), resync, restart.
 - Gate 1: NetBird → Team → Users → delete. Gate 2: suspend in Google Workspace.
 
 ## Notes

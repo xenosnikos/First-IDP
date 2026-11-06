@@ -16,15 +16,17 @@ export type Gate = (
   action: () => Promise<unknown>,
 ) => Promise<GateResult>;
 
-export type GateDeps = { policy: Policy; nonces: NonceStore; audit: AuditFn; actionPrefix?: string };
+/** `actor` binds nonces to the person they were issued to: another person echoing it is refused. */
+export type GateDeps = { policy: Policy; nonces: NonceStore; audit: AuditFn; actionPrefix?: string; actor?: string };
 
 /** The four gates, in order: policy → confirm nonce → action → audit row
  * (success, failure, and denial alike). `fields` are the policy-relevant
  * arguments; they are what the nonce is bound to, so anything that changes the
  * effect of the action must be in them. */
-export function createGate({ policy, nonces, audit, actionPrefix = "mcp." }: GateDeps): Gate {
+export function createGate({ policy, nonces, audit, actionPrefix = "mcp.", actor }: GateDeps): Gate {
   return async (tool, fields, confirm, summary, action) => {
     const actionName = `${actionPrefix}${tool}`;
+    const nonceKey = actor ? `${tool}\u0000${actor.toLowerCase()}` : tool;
     const resource = JSON.stringify(fields);
 
     const decision = evaluatePolicy(policy, tool, fields);
@@ -34,7 +36,7 @@ export function createGate({ policy, nonces, audit, actionPrefix = "mcp." }: Gat
     }
 
     if (!confirm) {
-      const nonce = await nonces.issue(tool, fields);
+      const nonce = await nonces.issue(nonceKey, fields);
       return {
         confirmationRequired: true,
         summary,
@@ -43,7 +45,7 @@ export function createGate({ policy, nonces, audit, actionPrefix = "mcp." }: Gat
       };
     }
 
-    const consumed = await nonces.consume(confirm, tool, fields);
+    const consumed = await nonces.consume(confirm, nonceKey, fields);
     if (!consumed.ok) {
       await audit({ action: actionName, resource, allowed: false, detail: { reason: consumed.reason } });
       return { denied: true, reason: consumed.reason };

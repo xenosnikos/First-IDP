@@ -571,6 +571,9 @@ export const actionsRouter = router({
       let attachTo: string | undefined;
       let attachUrl: string | undefined;
       if (attach && "env" in attach) {
+        // attaching adds this preview's origin to the backend env's CORS list: a
+        // change to THAT env, so it needs that env's owner or an operator (Codex review)
+        await ownedEnv(ctx, "create_env_from_repo.attach", attach.env);
         attachTo = attach.env;
         attachUrl = `https://${envHost(attach.env)}`;
       } else if (attach) {
@@ -604,6 +607,10 @@ export const actionsRouter = router({
         attach: attachTo ?? attachUrl ?? "",
         files: files.map((f) => f.path).sort().join(" "),
         filesHash: hashFiles(files),
+        // the exact config bytes and the second PR target shape the effect too:
+        // bind them, so nothing can change between review and confirm (Codex review)
+        configHash: hashFiles([{ path: CONFIG_FILE, content: twizzYaml }]),
+        defaultBranch: prTarget === "chosen+default" ? (defaultBranch ?? "") : "",
         secretNames: secretNames.join(" "),
         envHash: hashVars(envOverrides),
         prTarget: files.length ? prTarget : "none",

@@ -271,3 +271,30 @@ describe("owner-or-operator", () => {
     expect(JSON.parse(audit.at(-1)!.resource!)).toMatchObject({ name: "sentinel-feat-x", varNames: "ANTHROPIC_API_KEY LOG_LEVEL" });
   });
 });
+
+describe("createEnvFromRepo hardening (Codex review 2026-11-05)", () => {
+  const backend = (owner: string) => `name: api-alice\nservice: moly-backend\nowner: ${owner}\nimageTag: build-75b95f51-a1de-432d-8132-33a2802f622c\nexpiresAt: "2099-01-01T00:00:00Z"\ndb:\n  mode: isolated\n  generation: 1\n`;
+  const frontendYaml = ["version: 2", "kind: frontend", "port: 80", "healthPath: /", "build:", "  args:", '    VITE_BACKEND_URL: "${NEBULA_API_URL}"', "frontend:", "  framework: vite", "  apiEnvVar: VITE_BACKEND_URL", "  serve: static", ""].join("\n");
+  const fe = { ...base, name: "fe-feat-x", repo: "twizz-app/twizz-sentinel", files: [], twizzYaml: frontendYaml, db: "none" as const, prTarget: "chosen" as const, attach: { env: "api-alice" } };
+
+  it("attaching to someone else's backend env is refused for a non-operator (and audited)", async () => {
+    gitops.files.set("named-envs/api-alice.yaml", backend("alice"));
+    await expect(callerFor("rohitagrohia").createEnvFromRepo(fe)).rejects.toMatchObject({ code: "FORBIDDEN" });
+    expect(prismaRows).toContainEqual(expect.objectContaining({ actor: "rohitagrohia", allowed: false }));
+  });
+
+  it("the backend's owner may attach to it", async () => {
+    gitops.files.set("named-envs/api-alice.yaml", backend("alice"));
+    await expect(callerFor("alice").createEnvFromRepo(fe)).resolves.toMatchObject({ confirmationRequired: true });
+  });
+
+  it("a confirm with a different twizz.yaml (no files committed) is refused", async () => {
+    const caller = callerFor("rohitagrohia");
+    const noFiles = { ...base, files: [], prTarget: "chosen" as const };
+    const r = (await caller.createEnvFromRepo(noFiles)) as { confirm: string };
+    const changed = noFiles.twizzYaml.replace("port: 8090", "port: 9999");
+    const out = await caller.createEnvFromRepo({ ...noFiles, twizzYaml: changed, confirm: r.confirm, secretValues: { ANTHROPIC_API_KEY: "" } });
+    expect(out).toMatchObject({ denied: true });
+    expect(dispatched).toHaveLength(0);
+  });
+});
