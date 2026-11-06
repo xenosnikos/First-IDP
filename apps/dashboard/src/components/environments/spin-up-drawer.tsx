@@ -7,7 +7,7 @@ import { Pill } from "@/components/nebula/pill";
 import { Button } from "@/components/nebula/button";
 import { Field, inputStyle, Row } from "@/components/nebula/plate";
 import { GateDialog } from "@/components/nebula/gate-dialog";
-import { useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
+import { mayHaveWritten, useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
 import { ISOLATION_CAVEAT } from "./preview-card";
 
 // Spin-up wizard (docs/NEBULA.md §4.7): service → release image → DB mode →
@@ -81,7 +81,7 @@ export function SpinUpDrawer({ open, onClose, onCreated }: { open: boolean; onCl
           title="Create named env"
           phase={gated.phase}
           onConfirm={gated.confirm}
-          onClose={gated.phase.kind === "done" ? finish : () => gated.reset()}
+          onClose={mayHaveWritten(gated.phase) ? finish : () => gated.reset()}
           renderResult={(r) => (
             <div style={{ marginBottom: 14 }}>
               <Row label="url">

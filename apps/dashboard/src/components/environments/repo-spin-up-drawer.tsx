@@ -7,7 +7,7 @@ import { Pill } from "@/components/nebula/pill";
 import { Button } from "@/components/nebula/button";
 import { Field, inputStyle, Row } from "@/components/nebula/plate";
 import { GateDialog } from "@/components/nebula/gate-dialog";
-import { useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
+import { mayHaveWritten, useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
 import { buildArgPreview, problemsFor, proposalToFiles, slugEnvName, TTL } from "@/lib/nebula/repo-spin-up";
 import { BranchPicker, RepoPicker, type RepoPick } from "./repo-spin-up/pickers";
 import { ConfigSection, type ConfigState } from "./repo-spin-up/config-section";
@@ -160,7 +160,7 @@ export function RepoSpinUpDrawer({ open, onClose, onCreated, preselect }: { open
           title="Create preview env"
           phase={gated.phase}
           onConfirm={gated.confirm}
-          onClose={gated.phase.kind === "done" ? finish : () => gated.reset()}
+          onClose={mayHaveWritten(gated.phase) ? finish : () => gated.reset()}
           renderResult={(r) => (
             <div style={{ marginBottom: 14 }}>
               <Row label="url"><a href={r.url} target="_blank" rel="noreferrer" style={{ color: "var(--n-ion-soft)" }}>{r.url} ↗</a></Row>
