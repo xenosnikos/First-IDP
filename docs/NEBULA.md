@@ -861,6 +861,9 @@ from gitops:
    - the blob at `M`'s first parent differs (this merge introduced it).
 
    Commit-list membership is not accepted, so a stacked PR can't launder a direct push;
+   A later push that restores bytes identical to an approved version passes, by design: the
+   bytes are reviewed content. Rebase merges of several commits may be refused (fail safe;
+   this repo squash-merges);
 4. read the files **at `H`** and size from exactly those bytes. Their blob SHAs are bound into the
    nonce, so a change between review and confirm is refused.
 
