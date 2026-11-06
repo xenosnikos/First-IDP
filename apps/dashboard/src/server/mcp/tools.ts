@@ -95,17 +95,21 @@ export const MCP_READ_TOOLS = [
   "traffic_peaks",
   "traffic_window",
   "capacity_cases",
+  "capacity_verify",
+  "event_watch",
 ] as const;
 
 /** Any bound person (Nebula then applies owner-or-operator per env). */
 export const MCP_SELF_SERVICE_WRITES = ["create_env_from_repo", "rebuild_env", "set_env_vars", "extend_env", "teardown_env"] as const;
 /** Nebula operators only. */
 export const MCP_OPERATOR_WRITES = ["create_named_env", "clone_staging_db", "promote_release", "merge_promotion"] as const;
+/** Operator-only READS (other people's audited activity). */
+export const MCP_OPERATOR_READS = ["recent_changes"] as const;
 /** Operators whose binding carries the matching capacity scope. */
 export const MCP_CAPACITY_WRITES = ["apply_live_capacity", "set_prod_atlas_tier"] as const;
 
 export const MCP_WRITE_TOOLS = [...MCP_SELF_SERVICE_WRITES, ...MCP_OPERATOR_WRITES, ...MCP_CAPACITY_WRITES] as const;
-export const MCP_TOOL_NAMES = [...MCP_READ_TOOLS, ...MCP_WRITE_TOOLS] as const;
+export const MCP_TOOL_NAMES = [...MCP_READ_TOOLS, ...MCP_OPERATOR_READS, ...MCP_WRITE_TOOLS] as const;
 export type McpToolName = (typeof MCP_TOOL_NAMES)[number];
 
 /** Live tiers a person may resize through MCP: operator AND capacity:<tier>. */
@@ -117,7 +121,7 @@ export function liveTiersFor(who: { operator: boolean; scopes: readonly string[]
 /** The tools this person gets — anything else is not even listed. */
 export function toolsFor(who: { operator: boolean; scopes: readonly string[] }): McpToolName[] {
   const out: McpToolName[] = [...MCP_READ_TOOLS, ...MCP_SELF_SERVICE_WRITES];
-  if (who.operator) out.push(...MCP_OPERATOR_WRITES);
+  if (who.operator) out.push(...MCP_OPERATOR_READS, ...MCP_OPERATOR_WRITES);
   if (liveTiersFor(who).length) out.push("apply_live_capacity");
   if (who.operator && who.scopes.includes("capacity:production")) out.push("set_prod_atlas_tier");
   return out;
@@ -433,6 +437,37 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
     async (a) => json(await c.capacity.cases(a.tier ? { tier: a.tier } : undefined)),
   );
 
+  reg(
+    "capacity_verify",
+    "Rollout validation after apply_live_capacity: is the live cluster at the target of a template (preset) or estimate (estimateRps) — spec, ready pods, joined nodes — READY / PROGRESSING / MISMATCH, plus how what runs holds at the load of the last 10 minutes. Re-run until READY before the event starts. Read-only.",
+    { tier: liveTier, preset: presetName.optional(), estimateRps: estimateShape.rps.optional(), peakFactor: estimateShape.peakFactor, headroom: estimateShape.headroom },
+    RO,
+    async (a) => {
+      if ((a.preset === undefined) === (a.estimateRps === undefined)) throw new TRPCError({ code: "BAD_REQUEST", message: "give exactly one of preset or estimateRps (what you applied)" });
+      const by = a.estimateRps !== undefined ? { estimate: { rps: a.estimateRps, peakFactor: a.peakFactor ?? 1, headroom: a.headroom ?? 1.2 } } : { preset: a.preset };
+      return json(await c.capacity.verify({ tier: a.tier, ...by }));
+    },
+  );
+
+  reg(
+    "event_watch",
+    "Live watch during an event or an incident: the last 5–60 minutes (req/s, p95, 5xx, pods/CPU, nodes), the monitor's signals, and OK / WATCH / ACT with the reasons and — when capacity is short — the smallest template that holds the current peak + 30%. Call it every few minutes during a marketing push. Read-only; acting is apply_live_capacity.",
+    { tier: liveTier, minutes: z.number().int().min(5).max(60).optional() },
+    RO,
+    async (a) => {
+      const r = (await c.capacity.watch({ tier: a.tier, minutes: a.minutes ?? 15 })) as Record<string, unknown>;
+      return json({ ...r, minutes: undefined, lastMinutes: Array.isArray(r.minutes) ? (r.minutes as unknown[]).slice(-10) : [] });
+    },
+  );
+
+  reg(
+    "recent_changes",
+    "OPERATORS: what changed in a window (≤7 days): Nebula's audited writes (capacity applies, promotions, env changes, with who and the summary) and image pushes of the prod services (prod deploys happen outside Nebula: CodeBuild → ECR → rollout). The first question of any outage. Read-only.",
+    { from: z.string().datetime(), to: z.string().datetime().optional() },
+    RO,
+    async (a) => json(await c.capacity.recentChanges({ from: a.from, ...(a.to ? { to: a.to } : {}) })),
+  );
+
   const needScope = (scope: McpScope) => {
     if (!d.operator || !d.scopes.includes(scope)) throw new TRPCError({ code: "FORBIDDEN", message: `needs a Nebula operator with the ${scope} MCP scope` });
   };
@@ -598,6 +633,36 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
     }),
   );
 
+  server.registerPrompt(
+    "prepare_marketing_event",
+    {
+      title: "Prepare for a marketing event",
+      description: "End to end: size from past cases and the expected peak, apply ahead, validate the rollout, watch during, step back after.",
+      argsSchema: {
+        tier: z.enum(["production", "staging"]).optional(),
+        event: z.string().max(200).optional().describe("what it is"),
+        when: z.string().max(80).optional().describe("start time, e.g. 'Friday 20:00 EET'"),
+        expectedPeakRps: z.string().max(12).optional(),
+        durationMinutes: z.string().max(6).optional(),
+      },
+    },
+    (a) => ({ messages: [{ role: "user", content: { type: "text", text: PREPARE_EVENT_PROMPT({ tier: a.tier ?? "production", event: a.event, when: a.when, peak: a.expectedPeakRps, duration: a.durationMinutes }) } }] }),
+  );
+
+  server.registerPrompt(
+    "diagnose_outage",
+    {
+      title: "Diagnose an infra outage or slowdown",
+      description: "Grounded triage: what the users saw, what changed, where it saturated or failed, and the remediation options Nebula can apply (each behind a confirm).",
+      argsSchema: {
+        tier: z.enum(["production", "staging"]).optional(),
+        symptom: z.string().max(300).optional().describe("what was reported"),
+        since: z.string().max(80).optional().describe("when it started (ISO or words)"),
+      },
+    },
+    (a) => ({ messages: [{ role: "user", content: { type: "text", text: DIAGNOSE_PROMPT({ tier: a.tier ?? "production", symptom: a.symptom, since: a.since }) } }] }),
+  );
+
   reg(
     "promote_release",
     "OPERATORS, gate 1 of 2: open a twizz-gitops PR moving a service on STAGING to an immutable image tag (from release_train candidates). Nothing deploys until merge_promotion. There is no production target.",
@@ -628,5 +693,43 @@ export function PLAN_CAPACITY_PROMPT(a: { tier: string; peak?: string; when?: st
     "6. Plan the step back down to baseline after the event (a second plan + confirm), and note whether this event should become a new case in capacity/cases.yaml.",
     "",
     "Never invent numbers: every figure comes from a tool result. If the profile is uncalibrated for this tier, stop and say so.",
+  ].join("\n");
+}
+
+export function PREPARE_EVENT_PROMPT(a: { tier: string; event?: string; when?: string; peak?: string; duration?: string }): string {
+  return [
+    `Prepare ${a.tier} for ${a.event ? `"${a.event}"` : "a marketing event"}${a.when ? ` at ${a.when}` : ""}${a.peak ? `, expected peak ≈ ${a.peak} req/s` : ""}${a.duration ? ` for ~${a.duration} min` : ""}. Ground every step in tool results; show me the numbers.`,
+    "",
+    "BEFORE (aim to finish ≥ 30 minutes ahead — node groups take minutes to add nodes, and a ramp can be 2 minutes):",
+    "1. capacity_cases + traffic_peaks (days 14): the closest past event, its ramp and peak, what saturated.",
+    `2. capacity_estimate {tier: "${a.tier}", rps: <expected peak>, headroom: 1.2}: compare what runs now, the estimate and each template at that load.`,
+    "3. Recommend the smallest named template that is OK at the design load (else the estimate). Plan it (capacity_plan or the estimate's plan), show ops and warnings.",
+    "4. Only with my explicit yes: apply_live_capacity (show the confirmation summary verbatim, wait for my yes).",
+    "5. capacity_verify until READY (all pods ready, all nodes joined). If PROGRESSING for > 10 min or MISMATCH, stop and diagnose (recent_changes, cluster_overview, list_pods).",
+    "",
+    "DURING:",
+    "6. event_watch {minutes: 15} every few minutes. If WATCH: tell me why and what the next step would be. If ACT: propose the recommended template (plan first), apply only with my yes, then capacity_verify.",
+    "",
+    "AFTER:",
+    "7. When req/s is back near baseline for 15+ minutes, plan the step back down (estimates step down at most half per apply; the named baseline template may drop in one).",
+    "8. traffic_window over the event: summarise peak, ramp, p95, saturation, and draft a new entry for capacity/cases.yaml (I'll PR it).",
+  ].join("\n");
+}
+
+export function DIAGNOSE_PROMPT(a: { tier: string; symptom?: string; since?: string }): string {
+  return [
+    `Diagnose ${a.tier}${a.symptom ? `: "${a.symptom}"` : " (reported slowdown or outage)"}${a.since ? `, since ${a.since}` : ""}. Evidence first, hypotheses second, actions last; every claim cites a tool result with timestamps.`,
+    "",
+    "1. Scope it — event_watch {minutes: 60}: req/s, p95, 5xx, pods, nodes, signals. If the window is older, traffic_peaks + traffic_window around it.",
+    "2. What changed — recent_changes from 2 h before the start: Nebula writes (capacity, promotions) and prod image pushes (deploys happen outside Nebula).",
+    "3. Saturation or failure? Pods near one core (~900m+) or nodes ≥ 90% with low 5xx = capacity. High 5xx/restarts with normal CPU = a bad deploy, a dependency or data. Check monitor (Atlas/DB), cluster_overview + list_pods (restarts, CrashLoopBackOff).",
+    "4. Errors — log_histogram to find the burst, fetch_logs {errorsOnly} on the affected namespace, get_group_samples for the top group. Security/fraud angle: sentinel_alerts.",
+    "5. Conclude: the most likely cause with the evidence for and against, and what would confirm it.",
+    "6. Remediation through Nebula, each a plan → my explicit yes → confirm → capacity_verify / event_watch:",
+    "   - capacity short → apply_live_capacity (template or estimate); DB short → prod_atlas_plan → set_prod_atlas_tier;",
+    "   - bad release on staging → promote_release of the previous good tag (release_train shows it);",
+    "   - NonProd env broken → rebuild_env / set_env_vars / teardown_env.",
+    "   Prod restarts, image rollbacks and anything outside these tools are NOT Nebula actions: say exactly what the on-call engineer should run and why.",
+    "7. Afterwards: a short incident note (timeline, cause, fix, follow-ups) and, for capacity events, a capacity/cases.yaml entry.",
   ].join("\n");
 }

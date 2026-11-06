@@ -221,3 +221,90 @@ export function caseSizing(c: CapacityCase): LiveTierSize {
     nodegroups: Object.fromEntries(Object.entries(c.ran.nodegroups).map(([k, v]) => [k, { min: v.desired, desired: v.desired, max: v.desired }])),
   };
 }
+
+// ── rollout validation: is the cluster where the plan said it would be? ──
+
+export type RolloutCheck = {
+  verdict: "READY" | "PROGRESSING" | "MISMATCH";
+  workloads: Array<{ name: string; want: number; spec: number | null; ready: number | null; ok: boolean; note?: string }>;
+  nodegroups: Array<{ name: string; want: { min: number; desired: number; max: number }; spec: { min: number; desired: number; max: number } | null; nodes: number; ok: boolean; note?: string }>;
+};
+
+/** Compare the live state with a target size. MISMATCH = the spec isn't what was planned
+ * (the apply stopped, or something else changed it); PROGRESSING = spec right, pods or
+ * nodes still coming; READY = spec right and everything ready. */
+export function verifyLive(state: { workloads: Array<{ name: string; replicas: number; ready: number; rollout?: { observed: boolean; updated: number; available: number; total?: number; unavailable?: number } }>; nodegroups: Array<{ name: string; min: number; desired: number; max: number }>; nodes: Array<{ nodegroup?: string; ready?: boolean; schedulable?: boolean }> }, size: LiveTierSize): RolloutCheck {
+  let mismatch = false;
+  let progressing = false;
+  const workloads = Object.entries(size.workloads ?? {}).map(([name, want]) => {
+    const w = state.workloads.find((x) => x.name === name);
+    if (!w) {
+      mismatch = true;
+      return { name, want: want.replicas, spec: null, ready: null, ok: false, note: "not found on the cluster" };
+    }
+    if (w.replicas !== want.replicas) {
+      mismatch = true;
+      return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: `spec is ${w.replicas}, plan said ${want.replicas}` };
+    }
+    // done = the controller observed this spec AND every replica is updated and available (not just "ready")
+    const ro = w.rollout;
+    if (ro && !ro.observed) {
+      progressing = true;
+      return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: "the deployment controller hasn't observed the new spec yet" };
+    }
+    // `kubectl rollout status` semantics: every desired replica updated, no old replicas left
+    // (total == desired), all available, none unavailable — old pods can't mask new ones
+    if (ro) {
+      const notUpdated = w.replicas - ro.updated;
+      const oldLeft = (ro.total ?? w.replicas) - w.replicas;
+      const notAvailable = Math.max(w.replicas - ro.available, ro.unavailable ?? 0);
+      if (notUpdated > 0 || oldLeft > 0 || notAvailable > 0) {
+        progressing = true;
+        const bits = [notUpdated > 0 ? `${notUpdated} pod(s) not updated` : "", oldLeft > 0 ? `${oldLeft} old pod(s) still running` : "", notAvailable > 0 ? `${notAvailable} pod(s) not available` : ""].filter(Boolean);
+        return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: bits.join(", ") };
+      }
+    } else if (w.ready < w.replicas) {
+      progressing = true;
+      return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: `${w.replicas - w.ready} pod(s) not ready yet` };
+    }
+    return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: true };
+  });
+  const nodegroups = Object.entries(size.nodegroups ?? {}).map(([name, want]) => {
+    const g = state.nodegroups.find((x) => x.name === name);
+    // only Ready, schedulable nodes count (a NotReady or cordoned node adds no capacity)
+    const nodes = state.nodes.filter((n) => n.nodegroup === name && n.ready !== false && n.schedulable !== false).length;
+    if (!g) {
+      mismatch = true;
+      return { name, want, spec: null, nodes, ok: false, note: "node group not found" };
+    }
+    const spec = { min: g.min, desired: g.desired, max: g.max };
+    if (g.min !== want.min || g.desired !== want.desired || g.max !== want.max) {
+      mismatch = true;
+      return { name, want, spec, nodes, ok: false, note: `spec ${g.min}/${g.desired}/${g.max}, plan said ${want.min}/${want.desired}/${want.max}` };
+    }
+    if (nodes < want.desired) {
+      progressing = true;
+      return { name, want, spec, nodes, ok: false, note: `${want.desired - nodes} node(s) not Ready+schedulable yet (EC2 + bootstrap take a few minutes)` };
+    }
+    return { name, want, spec, nodes, ok: true };
+  });
+  return { verdict: mismatch ? "MISMATCH" : progressing ? "PROGRESSING" : "READY", workloads, nodegroups };
+}
+
+/** True when `a` is at least `b` everywhere `b` names (replicas, node-group desired). */
+export function atLeastAsLarge(a: LiveTierSize, b: LiveTierSize): boolean {
+  for (const [n, w] of Object.entries(b.workloads ?? {})) if ((a.workloads?.[n]?.replicas ?? Infinity) < w.replicas) return false;
+  for (const [n, g] of Object.entries(b.nodegroups ?? {})) if ((a.nodegroups?.[n]?.desired ?? Infinity) < g.desired) return false;
+  return true;
+}
+
+/** The smallest named template that is OK at `rps` (by assessLive), else null. With
+ * `atLeast` (what runs now), never one that is smaller anywhere: no downsizing mid-incident. */
+export function recommendTemplate(profile: LiveProfile, templates: Array<{ name: string; size: LiveTierSize }>, rps: number, atLeast?: LiveTierSize): { name: string; size: LiveTierSize; assessment: LiveAssessment } | null {
+  const scored = templates
+    .filter((t) => !atLeast || atLeastAsLarge(t.size, atLeast))
+    .map((t) => ({ ...t, assessment: assessLive(profile, t.size, rps), weight: Object.values(t.size.workloads ?? {}).reduce((a, w) => a + w.replicas, 0) }))
+    .filter((t) => t.assessment.verdict === "OK")
+    .sort((a, b) => a.weight - b.weight);
+  return scored[0] ? { name: scored[0].name, size: scored[0].size, assessment: scored[0].assessment } : null;
+}

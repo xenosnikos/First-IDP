@@ -803,6 +803,74 @@ sized at `targetMcpu` 600m (≈37 req/s per pod); node groups: `allocatableCpu`,
 4. plan the step back to baseline;
 5. record the new case.
 
+### N5.5 — Events and incidents: set, validate, watch, diagnose, rectify (2026-11-06)
+
+**Before an event** (MCP prompt `prepare_marketing_event`):
+1. Read `capacity_cases` and `traffic_peaks`.
+2. Get `capacity_estimate`, then apply ahead with `apply_live_capacity` (named template or estimate).
+3. Run **`capacity_verify`** until READY. It reports MISMATCH when the spec isn't what was planned,
+   PROGRESSING while pods or nodes are coming, and READY otherwise (`verifyLive` in actions/traffic.ts).
+
+**During**, **`event_watch`** returns the last N minutes plus the monitor's signals, labelled with
+their 15-minute window. The verdict is the pure `watchVerdict` (`server/nebula/watch-model.ts`):
+- **ACT:** what runs is SATURATED at the current peak, pods ≥ 900m, a node ≥ 90%, p95 > 1 s,
+  5xx ≥ 2%, or a monitor signal HOT.
+- **WATCH:** no 30% margin, p95 > 500 ms, 5xx ≥ 0.5%, nodes ≥ 70% average, a monitor WATCH, or
+  any data gap (named).
+- **UNKNOWN:** no edge data or no capacity model.
+- **OK:** otherwise.
+
+It recommends scaling **only on capacity evidence**: the smallest named template that holds
+peak × 1.3 and is **at least as large as what runs**, never a downsize mid-incident. Without
+capacity evidence it says "diagnose before scaling".
+
+`capacity_verify` counts only Ready, schedulable nodes. A deployment is done only when its
+controller observed the spec and every replica is updated and available.
+
+**After**, step back down, then record the event in `capacity/cases.yaml`.
+
+**Incidents** (MCP prompt `diagnose_outage`):
+1. `event_watch` (60 min).
+2. **`recent_changes`** (operators: it shows who did what): Nebula's audited writes (truncation
+   reported) plus ECR pushes of the prod services (per-repo errors reported, listings cached
+   5 min). Prod Moly deploys run outside Nebula, so an image push is the deploy signal.
+3. Saturation or failure? Use pods/nodes CPU vs 5xx/restarts, the monitor (Atlas), `cluster_overview`.
+4. Errors: `log_histogram` → `fetch_logs` → `get_group_samples`; sentinel.
+5. Conclusion with evidence for and against.
+
+**Rectify.** Nebula's levers, each a plan → explicit yes → confirm → verify:
+- capacity (`apply_live_capacity`);
+- prod Atlas tier;
+- staging rollback (`promote_release` of the previous good tag);
+- NonProd env actions.
+
+Prod restarts and image rollbacks are **not** Nebula actions (platform-owner rule: EKS-Moly-Prod is
+changed only through `apply_live_capacity`). The prompt tells the user the exact command for on-call.
+
+**Provenance of the capacity files.** twizz-gitops is a private personal repo, so GitHub offers no
+branch protection or rulesets, and `main` also takes Nebula's own commits. Nebula enforces review
+itself, against one pinned commit (`pinReviewedCapacity`). For a PRODUCTION `applyLiveCapacity`
+from gitops:
+1. resolve `main` to `H`;
+2. for `capacity/presets.yaml` (plus `profiles.yaml` for estimates), take the last commit `C` as of `H`;
+3. find a PR associated with `C`, merged into **this** repo's `main` by a capacity owner
+   (`NEBULA_CAPACITY_OWNERS`, default `twizzynicky`), whose merge commit `M` passes a
+   **blob-level proof**:
+   - `M` is on `H`'s history;
+   - the file's blob at `M` equals its blob at `H` (nothing changed it since);
+   - the blob at `M`'s first parent differs (this merge introduced it).
+
+   Commit-list membership is not accepted, so a stacked PR can't launder a direct push;
+   A later push that restores bytes identical to an approved version passes, by design: the
+   bytes are reviewed content. Rebase merges of several commits may be refused (fail safe;
+   this repo squash-merges);
+4. read the files **at `H`** and size from exactly those bytes. Their blob SHAs are bound into the
+   nonce, so a change between review and confirm is refused.
+
+Proofs are cached per (H, path); doubts are not cached. It fails closed, the denial is audited, and
+`.github/CODEOWNERS` documents the owners. Custom sizes (operator, UI) don't come from these files
+and skip this check by design.
+
 ## N6 — Monitor: prod + staging at a glance (2026-10-16)
 
 `/monitor` — one page so ops can see pressure and headroom without devops watching CloudWatch,

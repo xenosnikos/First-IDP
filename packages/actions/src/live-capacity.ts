@@ -30,9 +30,11 @@ export type LiveWorkload = {
   /** every container (incl. sidecars) has a CPU request — required for a CPU HPA */
   cpuRequestsOnAll?: boolean;
   hpa?: { min: number; max: number; targetCPU?: number; current?: number; desired?: number };
+  /** rollout completion: controller observed the spec; updated + available replicas */
+  rollout?: { observed: boolean; updated: number; available: number; total?: number; unavailable?: number };
 };
 export type LiveNodegroup = { name: string; status: string; instanceTypes: string[]; capacityType?: string; min: number; desired: number; max: number };
-export type LiveNode = { name: string; nodegroup?: string; instanceType?: string; cpuCores: number; memGi: number };
+export type LiveNode = { name: string; nodegroup?: string; instanceType?: string; cpuCores: number; memGi: number; ready?: boolean; schedulable?: boolean };
 export type LiveState = {
   tier: LiveTier;
   cluster: string;
@@ -252,7 +254,15 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize, 
   const addedPods = ops.filter((o): o is Extract<LiveOp, { kind: "scale" }> => o.kind === "scale").reduce((s, o) => s + Math.max(0, o.to - o.from), 0);
   if (addedPods > 0 && nodegroupUps.length === 0) warnings.push(`+${addedPods} pods with no node-group change; ${live.nodes.length} nodes / ${nodeCpu} vCPU today — check node headroom`);
 
-  const touched = ops.map((o) => (o.kind === "nodegroup" ? live.nodegroups.find((n) => n.name === o.name) : live.workloads.find((w) => w.name === o.name)));
+  // what the plan was made from — the SPEC the human reviewed, not volatile rollout progress
+  // (rollout observations would otherwise invalidate a confirmation while nothing planned changed)
+  const touched = ops.map((o) => {
+    if (o.kind === "nodegroup") return live.nodegroups.find((n) => n.name === o.name);
+    const w = live.workloads.find((x) => x.name === o.name);
+    if (!w) return w;
+    const { rollout: _rollout, ready: _ready, ...spec } = w;
+    return spec;
+  });
   // a template plan binds its name too (it is checked under different rules); hand edits hash as before
   const planHash = createHash("sha256").update(canonical(opts.template ? { tier: t.tier, ops, touched, template: opts.template.name } : { tier: t.tier, ops, touched })).digest("hex");
   return { tier: t.tier, cluster: t.cluster, readAt: live.readAt, rows: rows.sort((x, y) => Number(y.pair) - Number(x.pair) || x.workload.localeCompare(y.workload)), nodegroupRows, ops, violations, warnings, planHash };

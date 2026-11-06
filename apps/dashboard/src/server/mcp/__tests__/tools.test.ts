@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from "vitest";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
-import { MCP_CAPACITY_WRITES, MCP_CLUSTERS, MCP_OPERATOR_WRITES, MCP_READ_TOOLS, MCP_SELF_SERVICE_WRITES, MCP_TOOL_NAMES, MCP_WRITE_TOOLS, toolsFor, gateText, registerNebulaTools, scopeOf, type AppCaller, type NebulaMcpDeps } from "../tools";
+import { MCP_CAPACITY_WRITES, MCP_CLUSTERS, MCP_OPERATOR_READS, MCP_OPERATOR_WRITES, MCP_READ_TOOLS, MCP_SELF_SERVICE_WRITES, MCP_TOOL_NAMES, MCP_WRITE_TOOLS, toolsFor, gateText, registerNebulaTools, scopeOf, type AppCaller, type NebulaMcpDeps } from "../tools";
 import { isAllowedSentinelPath, sentinelEndpoint } from "../sentinel";
 
 // A caller that records every procedure call: tools must only reach the
@@ -60,7 +60,7 @@ describe("nebula MCP surface", () => {
     const everyone = [...MCP_READ_TOOLS, ...MCP_SELF_SERVICE_WRITES].sort();
     expect(await names(false, [])).toEqual(everyone);
     expect(await names(false, ["capacity:production"])).toEqual(everyone); // a scope without operator grants nothing
-    expect(await names(true, [])).toEqual([...everyone, ...MCP_OPERATOR_WRITES].sort()); // operator without a scope: no capacity writes
+    expect(await names(true, [])).toEqual([...everyone, ...MCP_OPERATOR_READS, ...MCP_OPERATOR_WRITES].sort()); // operator without a scope: no capacity writes
     expect(toolsFor({ operator: true, scopes: ["capacity:staging"] })).toContain("apply_live_capacity");
     expect(toolsFor({ operator: true, scopes: ["capacity:staging"] })).not.toContain("set_prod_atlas_tier");
   });
@@ -285,5 +285,168 @@ describe("traffic estimate hardening (Codex review 2026-11-06)", () => {
     expect(insightsTime("2026-11-05T22:18:00.000Z")).toBe(Date.parse("2026-11-05T22:18:00.000Z"));
     expect(insightsTime("2026-11-06T00:18:00+02:00")).toBe(Date.parse("2026-11-05T22:18:00.000Z"));
     expect(insightsTime("not a time")).toBeNull();
+  });
+});
+
+describe("events + incidents (verify / watch / changes / prompts)", () => {
+  it("are reads every bound person gets", async () => {
+    const names = (await (await connect({ caller: fakeCaller().caller, operator: false, scopes: [] })).listTools()).tools.map((t) => t.name);
+    for (const n of ["capacity_verify", "event_watch"]) expect(names).toContain(n);
+    expect(names).not.toContain("recent_changes"); // other people's activity: operators only
+  });
+
+  it("capacity_verify takes exactly one target and forwards it", async () => {
+    const { caller, calls } = fakeCaller({ "capacity.verify": { check: { verdict: "READY" } } });
+    const client = await connect({ caller });
+    expect((await client.callTool({ name: "capacity_verify", arguments: { tier: "production" } })).isError).toBe(true);
+    await client.callTool({ name: "capacity_verify", arguments: { tier: "production", preset: "campaign" } });
+    await client.callTool({ name: "capacity_verify", arguments: { tier: "production", estimateRps: 2500 } });
+    expect(calls.filter((c) => c.proc === "capacity.verify").map((c) => c.input)).toEqual([
+      { tier: "production", preset: "campaign" },
+      { tier: "production", estimate: { rps: 2500, peakFactor: 1, headroom: 1.2 } },
+    ]);
+  });
+
+  it("event_watch returns the verdict and only the last 10 minutes of detail", async () => {
+    const minutes = Array.from({ length: 30 }, (_, i) => ({ t: String(i), rps: i }));
+    const client = await connect({ caller: fakeCaller({ "capacity.watch": { status: "WATCH", minutes } }).caller });
+    const out = JSON.parse(textOf(await client.callTool({ name: "event_watch", arguments: { tier: "production" } })));
+    expect(out.status).toBe("WATCH");
+    expect(out.lastMinutes).toHaveLength(10);
+    expect(out.minutes).toBeUndefined();
+  });
+
+  it("prompts: prepare_marketing_event (verify before the event) and diagnose_outage (changes before conclusions; no prod restarts)", async () => {
+    const client = await connect({ caller: fakeCaller().caller });
+    const names = (await client.listPrompts()).prompts.map((p) => p.name);
+    expect(names).toEqual(expect.arrayContaining(["plan_capacity_for_traffic", "prepare_marketing_event", "diagnose_outage"]));
+    const prep = (( await client.getPrompt({ name: "prepare_marketing_event", arguments: { expectedPeakRps: "2500" } })).messages[0].content as { text: string }).text;
+    expect(prep.indexOf("capacity_verify")).toBeGreaterThan(prep.indexOf("apply_live_capacity"));
+    expect(prep).toMatch(/explicit yes/);
+    const diag = ((await client.getPrompt({ name: "diagnose_outage", arguments: { symptom: "slow at midnight" } })).messages[0].content as { text: string }).text;
+    expect(diag.indexOf("recent_changes")).toBeLessThan(diag.indexOf("Conclude"));
+    expect(diag).toMatch(/NOT Nebula actions/);
+  });
+});
+
+describe("capacity file provenance: blob-level proof at a pinned head (Codex reviews)", () => {
+  const P = "capacity/presets.yaml";
+  // a tiny git: commits with parents and the presets blob at each commit
+  type Commit = { parents: string[]; blob: string | null };
+  type PR = { number: number; merge: string; commits: string[]; mergedBy?: string; baseRepo?: string };
+  function fakeGh(o: { commits: Record<string, Commit>; head: string; prs: PR[]; lastTouch: string; throws?: boolean }) {
+    const ancestors = (sha: string, seen = new Set<string>()): Set<string> => {
+      if (seen.has(sha)) return seen;
+      seen.add(sha);
+      for (const p of o.commits[sha]?.parents ?? []) ancestors(p, seen);
+      return seen;
+    };
+    return {
+      git: {
+        getRef: async () => ({ data: { object: { sha: o.head } } }),
+        getCommit: async ({ commit_sha }: { commit_sha: string }) => ({ data: { parents: (o.commits[commit_sha]?.parents ?? []).map((sha) => ({ sha })) } }),
+      },
+      repos: {
+        listCommits: async () => {
+          if (o.throws) throw new Error("GitHub down");
+          return { data: [{ sha: o.lastTouch }] };
+        },
+        listPullRequestsAssociatedWithCommit: async ({ commit_sha }: { commit_sha: string }) => ({
+          data: o.prs.filter((p) => p.merge === commit_sha || p.commits.includes(commit_sha)).map((p) => ({ number: p.number, merged_at: "2026-11-06T08:00:00Z", base: { ref: "main", repo: { full_name: p.baseRepo ?? "TwizzyNicky/twizz-gitops" } } })),
+        }),
+        compareCommitsWithBasehead: async ({ basehead }: { basehead: string }) => {
+          const [base, head] = basehead.split("...");
+          return { data: { status: base === head ? "identical" : ancestors(head).has(base) ? "ahead" : "diverged" } };
+        },
+        getContent: async ({ ref }: { ref: string }) => {
+          const blob = o.commits[ref]?.blob;
+          if (!blob) throw Object.assign(new Error("Not Found"), { status: 404 });
+          return { data: { type: "file", sha: blob, content: Buffer.from(`presets: [] # ${blob}`).toString("base64") } };
+        },
+      },
+      pulls: {
+        get: async ({ pull_number }: { pull_number: number }) => {
+          const p = o.prs.find((x) => x.number === pull_number)!;
+          return { data: { merged_by: { login: p.mergedBy ?? "TwizzyNicky" }, merge_commit_sha: p.merge } };
+        },
+      },
+    } as never;
+  }
+  let n = 0;
+  const head = () => `h${++n}`.padEnd(40, "0"); // fresh cache key per scenario
+
+  it("accepts a squash merge by an owner that introduced the bytes at head", async () => {
+    const { capacityFileProvenance } = await import("../../nebula/capacity");
+    process.env.NEBULA_CAPACITY_OWNERS = "twizzynicky";
+    const H = head();
+    const gh = fakeGh({ head: H, lastTouch: H, prs: [{ number: 7, merge: H, commits: ["f"] }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } });
+    expect(await capacityFileProvenance(P, H, gh)).toMatchObject({ ok: true, pr: 7, mergedBy: "twizzynicky" });
+  });
+
+  it("accepts a merge-commit PR (last touch is the PR's own commit; the merge brought it to main)", async () => {
+    const { capacityFileProvenance } = await import("../../nebula/capacity");
+    const H = head();
+    const gh = fakeGh({ head: H, lastTouch: "f1", prs: [{ number: 8, merge: H, commits: ["f1"] }], commits: { p0: { parents: [], blob: "A" }, f1: { parents: ["p0"], blob: "B" }, [H]: { parents: ["p0", "f1"], blob: "B" } } });
+    expect(await capacityFileProvenance(P, H, gh)).toMatchObject({ ok: true, pr: 8 });
+  });
+
+  it("REFUSES a direct push laundered through a stacked owner-merged PR that merely contains it", async () => {
+    const { capacityFileProvenance } = await import("../../nebula/capacity");
+    const H = head();
+    // x = direct push to main changing presets (A→B); PR 9 (owner-merged later) lists x among its commits but its merge changes nothing in presets
+    const gh = fakeGh({ head: H, lastTouch: "x", prs: [{ number: 9, merge: H, commits: ["x", "y"] }], commits: { p0: { parents: [], blob: "A" }, x: { parents: ["p0"], blob: "B" }, y: { parents: ["x"], blob: "B" }, [H]: { parents: ["x", "y"], blob: "B" } } });
+    expect(await capacityFileProvenance(P, H, gh)).toMatchObject({ ok: false, reason: expect.stringMatching(/not introduced by a PR/) });
+  });
+
+  it("refuses: a direct push after an approved merge, a non-owner merger, a PR into another repo", async () => {
+    const { capacityFileProvenance } = await import("../../nebula/capacity");
+    let H = head();
+    expect(await capacityFileProvenance(P, H, fakeGh({ head: H, lastTouch: H, prs: [{ number: 7, merge: "m", commits: [] }], commits: { p0: { parents: [], blob: "A" }, m: { parents: ["p0"], blob: "B" }, [H]: { parents: ["m"], blob: "C" } } }))).toMatchObject({ ok: false, reason: expect.stringMatching(/pushed directly/) });
+    H = head();
+    expect(await capacityFileProvenance(P, H, fakeGh({ head: H, lastTouch: H, prs: [{ number: 10, merge: H, commits: [], mergedBy: "mallory" }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } }))).toMatchObject({ ok: false });
+    H = head();
+    expect(await capacityFileProvenance(P, H, fakeGh({ head: H, lastTouch: H, prs: [{ number: 11, merge: H, commits: [], baseRepo: "evil/twizz-gitops" }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } }))).toMatchObject({ ok: false, reason: expect.stringMatching(/pushed directly/) });
+  });
+
+  it("errors fail closed and are not cached", async () => {
+    const { capacityFileProvenance } = await import("../../nebula/capacity");
+    const H = head();
+    const good = { head: H, lastTouch: H, prs: [{ number: 7, merge: H, commits: [] }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } };
+    expect(await capacityFileProvenance(P, H, fakeGh({ ...good, throws: true }))).toMatchObject({ ok: false, reason: expect.stringMatching(/could not verify/) });
+    expect(await capacityFileProvenance(P, H, fakeGh(good))).toMatchObject({ ok: true });
+  });
+
+  it("pinReviewedCapacity sizes from the bytes at the pinned head and refuses if any file is unproven", async () => {
+    const { pinReviewedCapacity } = await import("../../nebula/capacity");
+    const H = head();
+    const pin = await pinReviewedCapacity([P], fakeGh({ head: H, lastTouch: H, prs: [{ number: 7, merge: H, commits: [] }], commits: { p0: { parents: [], blob: "A" }, [H]: { parents: ["p0"], blob: "B" } } }));
+    expect(pin.head).toBe(H);
+    expect(pin.files[P]).toMatchObject({ blob: "B", content: "presets: [] # B" });
+    const H2 = head();
+    await expect(pinReviewedCapacity([P], fakeGh({ head: H2, lastTouch: "x", prs: [], commits: { [H2]: { parents: [], blob: "B" } } }))).rejects.toThrow(/not owner-reviewed/);
+  });
+});
+
+describe("watchVerdict (Codex review)", () => {
+  const ok = { verdict: "OK" as const, rps: 0, workloads: [], nodegroups: [], notes: [] };
+  const sat = { ...ok, verdict: "SATURATED" as const };
+  const base = { peakRps: 200, requests: 12_000, err5xx: 0, p95MsLast: 280, nodes: { cpuAvgPct: 20, cpuMaxPct: 30 }, maxPodMcpu: 90, atPeak: ok, atPeakPlus30: ok, signals: [] as Array<{ label: string; word: string }>, edgeData: true, podData: "complete" as const };
+  it("OK when everything is calm", async () => {
+    const { watchVerdict } = await import("../../nebula/watch-model");
+    expect(watchVerdict(base)).toMatchObject({ status: "OK", reasons: [] });
+  });
+  it("high 5xx alone is ACT — but NOT capacity evidence", async () => {
+    const { watchVerdict } = await import("../../nebula/watch-model");
+    expect(watchVerdict({ ...base, err5xx: 600 })).toMatchObject({ status: "ACT", capacityEvidence: false, capacityShort: false });
+  });
+  it("saturation is ACT with capacity evidence", async () => {
+    const { watchVerdict } = await import("../../nebula/watch-model");
+    expect(watchVerdict({ ...base, atPeak: sat, nodes: { cpuAvgPct: 91, cpuMaxPct: 99 } })).toMatchObject({ status: "ACT", capacityEvidence: true });
+  });
+  it("a HOT monitor signal is ACT; missing data is UNKNOWN or WATCH with the gap named", async () => {
+    const { watchVerdict } = await import("../../nebula/watch-model");
+    expect(watchVerdict({ ...base, signals: [{ label: "Atlas connections", word: "HOT" }] }).status).toBe("ACT");
+    expect(watchVerdict({ ...base, edgeData: false })).toMatchObject({ status: "UNKNOWN" });
+    expect(watchVerdict({ ...base, podData: "timeout" })).toMatchObject({ status: "WATCH", reasons: [expect.stringMatching(/data gap: pod\/node metrics timeout/)] });
   });
 });

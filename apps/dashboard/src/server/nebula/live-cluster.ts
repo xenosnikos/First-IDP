@@ -42,9 +42,9 @@ const gib = (q?: string) => {
 const str = (v: unknown) => (v === undefined || v === null ? undefined : String(v));
 
 type DeployItem = {
-  metadata?: { name?: string; namespace?: string };
+  metadata?: { name?: string; namespace?: string; generation?: number };
   spec?: { replicas?: number; template?: { spec?: { containers?: Array<{ name?: string; resources?: { requests?: Record<string, unknown>; limits?: Record<string, unknown> } }> } } };
-  status?: { readyReplicas?: number };
+  status?: { replicas?: number; readyReplicas?: number; updatedReplicas?: number; availableReplicas?: number; unavailableReplicas?: number; observedGeneration?: number };
 };
 type HpaItem = {
   metadata?: { name?: string };
@@ -85,6 +85,8 @@ export function liveClusterPort(t: LiveTarget): LiveClusterPort {
             name,
             replicas: d.spec?.replicas ?? 0,
             ready: d.status?.readyReplicas ?? 0,
+            // rollout completion (capacity_verify): the controller saw this spec, and every replica is updated + available
+            rollout: { observed: (d.status?.observedGeneration ?? 0) >= (d.metadata?.generation ?? 0), updated: d.status?.updatedReplicas ?? 0, available: d.status?.availableReplicas ?? 0, total: d.status?.replicas ?? 0, unavailable: d.status?.unavailableReplicas ?? 0 },
             container: ct?.name ?? name,
             resources,
             cpuRequestsOnAll: (d.spec?.template?.spec?.containers ?? []).every((c) => !!c.resources?.requests?.cpu),
@@ -102,13 +104,15 @@ export function liveClusterPort(t: LiveTarget): LiveClusterPort {
           };
         }),
       );
-      type NodeItem = { metadata?: { name?: string; labels?: Record<string, string> }; status?: { capacity?: Record<string, string> } };
+      type NodeItem = { metadata?: { name?: string; labels?: Record<string, string> }; spec?: { unschedulable?: boolean }; status?: { capacity?: Record<string, string>; conditions?: Array<{ type?: string; status?: string }> } };
       const nodes = ((nodesRes.body.items ?? []) as NodeItem[]).map((n) => ({
         name: n.metadata?.name ?? "",
         nodegroup: n.metadata?.labels?.["eks.amazonaws.com/nodegroup"],
         instanceType: n.metadata?.labels?.["node.kubernetes.io/instance-type"],
         cpuCores: cores(n.status?.capacity?.cpu),
         memGi: Math.round(gib(n.status?.capacity?.memory) * 10) / 10,
+        ready: (n.status?.conditions ?? []).some((c) => c.type === "Ready" && c.status === "True"),
+        schedulable: !n.spec?.unschedulable,
       }));
       const groups = ((apiGroups.body as { groups?: Array<{ name?: string }> }).groups ?? []).map((g) => g.name);
       return { tier: t.tier, cluster: t.cluster, readAt: new Date().toISOString(), workloads, nodegroups, nodes, metricsServer: groups.includes("metrics.k8s.io") };

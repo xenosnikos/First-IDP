@@ -83,7 +83,7 @@ export type TrafficMinute = {
 
 /** One event, minute by minute (≤ 3 h). Pod/node figures exist only inside Container
  * Insights' 1-day retention; older windows return edge metrics only, and say so. */
-export async function trafficWindow(tier: MonitorTier, fromIso: string, toIso: string, profile?: LiveProfile): Promise<{ tier: MonitorTier; from: string; to: string; minutes: TrafficMinute[]; podMetrics: "complete" | "timeout" | "failed" | "expired"; note?: string }> {
+export async function trafficWindow(tier: MonitorTier, fromIso: string, toIso: string, profile?: LiveProfile): Promise<{ tier: MonitorTier; from: string; to: string; minutes: TrafficMinute[]; samples: { podMinutes: number; nodeMinutes: number }; podMetrics: "complete" | "timeout" | "failed" | "expired"; note?: string }> {
   const from = Math.floor(Date.parse(fromIso) / MIN) * MIN;
   let to = Math.ceil(Date.parse(toIso) / MIN) * MIN;
   if (!(to > from)) throw new Error("`to` must be after `from`");
@@ -102,6 +102,7 @@ export async function trafficWindow(tier: MonitorTier, fromIso: string, toIso: s
   const expired = retainedFrom >= to;
   const partial = !expired && retainedFrom > from;
   let podMetrics: "complete" | "timeout" | "failed" | "expired" = "expired";
+  let coverageGap: string | undefined;
   const pods = new Map<number, TrafficMinute["workloads"]>();
   const nodes = new Map<number, NonNullable<TrafficMinute["nodes"]>>();
   if (!expired) {
@@ -134,13 +135,25 @@ export async function trafficWindow(tier: MonitorTier, fromIso: string, toIso: s
       nodes: nodes.get(t) ?? null,
     });
   }
+  // "complete" must mean RECENT coverage, not one old sample (Codex reviews): every expected
+  // workload and the nodes need a sample within the last 4 minutes of the window
+  const fresh = to - 4 * MIN;
+  const staleWorkloads = workloadNames.filter((n) => ![...pods.entries()].some(([t, m]) => t >= fresh && m[n]));
+  const staleNodes = ![...nodes.keys()].some((t) => t >= fresh);
+  if (podMetrics === "complete" && !expired && (staleWorkloads.length || staleNodes)) {
+    podMetrics = "failed";
+    coverageGap = [staleWorkloads.length ? `no recent samples for ${staleWorkloads.join(", ")}` : "", staleNodes ? "no recent node samples" : ""].filter(Boolean).join("; ");
+  }
   return {
     tier,
     from: new Date(from).toISOString(),
     to: new Date(to).toISOString(),
     minutes,
+    samples: { podMinutes: pods.size, nodeMinutes: nodes.size },
     podMetrics,
-    note: expired
+    note: coverageGap
+      ? `pod/node metrics incomplete: ${coverageGap}`
+      : expired
       ? "pod and node metrics are kept 1 day: only edge req/s, p95 and 5xx for this window"
       : partial
         ? `pod and node metrics only from ${new Date(retainedFrom).toISOString()} (1-day retention); earlier minutes have edge metrics only`

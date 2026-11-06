@@ -1,11 +1,28 @@
 import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import { AtlasSize, CAPACITY_TIERS, EstimateInput, EstimateLiveInput, TierSize, type CapacityTier, type LiveTierSize } from "@twizz-idp/shared";
-import { BASELINE_TEMPLATE, LIVE_TARGETS, PROD_ATLAS, assessLive, caseSizing, describeLiveOp, estimateLive, planProdAtlas, estimateTier, exportPlan, hashSize, isLiveTier, listCapacityPrs, liveAsSize, nearestPreset, planCapacity, planLive, type LiveTier } from "@twizz-idp/actions";
+import { BASELINE_TEMPLATE, LIVE_TARGETS, PROD_ATLAS, assessLive, caseSizing, recommendTemplate, verifyLive, describeLiveOp, estimateLive, planProdAtlas, estimateTier, exportPlan, hashSize, isLiveTier, listCapacityPrs, liveAsSize, nearestPreset, planCapacity, planLive, type LiveTier } from "@twizz-idp/actions";
 import { capacityCases, trafficPeaks, trafficWindow } from "../nebula/traffic";
+import { monitorSnapshot } from "../nebula/monitor";
+import { watchVerdict } from "../nebula/watch-model";
+import { isOperator } from "@/lib/nebula/operators";
+import type { ImageInfo } from "@twizz-idp/actions";
+
+const imageCache = new Map<string, { at: number; v: ImageInfo[] }>();
+let oldestImageRead = Infinity;
+async function cachedImages(repo: string, load: () => Promise<ImageInfo[]>): Promise<ImageInfo[]> {
+  const hit = imageCache.get(repo);
+  if (hit && Date.now() - hit.at < 5 * 60_000) {
+    oldestImageRead = Math.min(oldestImageRead, hit.at);
+    return hit.v;
+  }
+  const v = await load();
+  imageCache.set(repo, { at: Date.now(), v });
+  return v;
+}
 import { router, protectedProcedure } from "../trpc";
 import { namedEnvDeps } from "../nebula/deps";
-import { currentFor, liveTemplateOpts, nodePoolUsedCpu, observe, presetsAndProfiles, prodAtlasPort, readLive, readProdAtlas, targetFor } from "../nebula/capacity";
+import { type CapacitySources, currentFor, liveTemplateOpts, nodePoolUsedCpu, observe, presetsAndProfiles, prodAtlasPort, readLive, readProdAtlas, targetFor } from "../nebula/capacity";
 
 // Capacity page (docs/NEBULA.md §N5). QUERIES ONLY: presets, the current
 // state per tier, a plan (diff + cost + export) and the traffic calculator.
@@ -33,8 +50,8 @@ export function checkProfileTargets(tier: LiveTier, profile: { workloads: Record
 /** A traffic estimate → a live size, server-side from the gitops profile (`<tier>.live`)
  * and floored by the tier's `baseline` template (docs/NEBULA.md §N5.4). The client
  * sends only numbers; it never supplies the size. */
-export async function resolveEstimate(tier: LiveTier, est: EstimateLiveInput) {
-  const { presets, profiles, presetsError, profilesError } = await presetsAndProfiles();
+export async function resolveEstimate(tier: LiveTier, est: EstimateLiveInput, pinned?: CapacitySources) {
+  const { presets, profiles, presetsError, profilesError } = pinned ? { ...pinned, presetsError: undefined, profilesError: undefined } : await presetsAndProfiles();
   if (presetsError) throw new TRPCError({ code: "PRECONDITION_FAILED", message: presetsError });
   const profile = profiles?.tiers[tier]?.live;
   if (!profile) throw new TRPCError({ code: "PRECONDITION_FAILED", message: profilesError ?? `capacity/profiles.yaml has no ${tier}.live profile: traffic estimates are not calibrated for ${tier}` });
@@ -48,15 +65,15 @@ export async function resolveEstimate(tier: LiveTier, est: EstimateLiveInput) {
 
 /** Resolve the size to plan: a named preset (read from gitops, never from the
  * client), a traffic estimate (computed server-side), or a custom size. */
-export async function resolveSize(tier: CapacityTier, input: { preset?: string; custom?: TierSize; estimate?: EstimateLiveInput }): Promise<{ label: string; size: TierSize }> {
+export async function resolveSize(tier: CapacityTier, input: { preset?: string; custom?: TierSize; estimate?: EstimateLiveInput }, pinned?: CapacitySources): Promise<{ label: string; size: TierSize }> {
   if (input.estimate) {
     if (!isLiveTier(tier)) throw new TRPCError({ code: "BAD_REQUEST", message: "traffic estimates size the live tiers (staging, production) only" });
-    const r = await resolveEstimate(tier, input.estimate);
+    const r = await resolveEstimate(tier, input.estimate, pinned);
     return { label: r.label, size: r.size };
   }
   if (input.custom) return { label: "custom", size: input.custom };
   if (!input.preset) throw new TRPCError({ code: "BAD_REQUEST", message: "pick a preset or a custom size" });
-  const { presets, presetsError } = await presetsAndProfiles();
+  const { presets, presetsError } = pinned ? { presets: pinned.presets, presetsError: undefined } : await presetsAndProfiles();
   if (presetsError) throw new TRPCError({ code: "PRECONDITION_FAILED", message: presetsError });
   const p = presets.find((x) => x.name === input.preset);
   if (!p) throw new TRPCError({ code: "NOT_FOUND", message: `no preset "${input.preset}"` });
@@ -205,6 +222,145 @@ export const capacityRouter = router({
         }),
     };
   }),
+
+  /** Rollout validation (§N5.4): is the live cluster at the target of a template or an
+   * estimate — spec, ready pods, joined nodes — and how does it hold at the load right now? */
+  verify: protectedProcedure
+    .input(z.object({ tier: z.enum(["staging", "production"]), preset: z.string().max(24).optional(), estimate: EstimateLiveInput.optional() }).refine((v) => (v.preset === undefined) !== (v.estimate === undefined), "give exactly one of preset or estimate"))
+    .query(async ({ input }) => {
+      const { label, size } = await resolveSize(input.tier, input);
+      if (!size.live) throw new TRPCError({ code: "BAD_REQUEST", message: `"${label}" has no live sizing for ${input.tier}` });
+      const live = await readLive(input.tier);
+      if ("error" in live) throw new TRPCError({ code: "PRECONDITION_FAILED", message: `${LIVE_TARGETS[input.tier].cluster} not readable: ${live.error}` });
+      const check = verifyLive(live.state, size.live);
+      const now = Date.now();
+      const { profiles } = await presetsAndProfiles();
+      const profile = profiles?.tiers[input.tier]?.live;
+      const w = await trafficWindow(input.tier, new Date(now - 10 * 60_000).toISOString(), new Date(now).toISOString(), profile).catch(() => null);
+      const peak = w ? Math.max(0, ...w.minutes.map((m) => m.rps)) : null;
+      return {
+        tier: input.tier,
+        target: label,
+        readAt: live.state.readAt,
+        check,
+        loadNow: { peakRps10m: peak, p95MsLast: w?.minutes.filter((m) => m.p95Ms !== null).at(-1)?.p95Ms ?? null, assessment: profile && peak !== null ? assessLive(profile, liveAsSize(LIVE_TARGETS[input.tier], live.state), peak) : null },
+      };
+    }),
+
+  /** Event watch (§N5.4): the last N minutes, the monitor's signals, and OK / WATCH / ACT
+   * with the next step if capacity is short. Read-only: acting is apply_live_capacity. */
+  watch: protectedProcedure.input(z.object({ tier: z.enum(["staging", "production"]), minutes: z.number().int().min(5).max(60).default(15) })).query(async ({ input }) => {
+    const now = Date.now();
+    const [{ presets, profiles }, live, snap] = await Promise.all([presetsAndProfiles(), readLive(input.tier), monitorSnapshot(input.tier, "15m").catch((e) => ({ error: String((e as Error).message ?? e) }))]);
+    const profile = profiles?.tiers[input.tier]?.live;
+    const w = await trafficWindow(input.tier, new Date(now - input.minutes * 60_000).toISOString(), new Date(now).toISOString(), profile);
+    const withRps = w.minutes.filter((m) => m.rps > 0);
+    const peak = Math.max(0, ...withRps.map((m) => m.rps));
+    const p95s = w.minutes.map((m) => m.p95Ms).filter((v): v is number => v !== null);
+    const p95Last = p95s.at(-1) ?? null;
+    const p95Max = p95s.length ? Math.max(...p95s) : null;
+    const nodesLast = [...w.minutes].reverse().find((m) => m.nodes)?.nodes ?? null;
+    const recentPods = w.minutes.slice(-5).flatMap((m) => Object.values(m.workloads).map((x) => x.mcpuAvg));
+    const running = "state" in live ? liveAsSize(LIVE_TARGETS[input.tier], live.state) : null;
+    const atPeak = profile && running ? assessLive(profile, running, peak) : null;
+    const atMargin = profile && running ? assessLive(profile, running, peak * 1.3) : null;
+    const requests = w.minutes.reduce((a, m) => a + m.rps * 60, 0);
+    const err5xx = w.minutes.reduce((a, m) => a + m.err5xx, 0);
+    const v = watchVerdict({
+      peakRps: peak,
+      requests,
+      err5xx,
+      p95MsLast: p95Last,
+      nodes: nodesLast,
+      maxPodMcpu: recentPods.length ? Math.max(...recentPods) : null,
+      atPeak,
+      atPeakPlus30: atMargin,
+      signals: "error" in snap ? null : snap.signals,
+      edgeData: withRps.length > 0,
+      podData: w.podMetrics,
+    });
+    const templates = presets.filter((p) => p.tiers[input.tier]?.live).map((p) => ({ name: p.name, size: p.tiers[input.tier]!.live! }));
+    // recommend scaling ONLY on capacity evidence, and never below what runs (no downsizing mid-incident)
+    const next = v.capacityShort && profile && running ? recommendTemplate(profile, templates, Math.max(peak * 1.3, 1), running) : null;
+    const status = v.status;
+    const reasons = v.reasons;
+    return {
+      tier: input.tier,
+      window: { from: w.from, to: w.to, minutes: input.minutes },
+      status,
+      reasons,
+      edge: { peakRps: peak, lastRps: withRps.at(-1)?.rps ?? null, p95MsLast: p95Last, p95MsMax: p95Max, err5xx: w.minutes.reduce((a, m) => a + m.err5xx, 0) },
+      nodes: nodesLast,
+      running,
+      atPeak,
+      atPeakPlus30: atMargin,
+      capacityEvidence: v.capacityEvidence,
+      dataGaps: v.dataGaps,
+      recommend: next
+        ? { template: next.name, assessment: next.assessment, then: `capacity_plan {tier: "${input.tier}", preset: "${next.name}"} → apply_live_capacity` }
+        : v.capacityShort
+          ? { template: null, then: `no named template at least as large as what runs holds ${Math.round(peak * 1.3)} req/s: capacity_estimate {tier: "${input.tier}", rps: ${Math.round(peak * 1.3)}}` }
+          : status !== "OK"
+            ? { template: null, then: "not a capacity problem by the evidence: diagnose (recent_changes, fetch_logs errorsOnly, monitor DB) before scaling" }
+            : null,
+      signals: "error" in snap ? { error: snap.error } : { window: "15m", at: snap.at, items: snap.signals },
+      minutes: w.minutes,
+      podMetrics: w.podMetrics,
+    };
+  }),
+
+  /** What changed (§N5.4): Nebula's audited writes (capacity, promotions, envs, …) and the
+   * image pushes of the prod services in a window — the first question of any outage. */
+  recentChanges: protectedProcedure
+    .input(z.object({ from: z.string().datetime(), to: z.string().datetime().optional() }))
+    .query(async ({ ctx, input }) => {
+      // other people's audited activity: operators only (Codex review)
+      const login = (ctx.session as { login?: string } | null)?.login;
+      if (!isOperator(login)) {
+        await ctx.prisma.auditLog.create({ data: { actor: login ?? "unknown", action: "nebula.recent_changes", allowed: false, detail: { reason: "not a Nebula operator" } } }).catch(() => {});
+        throw new TRPCError({ code: "FORBIDDEN", message: "recent changes (who did what) are for Nebula operators" });
+      }
+      const from = new Date(input.from);
+      const to = input.to ? new Date(input.to) : new Date();
+      if (!(to > from)) throw new TRPCError({ code: "BAD_REQUEST", message: "`to` must be after `from`" });
+      if (to.getTime() - from.getTime() > 7 * 24 * 3600_000) throw new TRPCError({ code: "BAD_REQUEST", message: "at most 7 days" });
+      const rows = await ctx.prisma.auditLog.findMany({
+        where: { createdAt: { gte: from, lte: to }, allowed: true, OR: [{ action: { startsWith: "nebula." } }, { action: { startsWith: "mcp.intent." } }], NOT: { action: { startsWith: "nebula.observer." } } },
+        orderBy: { createdAt: "asc" },
+        take: 201,
+        select: { createdAt: true, actor: true, action: true, resource: true, detail: true },
+      });
+      const truncated = rows.length > 200;
+      if (truncated) rows.length = 200;
+      const PROD_REPOS = ["molybackend", "lolygramdiscovery", "alertservice", "invoicegen", "sendgridwebhook", "emailservice", "paymentserv", "twizz-sentinel", "twizz-admin"];
+      const images = namedEnvDeps().images;
+      const repoErrors: Array<{ repo: string; error: string }> = [];
+      oldestImageRead = Infinity;
+      const pushes = (
+        await Promise.all(
+          PROD_REPOS.map(async (repo) => {
+            try {
+              return (await cachedImages(repo, () => images.listImages(repo)))
+                .filter((i) => i.pushedAt && i.pushedAt >= from && i.pushedAt <= to)
+                .map((i) => ({ at: i.pushedAt!.toISOString(), repo, tags: i.tags.slice(0, 3) }));
+            } catch (e) {
+              repoErrors.push({ repo, error: String((e as Error).message ?? e).slice(0, 160) });
+              return [];
+            }
+          }),
+        )
+      ).flat().sort((a, b) => a.at.localeCompare(b.at));
+      return {
+        from: from.toISOString(),
+        to: to.toISOString(),
+        nebulaWrites: rows.map((r) => ({ at: r.createdAt.toISOString(), actor: r.actor, action: r.action, resource: r.resource, summary: String((r.detail as { summary?: string } | null)?.summary ?? "").split("\n")[0].slice(0, 200) })),
+        imagePushes: pushes,
+        truncated: truncated ? "only the first 200 Nebula writes in this window are shown: narrow it" : undefined,
+        repoErrors: repoErrors.length ? repoErrors : undefined,
+        imagesAsOf: Number.isFinite(oldestImageRead) ? new Date(oldestImageRead).toISOString() : new Date().toISOString(),
+        note: "prod Moly services deploy outside Nebula (CodeBuild → ECR → rollout): an image push shortly before an incident is a likely deploy",
+      };
+    }),
 
   /** Traffic calculator: rps → a custom size + the nearest named preset. */
   estimate: protectedProcedure.input(EstimateInput.extend({ tier: tierSchema })).query(async ({ input }) => {
