@@ -48,8 +48,9 @@ planner (`components/capacity/capacity-view.tsx`), `/monitor` the read-only prod
 GitHub token + Google ID token + presigned STS GetCallerIdentity, all matching `NEBULA_MCP_IDENTITIES`; §N7.1) → `server/mcp/tools.ts` (explicit tool
 list; each tool = a tRPC procedure through `appRouter.createCaller`, an Observer tool with an explicit
 NonProd/staging/prod scope, or a GET on sentinel `server/mcp/sentinel.ts`). Every tool call
-writes an `mcp.tool.*` AuditLog row with all three identities. Prod is READ-only: never add a write that takes a cluster/
-tier/target, a capacity/live/Atlas procedure, or a secret VALUE input; the tests pin it.
+writes an `mcp.tool.*` AuditLog row with all three identities. The ONLY prod writes are the two capacity
+tools (operator + `capacity:<tier>` scope; named template or a server-side traffic estimate, never a custom
+size; §N5.4). Never add another write that takes a cluster/tier/target, or a secret VALUE input; the tests pin it.
 
 ## Tests
 `pnpm --filter @twizz-idp/dashboard test` (vitest): status-word mapping, operator

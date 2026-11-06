@@ -13,6 +13,7 @@ Kubernetes API anywhere in here: every write is a GitHub Contents-API commit to
 - `promote.ts` — the release train (docs/NEBULA.md §N4): `promoteRelease` (gitops PR bumping `apps/<svc>/values-staging.yaml`), `mergePromotion` (sha-guarded squash), `listReleaseCandidates`, `listPromotions`, `readTargetState`; targets come from `registry.ts releaseTrain`
 - `capacity.ts` — capacity templates (docs/NEBULA.md §N5): `CAPACITY_TARGETS` (per-tier services, files, caps; prod never writable), comment-preserving values/NodePool surgery, `planCapacity`, `estimateTier`, `applyCapacity` (one gitops PR), `mergeCapacityPr`, `setAtlasTier` over the `AtlasClusters` port; prices in `capacity-prices.ts`
 - `live-capacity.ts` — staging/prod live sizing (§N5.2): `LIVE_TARGETS`, `planLive` (+ `LivePlanOpts.template`: named prod templates floored by `baseline`), `applyLive`
+- `traffic.ts` — capacity by traffic (§N5.4): `estimateLive` (req/s → live pods + node groups from the calibrated `<tier>.live` profile, baseline floor, caps), `assessLive` (OK/WATCH/SATURATED; replays cases), `findBursts`, `loadCases` (`capacity/cases.yaml`)
 - `prod-atlas.ts` — prod Atlas tier (§N5.3): `PROD_ATLAS` allowlist + step limits, `planProdAtlas`, `setProdAtlasTier` (re-checks `from`)
 - `adapters.ts` — the real ports: Octokit (`GithubGitops`, `GithubBuilds`, `GithubPromotions`), `@aws-sdk/client-secrets-manager`, `@aws-sdk/client-ecr`
 

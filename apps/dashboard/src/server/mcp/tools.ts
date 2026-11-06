@@ -91,6 +91,10 @@ export const MCP_READ_TOOLS = [
   "capacity_tier",
   "capacity_plan",
   "prod_atlas_plan",
+  "capacity_estimate",
+  "traffic_peaks",
+  "traffic_window",
+  "capacity_cases",
 ] as const;
 
 /** Any bound person (Nebula then applies owner-or-operator per env). */
@@ -389,6 +393,46 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
     async (a) => json(await c.capacity.prodAtlasPlan({ cluster: a.cluster, size: { instanceSize: a.instanceSize, ...(a.autoScaling ? { autoScaling: a.autoScaling } : {}) } as never })),
   );
 
+  // ── traffic-driven sizing (§N5.4): reads for everyone bound ──
+  const liveTier = z.enum(["production", "staging"]);
+  const estimateShape = {
+    rps: z.number().min(1).max(100_000).describe("Expected PEAK edge requests/s (last night's burst: ~2,330)"),
+    peakFactor: z.number().min(1).max(20).optional().describe("Multiplier if rps is a typical level, not the peak (default 1)"),
+    headroom: z.number().min(1).max(3).optional().describe("Safety margin over the peak (default 1.2)"),
+  };
+
+  reg(
+    "capacity_estimate",
+    "Size a live tier for an expected PEAK traffic: pods per workload and node-group min/desired/max from the profile calibrated on real events, floored by `baseline`, within caps. Returns the per-step arithmetic, warnings, the plan against the live cluster (ops + planHash for apply_live_capacity), and how what runs NOW, the estimate and every named template would fare at that load (OK / WATCH / SATURATED). Read-only.",
+    { tier: liveTier, ...estimateShape },
+    RO,
+    async (a) => json(await c.capacity.estimateLive({ tier: a.tier, rps: a.rps, peakFactor: a.peakFactor ?? 1, headroom: a.headroom ?? 1.2 })),
+  );
+
+  reg(
+    "traffic_peaks",
+    "Sudden traffic ramps in the last 1–14 days (per-minute edge req/s): start, peak, baseline, ratio, ramp minutes, duration, p95 before/max, 5xx. Use it to find events like the 2026-11-05 00:17 burst and how often they happen. Read-only.",
+    { tier: liveTier, days: z.number().int().min(1).max(14).optional() },
+    RO,
+    async (a) => json(await c.capacity.trafficPeaks({ tier: a.tier, days: a.days ?? 7 })),
+  );
+
+  reg(
+    "traffic_window",
+    "One event minute by minute (≤3 h): req/s, p95, 5xx, and — within the last day only — pods and CPU per modelled workload and node CPU. Use after traffic_peaks to see what saturated. Read-only.",
+    { tier: liveTier, from: z.string().datetime(), to: z.string().datetime() },
+    RO,
+    async (a) => json(await c.capacity.trafficWindow({ tier: a.tier, from: a.from, to: a.to })),
+  );
+
+  reg(
+    "capacity_cases",
+    "The library of past capacity events (twizz-gitops capacity/cases.yaml): what traffic came, what ran, what happened, what to do next time — each replayed against today's profile (what ran vs its peak; the recommended template). Start every capacity plan here. Read-only.",
+    { tier: liveTier.optional() },
+    RO,
+    async (a) => json(await c.capacity.cases(a.tier ? { tier: a.tier } : undefined)),
+  );
+
   const needScope = (scope: McpScope) => {
     if (!d.operator || !d.scopes.includes(scope)) throw new TRPCError({ code: "FORBIDDEN", message: `needs a Nebula operator with the ${scope} MCP scope` });
   };
@@ -397,15 +441,25 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
     reg(
       "apply_live_capacity",
       [
-        `OPERATORS with capacity:<tier>: resize ${liveTiers.join("/")} ON THE CLUSTER to a NAMED template (prod: baseline / campaign / max). No custom sizes here.`,
-        "Steps: capacity_plan {tier, preset} → review ops/violations/warnings → call this with the plan's planHash (no confirm) → show the CONFIRMATION summary verbatim → only after an explicit yes, call again with confirm.",
+        `OPERATORS with capacity:<tier>: resize ${liveTiers.join("/")} ON THE CLUSTER to a NAMED template (prod: baseline / campaign / max) OR to a traffic estimate (estimateRps: computed server-side from the calibrated profile, floored by baseline). Exactly one of preset / estimateRps. No custom sizes here.`,
+        "Steps: capacity_plan {tier, preset} or capacity_estimate {tier, rps} → review ops/violations/warnings → call this with the SAME preset or estimate and the plan's planHash (no confirm) → show the CONFIRMATION summary verbatim → only after an explicit yes, call again with confirm.",
         "Refused if the cluster moved since the plan (planHash), if any step exceeds ×3/×0.5, a cap, or the baseline floor. Stops at the first failure. Every attempt is audited.",
       ].join(" "),
-      { tier: z.enum(liveTiers as [string, ...string[]]), preset: presetName, planHash: z.string().regex(/^[0-9a-f]{64}$/), confirm },
+      {
+        tier: z.enum(liveTiers as [string, ...string[]]),
+        preset: presetName.optional(),
+        estimateRps: estimateShape.rps.optional(),
+        peakFactor: estimateShape.peakFactor,
+        headroom: estimateShape.headroom,
+        planHash: z.string().regex(/^[0-9a-f]{64}$/),
+        confirm,
+      },
       { readOnlyHint: false, destructiveHint: true, openWorldHint: true },
       async (a) => {
         needScope(`capacity:${a.tier}` as McpScope);
-        return gateText(await c.actions.applyLiveCapacity({ tier: a.tier as "production" | "staging", preset: a.preset, planHash: a.planHash, confirm: a.confirm }));
+        if ((a.preset === undefined) === (a.estimateRps === undefined)) throw new TRPCError({ code: "BAD_REQUEST", message: "give exactly one of preset or estimateRps" });
+        const by = a.estimateRps !== undefined ? { estimate: { rps: a.estimateRps, peakFactor: a.peakFactor ?? 1, headroom: a.headroom ?? 1.2 } } : { preset: a.preset };
+        return gateText(await c.actions.applyLiveCapacity({ tier: a.tier as "production" | "staging", ...by, planHash: a.planHash, confirm: a.confirm }));
       },
     );
   }
@@ -518,6 +572,32 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
 
   reg("teardown_env", "Owner or operator: tear down a named env (manifest, values, secret; app pruned, db dropped).", { name: envName, confirm }, { ...W, destructiveHint: true }, async (a) => gateText(await c.actions.teardownNamedEnv(a)));
 
+  // ── guided prompt: plan capacity for a traffic event, learning from past cases ──
+  server.registerPrompt(
+    "plan_capacity_for_traffic",
+    {
+      title: "Plan capacity for a traffic event",
+      description: "Size staging/production ahead of expected traffic, using past events (like the 2026-11-05 midnight burst) as the reference.",
+      argsSchema: {
+        tier: z.enum(["production", "staging"]).optional().describe("default production"),
+        expectedPeakRps: z.string().max(12).optional().describe("expected PEAK req/s, if known"),
+        when: z.string().max(80).optional().describe("when the event starts (e.g. 'tonight 00:00 EET')"),
+        event: z.string().max(200).optional().describe("what it is (campaign push, drop, live show…)"),
+      },
+    },
+    (args) => ({
+      messages: [
+        {
+          role: "user",
+          content: {
+            type: "text",
+            text: PLAN_CAPACITY_PROMPT({ tier: args.tier ?? "production", peak: args.expectedPeakRps, when: args.when, event: args.event }),
+          },
+        },
+      ],
+    }),
+  );
+
   reg(
     "promote_release",
     "OPERATORS, gate 1 of 2: open a twizz-gitops PR moving a service on STAGING to an immutable image tag (from release_train candidates). Nothing deploys until merge_promotion. There is no production target.",
@@ -533,4 +613,20 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
     W,
     async (a) => gateText(await c.actions.mergePromotion({ prNumber: a.prNumber, service: a.service as never, target: "staging", imageTag: a.imageTag, confirm: a.confirm })),
   );
+}
+
+export function PLAN_CAPACITY_PROMPT(a: { tier: string; peak?: string; when?: string; event?: string }): string {
+  return [
+    `Plan ${a.tier} capacity for ${a.event ? `"${a.event}"` : "an expected traffic event"}${a.when ? ` starting ${a.when}` : ""}${a.peak ? `, expected peak ≈ ${a.peak} req/s` : ""}.`,
+    "",
+    "Work through Nebula, in this order, and show me the evidence at each step:",
+    "1. capacity_cases — read the past events. Note how fast traffic ramped (2026-11-05: 132 → 2,327 req/s in ~2 minutes, p95 280 ms → 9.5 s) and what each replay says about what ran vs the recommended sizing.",
+    "2. traffic_peaks (days: 14) — how often bursts like this happen, their peak req/s and ramp. If the expected peak is unknown, propose one from the largest comparable burst and say which.",
+    `3. capacity_estimate {tier: "${a.tier}", rps: <expected PEAK>, headroom: 1.2} — explain the per-pod req/s, the pods and nodes it asks for, and compare: what runs now, the estimate, and each named template at that load (OK / WATCH / SATURATED).`,
+    "4. Recommend ONE: the smallest named template that is OK at the design load, or the estimate if no template fits. Reactive autoscaling can't absorb a 2-minute ramp, so the capacity must be in place BEFORE the event (node groups take several minutes to add nodes).",
+    "5. Only if I have the capacity scope and say go: apply_live_capacity with that template or estimateRps and the planHash; show the confirmation summary verbatim and wait for my explicit yes.",
+    "6. Plan the step back down to baseline after the event (a second plan + confirm), and note whether this event should become a new case in capacity/cases.yaml.",
+    "",
+    "Never invent numbers: every figure comes from a tool result. If the profile is uncalibrated for this tier, stop and say so.",
+  ].join("\n");
 }

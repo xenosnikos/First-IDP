@@ -58,7 +58,7 @@ import {
   type GateResult,
   type NamedEnvManifest,
 } from "@twizz-idp/actions";
-import { AtlasSize, ENV_KEY_RE, SECRET_SHAPE_RE, TierSize } from "@twizz-idp/shared";
+import { AtlasSize, ENV_KEY_RE, EstimateLiveInput, SECRET_SHAPE_RE, TierSize } from "@twizz-idp/shared";
 import type { PrismaClient } from "@twizz-idp/db";
 import { router, protectedProcedure } from "../trpc";
 import { isOperator } from "@/lib/nebula/operators";
@@ -492,9 +492,10 @@ export const actionsRouter = router({
    * they came from), and applyLive re-checks it, so a cluster that moved after
    * review is refused, never resized blind. */
   applyLiveCapacity: operatorProcedure
-    .input(z.object({ tier: z.enum(["staging", "production"]), preset: z.string().max(24).optional(), custom: TierSize.optional(), planHash: z.string().regex(/^[0-9a-f]{64}$/), confirm: confirmSchema }))
+    .input(z.object({ tier: z.enum(["staging", "production"]), preset: z.string().max(24).optional(), custom: TierSize.optional(), estimate: EstimateLiveInput.optional(), planHash: z.string().regex(/^[0-9a-f]{64}$/), confirm: confirmSchema }))
     .mutation(async ({ ctx, input }) => {
       const { tier, planHash, confirm } = input;
+      if ([input.preset, input.custom, input.estimate].filter((x) => x !== undefined).length !== 1) throw new TRPCError({ code: "BAD_REQUEST", message: "size by exactly one of: preset, custom, estimate" });
       const { label, size } = await resolveSize(tier, input);
       if (!size.live) throw new TRPCError({ code: "BAD_REQUEST", message: `"${label}" has no live sizing for ${tier}` });
       const t = LIVE_TARGETS[tier];
@@ -504,9 +505,10 @@ export const actionsRouter = router({
       if (plan.planHash !== planHash) throw new TRPCError({ code: "CONFLICT", message: `${t.cluster} changed since you reviewed the plan — reload it` });
       if (plan.violations.length) throw new TRPCError({ code: "BAD_REQUEST", message: plan.violations.join("\n") });
       if (!plan.ops.length) throw new TRPCError({ code: "BAD_REQUEST", message: `${t.cluster} already matches "${label}"` });
-      const fields = { tier, preset: label, planHash };
+      // an estimate binds its inputs too: a different req/s is a different confirmation
+      const fields = { tier, preset: label, planHash, ...(input.estimate ? { estimateRps: String(input.estimate.rps), peakFactor: String(input.estimate.peakFactor), headroom: String(input.estimate.headroom) } : {}) };
       const summary = [
-        `Resize ${t.cluster}${tier === "production" ? " (PRODUCTION)" : ""} to "${label}" — ${plan.ops.length} change(s), in this order:`,
+        `Resize ${t.cluster}${tier === "production" ? " (PRODUCTION)" : ""} to "${label}"${input.estimate ? ` (traffic estimate: ${input.estimate.rps} req/s × ${input.estimate.peakFactor} × ${input.estimate.headroom} headroom)` : ""} — ${plan.ops.length} change(s), in this order:`,
         ...plan.ops.map((o) => `- ${describeLiveOp(o)}`),
         ...plan.warnings.map((w) => `! ${w}`),
         `- applied live on the cluster (no PR); refused if anything moves before you confirm; stops at the first failure`,
