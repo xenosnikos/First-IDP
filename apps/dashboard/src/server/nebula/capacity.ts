@@ -12,6 +12,8 @@ import {
   capacityTarget,
   loadPresets,
   loadProfiles,
+  parsePresets,
+  parseProfiles,
   readCurrentTier,
   type CapacityTarget,
   type CurrentTier,
@@ -21,7 +23,7 @@ import {
   GITOPS,
 } from "@twizz-idp/actions";
 import type { Octokit } from "@octokit/rest";
-import { ATLAS_TIERS, type AtlasSize, type AtlasTier, type CapacityTier } from "@twizz-idp/shared";
+import { ATLAS_TIERS, type AtlasSize, type AtlasTier, type CapacityPreset, type CapacityTier } from "@twizz-idp/shared";
 import { namedEnvDeps, octokit } from "./deps";
 import { readCapacityKube, readClusterSnapshot } from "./kube";
 import { liveClusterPort } from "./live-cluster";
@@ -153,9 +155,9 @@ async function observeKube(t: CapacityTarget) {
  * template, floored by the tier's `baseline` template (read from gitops, never
  * from the client); a hand edit (`custom`, or no preset) gets the normal rules.
  * The plan query and the apply mutation both call this, so their hashes agree. */
-export async function liveTemplateOpts(tier: LiveTier, input: { preset?: string; custom?: unknown; estimate?: { rps: number } }): Promise<LivePlanOpts> {
+export async function liveTemplateOpts(tier: LiveTier, input: { preset?: string; custom?: unknown; estimate?: { rps: number } }, pinnedPresets?: CapacityPreset[]): Promise<LivePlanOpts> {
   if (input.custom || (!input.preset && !input.estimate)) return {};
-  const presets = await loadPresets(namedEnvDeps().promotions);
+  const presets = pinnedPresets ?? (await loadPresets(namedEnvDeps().promotions));
   const floor = presets.find((p) => p.name === BASELINE_TEMPLATE)?.tiers[tier]?.live;
   if (input.estimate) {
     // a traffic estimate: floored by baseline (REQUIRED — fail closed without it), but it keeps
@@ -202,51 +204,99 @@ export async function readProdAtlas(): Promise<{ clusters: ProdAtlasRow[] } | { 
   }
 }
 
-// ── provenance of the capacity files (Codex review 2026-11-06) ─────────────
+// ── provenance of the capacity files (Codex reviews 2026-11-06) ─────────────
 // twizz-gitops is a private personal repo: GitHub offers no branch protection or
 // rulesets there, and `main` also takes Nebula's own direct commits (named envs).
-// So Nebula enforces it: a PRODUCTION capacity write needs the latest commit to each
-// capacity file it relies on to come from a PR merged by a capacity owner
-// (NEBULA_CAPACITY_OWNERS, default the platform owner). Fail closed.
+// So Nebula enforces it, against ONE pinned commit:
+//   1. H = the head of main now;
+//   2. per file, C = the last commit touching it as of H;
+//   3. C must be PROVEN to come from a PR merged into THIS repo's main by a capacity
+//      owner: C is that PR's merge commit (squash/rebase), or one of the PR's own commits;
+//   4. the file is read AT H — the bytes sized from are the bytes that were proven.
+// Cached by (H, path). Fails closed on any doubt.
 export const CAPACITY_OWNERS = () =>
   (process.env.NEBULA_CAPACITY_OWNERS || "twizzynicky")
     .split(",")
     .map((s) => s.trim().toLowerCase())
     .filter(Boolean);
 
-export type Provenance = { path: string; ok: boolean; sha?: string; pr?: number; mergedBy?: string; reason?: string };
-const provenanceCache = new Map<string, { at: number; v: Provenance }>();
+export type Provenance = { path: string; ok: boolean; commit?: string; pr?: number; mergedBy?: string; reason?: string };
+const provenanceCache = new Map<string, Provenance>();
 
-export async function capacityFileProvenance(path: string, gh: Octokit = octokit()): Promise<Provenance> {
-  const hit = provenanceCache.get(path);
-  if (hit && Date.now() - hit.at < 5 * 60_000) return hit.v;
+/** Is commit `sha` proven to come from a PR merged into GITOPS main by an owner? */
+async function provePrOrigin(gh: Octokit, sha: string): Promise<{ ok: true; pr: number; mergedBy: string } | { ok: false; reason: string }> {
+  const { owner, repo, branch } = GITOPS;
+  const fullName = `${owner}/${repo}`.toLowerCase();
+  const pulls = await gh.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
+  const candidates = pulls.data.filter((p) => p.merged_at && p.base.ref === branch && p.base.repo?.full_name?.toLowerCase() === fullName);
+  if (!candidates.length) return { ok: false, reason: `commit ${sha.slice(0, 7)} was pushed directly, not merged through a PR into ${fullName}:${branch}` };
+  const owners = CAPACITY_OWNERS();
+  for (const p of candidates) {
+    const full = (await gh.pulls.get({ owner, repo, pull_number: p.number })).data;
+    const by = full.merged_by?.login?.toLowerCase();
+    if (!by || !owners.includes(by)) continue;
+    // the PR must have INTRODUCED this commit, not merely contain it
+    if (full.merge_commit_sha === sha) return { ok: true, pr: p.number, mergedBy: by };
+    const commits = await gh.pulls.listCommits({ owner, repo, pull_number: p.number, per_page: 100 });
+    if (commits.data.some((c) => c.sha === sha)) return { ok: true, pr: p.number, mergedBy: by };
+  }
+  return { ok: false, reason: `commit ${sha.slice(0, 7)} is not the merge or one of the commits of a PR merged by a capacity owner (${owners.join(", ")})` };
+}
+
+export async function capacityFileProvenance(path: string, head: string, gh: Octokit = octokit()): Promise<Provenance> {
+  const key = `${head}:${path}`;
+  const hit = provenanceCache.get(key);
+  if (hit) return hit;
   let v: Provenance;
   try {
-    const { owner, repo, branch } = GITOPS;
-    const commits = await gh.repos.listCommits({ owner, repo, sha: branch, path, per_page: 1 });
-    const sha = commits.data[0]?.sha;
-    if (!sha) v = { path, ok: false, reason: `${path} has no commits on ${branch}` };
+    const { owner, repo } = GITOPS;
+    const commits = await gh.repos.listCommits({ owner, repo, sha: head, path, per_page: 1 });
+    const commit = commits.data[0]?.sha;
+    if (!commit) v = { path, ok: false, reason: `${path} has no history as of ${head.slice(0, 7)}` };
     else {
-      const pulls = await gh.repos.listPullRequestsAssociatedWithCommit({ owner, repo, commit_sha: sha });
-      const merged = pulls.data.find((p) => p.merged_at && p.base.ref === branch);
-      if (!merged) v = { path, ok: false, sha, reason: `the last change to ${path} (${sha.slice(0, 7)}) was pushed directly, not merged through a PR` };
-      else {
-        const full = await gh.pulls.get({ owner, repo, pull_number: merged.number });
-        const by = full.data.merged_by?.login?.toLowerCase();
-        v = by && CAPACITY_OWNERS().includes(by) ? { path, ok: true, sha, pr: merged.number, mergedBy: by } : { path, ok: false, sha, pr: merged.number, mergedBy: by, reason: `${path} was last changed by PR #${merged.number}, merged by ${by ?? "unknown"} — not a capacity owner (${CAPACITY_OWNERS().join(", ")})` };
-      }
+      const proof = await provePrOrigin(gh, commit);
+      v = proof.ok ? { path, ok: true, commit, pr: proof.pr, mergedBy: proof.mergedBy } : { path, ok: false, commit, reason: `${path}: ${proof.reason}` };
     }
   } catch (e) {
     v = { path, ok: false, reason: `could not verify ${path} on GitHub: ${errMsg(e)}` };
   }
-  provenanceCache.set(path, { at: Date.now(), v });
+  if (v.ok) {
+    if (provenanceCache.size > 200) provenanceCache.clear();
+    provenanceCache.set(key, v); // only proofs are cached; doubts are re-checked
+  }
   return v;
 }
 
-/** Throws unless every file was last changed by an owner-merged PR. */
-export async function requireReviewedCapacityFiles(paths: string[]): Promise<Provenance[]> {
-  const all = await Promise.all(paths.map((p) => capacityFileProvenance(p)));
-  const bad = all.filter((p) => !p.ok);
-  if (bad.length) throw new Error(`refused: production capacity relies on files that are not owner-reviewed — ${bad.map((b) => b.reason).join("; ")}`);
-  return all;
+export type PinnedCapacity = { head: string; files: Record<string, { content: string; blob: string; provenance: Provenance }> };
+
+/** Pin main, prove every file at that commit, and return their bytes AT that commit.
+ * Throws (fail closed) unless every file is proven. */
+export async function pinReviewedCapacity(paths: string[], gh: Octokit = octokit()): Promise<PinnedCapacity> {
+  const { owner, repo, branch } = GITOPS;
+  const head = (await gh.git.getRef({ owner, repo, ref: `heads/${branch}` })).data.object.sha;
+  const files: PinnedCapacity["files"] = {};
+  const bad: string[] = [];
+  for (const path of paths) {
+    const provenance = await capacityFileProvenance(path, head, gh);
+    if (!provenance.ok) {
+      bad.push(provenance.reason ?? path);
+      continue;
+    }
+    const { data } = await gh.repos.getContent({ owner, repo, path, ref: head });
+    if (Array.isArray(data) || data.type !== "file") {
+      bad.push(`${path} is not a file at ${head.slice(0, 7)}`);
+      continue;
+    }
+    files[path] = { content: Buffer.from(data.content, "base64").toString("utf8"), blob: data.sha, provenance };
+  }
+  if (bad.length) throw new Error(`refused: production capacity relies on files that are not owner-reviewed — ${bad.join("; ")}`);
+  return { head, files };
 }
+
+/** Presets + profiles parsed from a pin (what a production apply sizes from). */
+export function capacitySourcesFrom(pin: PinnedCapacity) {
+  const pre = pin.files["capacity/presets.yaml"];
+  const pro = pin.files["capacity/profiles.yaml"];
+  return { presets: pre ? parsePresets(pre.content) : [], profiles: pro ? parseProfiles(pro.content) : null };
+}
+export type CapacitySources = ReturnType<typeof capacitySourcesFrom>;

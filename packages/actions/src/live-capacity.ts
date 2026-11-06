@@ -30,9 +30,11 @@ export type LiveWorkload = {
   /** every container (incl. sidecars) has a CPU request — required for a CPU HPA */
   cpuRequestsOnAll?: boolean;
   hpa?: { min: number; max: number; targetCPU?: number; current?: number; desired?: number };
+  /** rollout completion: controller observed the spec; updated + available replicas */
+  rollout?: { observed: boolean; updated: number; available: number };
 };
 export type LiveNodegroup = { name: string; status: string; instanceTypes: string[]; capacityType?: string; min: number; desired: number; max: number };
-export type LiveNode = { name: string; nodegroup?: string; instanceType?: string; cpuCores: number; memGi: number };
+export type LiveNode = { name: string; nodegroup?: string; instanceType?: string; cpuCores: number; memGi: number; ready?: boolean; schedulable?: boolean };
 export type LiveState = {
   tier: LiveTier;
   cluster: string;

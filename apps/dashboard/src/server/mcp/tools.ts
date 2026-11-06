@@ -97,18 +97,19 @@ export const MCP_READ_TOOLS = [
   "capacity_cases",
   "capacity_verify",
   "event_watch",
-  "recent_changes",
 ] as const;
 
 /** Any bound person (Nebula then applies owner-or-operator per env). */
 export const MCP_SELF_SERVICE_WRITES = ["create_env_from_repo", "rebuild_env", "set_env_vars", "extend_env", "teardown_env"] as const;
 /** Nebula operators only. */
 export const MCP_OPERATOR_WRITES = ["create_named_env", "clone_staging_db", "promote_release", "merge_promotion"] as const;
+/** Operator-only READS (other people's audited activity). */
+export const MCP_OPERATOR_READS = ["recent_changes"] as const;
 /** Operators whose binding carries the matching capacity scope. */
 export const MCP_CAPACITY_WRITES = ["apply_live_capacity", "set_prod_atlas_tier"] as const;
 
 export const MCP_WRITE_TOOLS = [...MCP_SELF_SERVICE_WRITES, ...MCP_OPERATOR_WRITES, ...MCP_CAPACITY_WRITES] as const;
-export const MCP_TOOL_NAMES = [...MCP_READ_TOOLS, ...MCP_WRITE_TOOLS] as const;
+export const MCP_TOOL_NAMES = [...MCP_READ_TOOLS, ...MCP_OPERATOR_READS, ...MCP_WRITE_TOOLS] as const;
 export type McpToolName = (typeof MCP_TOOL_NAMES)[number];
 
 /** Live tiers a person may resize through MCP: operator AND capacity:<tier>. */
@@ -120,7 +121,7 @@ export function liveTiersFor(who: { operator: boolean; scopes: readonly string[]
 /** The tools this person gets — anything else is not even listed. */
 export function toolsFor(who: { operator: boolean; scopes: readonly string[] }): McpToolName[] {
   const out: McpToolName[] = [...MCP_READ_TOOLS, ...MCP_SELF_SERVICE_WRITES];
-  if (who.operator) out.push(...MCP_OPERATOR_WRITES);
+  if (who.operator) out.push(...MCP_OPERATOR_READS, ...MCP_OPERATOR_WRITES);
   if (liveTiersFor(who).length) out.push("apply_live_capacity");
   if (who.operator && who.scopes.includes("capacity:production")) out.push("set_prod_atlas_tier");
   return out;
@@ -461,7 +462,7 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
 
   reg(
     "recent_changes",
-    "What changed in a window (≤7 days): Nebula's audited writes (capacity applies, promotions, env changes, with who and the summary) and image pushes of the prod services (prod deploys happen outside Nebula: CodeBuild → ECR → rollout). The first question of any outage. Read-only.",
+    "OPERATORS: what changed in a window (≤7 days): Nebula's audited writes (capacity applies, promotions, env changes, with who and the summary) and image pushes of the prod services (prod deploys happen outside Nebula: CodeBuild → ECR → rollout). The first question of any outage. Read-only.",
     { from: z.string().datetime(), to: z.string().datetime().optional() },
     RO,
     async (a) => json(await c.capacity.recentChanges({ from: a.from, ...(a.to ? { to: a.to } : {}) })),

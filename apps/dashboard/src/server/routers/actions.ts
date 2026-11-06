@@ -65,7 +65,7 @@ import { isOperator } from "@/lib/nebula/operators";
 import { argoWord, ttlWord } from "@/lib/nebula/status";
 import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
-import { atlasPort, liveTemplateOpts, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, requireReviewedCapacityFiles, targetFor } from "../nebula/capacity";
+import { atlasPort, liveTemplateOpts, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, pinReviewedCapacity, capacitySourcesFrom, type CapacitySources, targetFor } from "../nebula/capacity";
 import { liveClusterPort } from "../nebula/live-cluster";
 import { resolveSize } from "./capacity";
 
@@ -496,27 +496,33 @@ export const actionsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const { tier, planHash, confirm } = input;
       if ([input.preset, input.custom, input.estimate].filter((x) => x !== undefined).length !== 1) throw new TRPCError({ code: "BAD_REQUEST", message: "size by exactly one of: preset, custom, estimate" });
-      // PRODUCTION from gitops files: those files must be owner-reviewed (Nebula-enforced; the repo can't)
+      // PRODUCTION from gitops files: pin main, PROVE each file owner-reviewed at that commit, and
+      // size from exactly those bytes (Nebula-enforced; the repo can't). Fails closed, audited.
+      let pinned: CapacitySources | undefined;
+      let blobs: Record<string, string> = {};
       if (tier === "production" && !input.custom) {
         const files = ["capacity/presets.yaml", ...(input.estimate ? ["capacity/profiles.yaml"] : [])];
         try {
-          await requireReviewedCapacityFiles(files);
+          const pin = await pinReviewedCapacity(files);
+          pinned = capacitySourcesFrom(pin);
+          blobs = Object.fromEntries(Object.entries(pin.files).map(([p, f]) => [p.replace("capacity/", "").replace(".yaml", "Blob"), f.blob]));
         } catch (e) {
           await auditDenial(ctx.prisma, ctx.login, "apply_live_capacity", String((e as Error).message), files.join(" "));
           throw new TRPCError({ code: "PRECONDITION_FAILED", message: String((e as Error).message) });
         }
       }
-      const { label, size } = await resolveSize(tier, input);
+      const { label, size } = await resolveSize(tier, input, pinned);
       if (!size.live) throw new TRPCError({ code: "BAD_REQUEST", message: `"${label}" has no live sizing for ${tier}` });
       const t = LIVE_TARGETS[tier];
-      const [r, opts] = await Promise.all([readLive(tier), liveTemplateOpts(tier, input)]);
+      const [r, opts] = await Promise.all([readLive(tier), liveTemplateOpts(tier, input, pinned?.presets)]);
       if ("error" in r) throw new TRPCError({ code: "PRECONDITION_FAILED", message: `${t.cluster} not readable: ${r.error}` });
       const plan = planLive(t, r.state, size.live, opts);
       if (plan.planHash !== planHash) throw new TRPCError({ code: "CONFLICT", message: `${t.cluster} changed since you reviewed the plan — reload it` });
       if (plan.violations.length) throw new TRPCError({ code: "BAD_REQUEST", message: plan.violations.join("\n") });
       if (!plan.ops.length) throw new TRPCError({ code: "BAD_REQUEST", message: `${t.cluster} already matches "${label}"` });
       // an estimate binds its inputs too: a different req/s is a different confirmation
-      const fields = { tier, preset: label, planHash, ...(input.estimate ? { estimateRps: String(input.estimate.rps), peakFactor: String(input.estimate.peakFactor), headroom: String(input.estimate.headroom) } : {}) };
+      // …and the exact capacity files it was sized from: a change between review and confirm is refused
+      const fields = { tier, preset: label, planHash, ...blobs, ...(input.estimate ? { estimateRps: String(input.estimate.rps), peakFactor: String(input.estimate.peakFactor), headroom: String(input.estimate.headroom) } : {}) };
       const summary = [
         `Resize ${t.cluster}${tier === "production" ? " (PRODUCTION)" : ""} to "${label}"${input.estimate ? ` (traffic estimate: ${input.estimate.rps} req/s × ${input.estimate.peakFactor} × ${input.estimate.headroom} headroom)` : ""} — ${plan.ops.length} change(s), in this order:`,
         ...plan.ops.map((o) => `- ${describeLiveOp(o)}`),

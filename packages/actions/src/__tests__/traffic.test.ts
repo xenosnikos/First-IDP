@@ -122,3 +122,25 @@ describe("recommendTemplate", () => {
     expect(recommendTemplate(PROFILE, T3, 9000)).toBeNull();
   });
 });
+
+describe("verifyLive + recommendTemplate (Codex review)", () => {
+  const want: LiveTierSize = { workloads: { "moly-backend-deployment": { replicas: 80 } }, nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: 8, desired: 10, max: 14 } } };
+  const ng = { name: "eks-prod-node-group-m5-2x-extra", min: 8, desired: 10, max: 14 };
+  it("NotReady or cordoned nodes don't count; a rollout isn't done until updated + available", () => {
+    const nodes = [...Array.from({ length: 9 }, () => ({ nodegroup: ng.name, ready: true, schedulable: true })), { nodegroup: ng.name, ready: false, schedulable: true }];
+    const r = verifyLive({ workloads: [{ name: "moly-backend-deployment", replicas: 80, ready: 80, rollout: { observed: true, updated: 80, available: 80 } }], nodegroups: [ng], nodes }, want);
+    expect(r.verdict).toBe("PROGRESSING");
+    expect(r.nodegroups[0].note).toMatch(/1 node/);
+    const notObserved = verifyLive({ workloads: [{ name: "moly-backend-deployment", replicas: 80, ready: 80, rollout: { observed: false, updated: 40, available: 80 } }], nodegroups: [], nodes: [] }, { workloads: want.workloads, nodegroups: {} });
+    expect(notObserved.verdict).toBe("PROGRESSING");
+    const notAvailable = verifyLive({ workloads: [{ name: "moly-backend-deployment", replicas: 80, ready: 80, rollout: { observed: true, updated: 80, available: 70 } }], nodegroups: [], nodes: [] }, { workloads: want.workloads, nodegroups: {} });
+    expect(notAvailable.workloads[0].note).toMatch(/10 pod/);
+  });
+  it("never recommends a template smaller than what runs (no downsizing mid-incident)", () => {
+    const tpl = (name: string, pods: number, nodes: number) => ({ name, size: { workloads: { "moly-backend-deployment": { replicas: pods } }, nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: nodes, desired: nodes, max: nodes } } } as LiveTierSize });
+    const running = tpl("now", 80, 10).size;
+    const all = [tpl("baseline", 40, 5), tpl("campaign", 80, 10), tpl("max", 120, 15)];
+    expect(recommendTemplate(PROFILE, all, 300)?.name).toBe("baseline");
+    expect(recommendTemplate(PROFILE, all, 300, running)?.name).toBe("campaign");
+  });
+});

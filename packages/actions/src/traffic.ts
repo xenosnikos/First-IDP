@@ -233,7 +233,7 @@ export type RolloutCheck = {
 /** Compare the live state with a target size. MISMATCH = the spec isn't what was planned
  * (the apply stopped, or something else changed it); PROGRESSING = spec right, pods or
  * nodes still coming; READY = spec right and everything ready. */
-export function verifyLive(state: { workloads: Array<{ name: string; replicas: number; ready: number }>; nodegroups: Array<{ name: string; min: number; desired: number; max: number }>; nodes: Array<{ nodegroup?: string }> }, size: LiveTierSize): RolloutCheck {
+export function verifyLive(state: { workloads: Array<{ name: string; replicas: number; ready: number; rollout?: { observed: boolean; updated: number; available: number } }>; nodegroups: Array<{ name: string; min: number; desired: number; max: number }>; nodes: Array<{ nodegroup?: string; ready?: boolean; schedulable?: boolean }> }, size: LiveTierSize): RolloutCheck {
   let mismatch = false;
   let progressing = false;
   const workloads = Object.entries(size.workloads ?? {}).map(([name, want]) => {
@@ -246,15 +246,23 @@ export function verifyLive(state: { workloads: Array<{ name: string; replicas: n
       mismatch = true;
       return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: `spec is ${w.replicas}, plan said ${want.replicas}` };
     }
-    if (w.ready < w.replicas) {
+    // done = the controller observed this spec AND every replica is updated and available (not just "ready")
+    const ro = w.rollout;
+    if (ro && !ro.observed) {
       progressing = true;
-      return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: `${w.replicas - w.ready} pod(s) not ready yet` };
+      return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: "the deployment controller hasn't observed the new spec yet" };
+    }
+    const available = ro ? Math.min(ro.updated, ro.available) : w.ready;
+    if (available < w.replicas) {
+      progressing = true;
+      return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: false, note: `${w.replicas - available} pod(s) not updated+available yet` };
     }
     return { name, want: want.replicas, spec: w.replicas, ready: w.ready, ok: true };
   });
   const nodegroups = Object.entries(size.nodegroups ?? {}).map(([name, want]) => {
     const g = state.nodegroups.find((x) => x.name === name);
-    const nodes = state.nodes.filter((n) => n.nodegroup === name).length;
+    // only Ready, schedulable nodes count (a NotReady or cordoned node adds no capacity)
+    const nodes = state.nodes.filter((n) => n.nodegroup === name && n.ready !== false && n.schedulable !== false).length;
     if (!g) {
       mismatch = true;
       return { name, want, spec: null, nodes, ok: false, note: "node group not found" };
@@ -266,16 +274,25 @@ export function verifyLive(state: { workloads: Array<{ name: string; replicas: n
     }
     if (nodes < want.desired) {
       progressing = true;
-      return { name, want, spec, nodes, ok: false, note: `${want.desired - nodes} node(s) still joining (EC2 + bootstrap take a few minutes)` };
+      return { name, want, spec, nodes, ok: false, note: `${want.desired - nodes} node(s) not Ready+schedulable yet (EC2 + bootstrap take a few minutes)` };
     }
     return { name, want, spec, nodes, ok: true };
   });
   return { verdict: mismatch ? "MISMATCH" : progressing ? "PROGRESSING" : "READY", workloads, nodegroups };
 }
 
-/** The smallest named template that is OK at `rps` (by assessLive), else null. */
-export function recommendTemplate(profile: LiveProfile, templates: Array<{ name: string; size: LiveTierSize }>, rps: number): { name: string; size: LiveTierSize; assessment: LiveAssessment } | null {
+/** True when `a` is at least `b` everywhere `b` names (replicas, node-group desired). */
+export function atLeastAsLarge(a: LiveTierSize, b: LiveTierSize): boolean {
+  for (const [n, w] of Object.entries(b.workloads ?? {})) if ((a.workloads?.[n]?.replicas ?? Infinity) < w.replicas) return false;
+  for (const [n, g] of Object.entries(b.nodegroups ?? {})) if ((a.nodegroups?.[n]?.desired ?? Infinity) < g.desired) return false;
+  return true;
+}
+
+/** The smallest named template that is OK at `rps` (by assessLive), else null. With
+ * `atLeast` (what runs now), never one that is smaller anywhere: no downsizing mid-incident. */
+export function recommendTemplate(profile: LiveProfile, templates: Array<{ name: string; size: LiveTierSize }>, rps: number, atLeast?: LiveTierSize): { name: string; size: LiveTierSize; assessment: LiveAssessment } | null {
   const scored = templates
+    .filter((t) => !atLeast || atLeastAsLarge(t.size, atLeast))
     .map((t) => ({ ...t, assessment: assessLive(profile, t.size, rps), weight: Object.values(t.size.workloads ?? {}).reduce((a, w) => a + w.replicas, 0) }))
     .filter((t) => t.assessment.verdict === "OK")
     .sort((a, b) => a.weight - b.weight);
