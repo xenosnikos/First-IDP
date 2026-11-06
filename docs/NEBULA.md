@@ -853,9 +853,14 @@ itself, against one pinned commit (`pinReviewedCapacity`). For a PRODUCTION `app
 from gitops:
 1. resolve `main` to `H`;
 2. for `capacity/presets.yaml` (plus `profiles.yaml` for estimates), take the last commit `C` as of `H`;
-3. require `C` to be the merge commit, or one of the own commits, of a PR merged into **this** repo's
-   `main` by a capacity owner (`NEBULA_CAPACITY_OWNERS`, default `twizzynicky`). A PR that merely
-   contains `C` does not count;
+3. find a PR associated with `C`, merged into **this** repo's `main` by a capacity owner
+   (`NEBULA_CAPACITY_OWNERS`, default `twizzynicky`), whose merge commit `M` passes a
+   **blob-level proof**:
+   - `M` is on `H`'s history;
+   - the file's blob at `M` equals its blob at `H` (nothing changed it since);
+   - the blob at `M`'s first parent differs (this merge introduced it).
+
+   Commit-list membership is not accepted, so a stacked PR can't launder a direct push;
 4. read the files **at `H`** and size from exactly those bytes. Their blob SHAs are bound into the
    nonce, so a change between review and confirm is refused.
 
