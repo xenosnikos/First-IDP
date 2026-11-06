@@ -151,11 +151,13 @@ async function observeKube(t: CapacityTarget) {
  * template, floored by the tier's `baseline` template (read from gitops, never
  * from the client); a hand edit (`custom`, or no preset) gets the normal rules.
  * The plan query and the apply mutation both call this, so their hashes agree. */
-export async function liveTemplateOpts(tier: LiveTier, input: { preset?: string; custom?: unknown }): Promise<LivePlanOpts> {
-  if (input.custom || !input.preset) return {};
+export async function liveTemplateOpts(tier: LiveTier, input: { preset?: string; custom?: unknown; estimate?: { rps: number } }): Promise<LivePlanOpts> {
+  if (input.custom || (!input.preset && !input.estimate)) return {};
   const presets = await loadPresets(namedEnvDeps().promotions);
   const floor = presets.find((p) => p.name === BASELINE_TEMPLATE)?.tiers[tier]?.live;
-  return { template: { name: input.preset, ...(floor ? { floor } : {}) } };
+  // a traffic estimate plans like a template: floored by baseline, never below it (§N5.4)
+  const name = input.estimate ? `estimate-${Math.round(input.estimate.rps)}` : input.preset!;
+  return { template: { name, ...(floor ? { floor } : {}) } };
 }
 
 export async function readLive(tier: LiveTier): Promise<{ state: LiveState } | { error: string }> {

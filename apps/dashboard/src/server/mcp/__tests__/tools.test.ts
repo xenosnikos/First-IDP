@@ -226,3 +226,47 @@ describe("durable intent before a confirmed write (Codex review 2026-11-05)", ()
     expect(order[2]).toBe(`outcome:${id}`);
   });
 });
+
+describe("traffic-driven capacity (§N5.4)", () => {
+  it("an estimate apply forwards only numbers — the size is computed server-side", async () => {
+    const { caller, calls } = fakeCaller();
+    const client = await connect({ caller });
+    await client.callTool({ name: "apply_live_capacity", arguments: { tier: "production", estimateRps: 2500, planHash: "c".repeat(64) } });
+    const call = calls.find((c) => c.proc === "actions.applyLiveCapacity")!;
+    expect(call.input).toEqual({ tier: "production", estimate: { rps: 2500, peakFactor: 1, headroom: 1.2 }, planHash: "c".repeat(64), confirm: undefined });
+  });
+
+  it("exactly one of preset or estimateRps", async () => {
+    const { caller, calls } = fakeCaller();
+    const client = await connect({ caller });
+    for (const args of [{ tier: "production", planHash: "c".repeat(64) }, { tier: "production", preset: "max", estimateRps: 2500, planHash: "c".repeat(64) }]) {
+      const r = await client.callTool({ name: "apply_live_capacity", arguments: args });
+      expect(r.isError).toBe(true);
+    }
+    expect(calls.filter((c) => c.proc === "actions.applyLiveCapacity")).toHaveLength(0);
+  });
+
+  it("estimates, peaks, windows and cases are reads every bound person gets; applying stays scoped", async () => {
+    const names = (await (await connect({ caller: fakeCaller().caller, operator: false, scopes: [] })).listTools()).tools.map((t) => t.name);
+    for (const n of ["capacity_estimate", "traffic_peaks", "traffic_window", "capacity_cases"]) expect(names).toContain(n);
+    expect(names).not.toContain("apply_live_capacity");
+  });
+
+  it("capacity_estimate defaults to the peak as given with 1.2 headroom", async () => {
+    const { caller, calls } = fakeCaller({ "capacity.estimateLive": { ok: true } });
+    const client = await connect({ caller });
+    await client.callTool({ name: "capacity_estimate", arguments: { tier: "production", rps: 2500 } });
+    expect(calls.find((c) => c.proc === "capacity.estimateLive")?.input).toEqual({ tier: "production", rps: 2500, peakFactor: 1, headroom: 1.2 });
+  });
+
+  it("offers the plan_capacity_for_traffic prompt, which starts from past cases", async () => {
+    const client = await connect({ caller: fakeCaller().caller });
+    const { prompts } = await client.listPrompts();
+    expect(prompts.map((p) => p.name)).toContain("plan_capacity_for_traffic");
+    const p = await client.getPrompt({ name: "plan_capacity_for_traffic", arguments: { expectedPeakRps: "2500", when: "tonight 00:00 EET" } });
+    const text = (p.messages[0].content as { text: string }).text;
+    expect(text).toMatch(/capacity_cases/);
+    expect(text.indexOf("capacity_cases")).toBeLessThan(text.indexOf("capacity_estimate"));
+    expect(text).toContain("2500");
+  });
+});

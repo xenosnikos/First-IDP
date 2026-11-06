@@ -749,6 +749,52 @@ tier (and the auto-scaling bounds where auto-scaling is on) → **Plan** (fresh 
   auto-scaled cluster, raise the floor (min) too or Atlas may scale back down after low load.
 - Cost is Atlas list price per cluster (capacity-prices.ts), shown as a delta, not a bill.
 
+### N5.4 — Capacity by traffic: estimate from req/s, learn from past events (2026-11-06)
+
+**Why.** 2026-11-05 00:17 EET: prod edge traffic went 132 → 2,327 req/s in ~2 minutes (17×).
+40 moly-backend pods (no CPU requests/limits) each hit one Node core (~820–1,000m) and the
+node group (5 × m5.2xlarge) ran at 91–99% CPU; p95 went 280 ms → 9.5 s for ~3 minutes, with
+almost no errors. A 2-minute ramp outruns any HPA plus node scale-up, so capacity has to be
+in place **before** the event, sized from expected traffic.
+
+**Profile** (`twizz-gitops capacity/profiles.yaml` `<tier>.live`, calibrated on that event):
+per-pod CPU = `baseMcpu + mcpuPerRps × req/s per pod` (30m + 15.5m; fits 5 measured points),
+sized at `targetMcpu` 600m (≈37 req/s per pod); node groups: `allocatableCpu`, `reservedCpu`
+(other load), `headroom`, `burst` (max = desired × burst).
+
+**Pure core** (`packages/actions/src/traffic.ts`):
+- `estimateLive(target, profile, {rps, peakFactor, headroom}, floor)` → a `LiveTierSize` with
+  the arithmetic per step. It is floored by the tier's `baseline` template and capped by
+  `LIVE_TARGETS`, saying so, never silently. Node group min = desired, so nothing scales away
+  mid-event.
+- `assessLive(profile, size, rps)` → OK / WATCH / SATURATED per pod and node group. It
+  replays a case: on 2026-11-05 `baseline` comes out SATURATED (932m/pod, 109% nodes),
+  `campaign` OK (481m, 56%). Tests pin that the profile predicts the observed saturation.
+- `findBursts(series)` → sudden ramps (≥ 3× and +300 req/s over a 15-minute median).
+
+**Reads** (`capacity` router, every signed-in user; MCP for every bound person):
+- `estimateLive` (MCP `capacity_estimate`): the estimate, the plan against a fresh read with
+  its `planHash`, and what runs now, the estimate and each named template assessed at that load.
+- `trafficPeaks` (`traffic_peaks`): ≤ 14 days, ALB per-minute points.
+- `trafficWindow` (`traffic_window`): ≤ 3 h minute by minute; pods/nodes from Container
+  Insights, which keeps them 1 day.
+- `cases` (`capacity_cases`): `capacity/cases.yaml`, each case replayed against today's profile.
+
+**Apply.**
+- `actions.applyLiveCapacity` takes exactly one of `preset` / `custom` / `estimate`.
+- An estimate is resolved server-side; the client sends only req/s, peak factor and headroom.
+  It plans like a template (baseline floor, step-up limits, caps) and its numbers are bound
+  into the nonce fields.
+- MCP `apply_live_capacity` takes `preset` or `estimateRps` (never a custom size), still
+  operator + `capacity:<tier>`.
+
+**Prompt.** MCP `plan_capacity_for_traffic {tier, expectedPeakRps, when, event}`:
+1. cases first, then peaks;
+2. estimate, compared with the templates;
+3. recommend one, apply ahead of the event (with the user's yes);
+4. plan the step back to baseline;
+5. record the new case.
+
 ## N6 — Monitor: prod + staging at a glance (2026-10-16)
 
 `/monitor` — one page so ops can see pressure and headroom without devops watching CloudWatch,

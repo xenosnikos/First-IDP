@@ -132,8 +132,48 @@ export const ServiceProfile = z.object({
 });
 export type ServiceProfile = z.infer<typeof ServiceProfile>;
 
+// ── Live traffic profile (staging/prod sized ON the cluster, docs/NEBULA.md §N5.4) ──
+// Measured, not guessed: per-pod CPU cost of one edge request/s and the per-pod CPU
+// we size for (Node.js saturates one core per process). Calibrated from real events
+// (capacity/cases.yaml); every number names the case it came from.
+export const LiveWorkloadProfile = z.object({
+  /** fraction of edge requests/s this workload serves (ALB target-group split) */
+  share: z.number().min(0).max(1).default(1),
+  /** CPU millicores one pod spends per request/s it serves (slope, measured) */
+  mcpuPerRps: z.number().positive(),
+  /** CPU millicores one pod spends idle (intercept, measured) */
+  baseMcpu: z.number().min(0).default(0),
+  /** per-pod CPU (millicores) to size for at design load; Node saturates near 1000 */
+  targetMcpu: z.number().positive().max(4000),
+  /** the node group its pods run on */
+  nodegroup: z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/),
+});
+export type LiveWorkloadProfile = z.infer<typeof LiveWorkloadProfile>;
+
+export const LiveNodegroupProfile = z.object({
+  /** schedulable vCPU per node (instance vCPU minus kube/system reserve) */
+  allocatableCpu: z.number().positive(),
+  /** vCPU everything else on the group uses at peak (other workloads, daemonsets) */
+  reservedCpu: z.number().min(0).default(0),
+  /** node headroom over the summed pod CPU */
+  headroom: z.number().min(1).max(3).default(1.15),
+  /** max = desired × this (room for the cluster autoscaler during the event) */
+  burst: z.number().min(1).max(3).default(1.4),
+});
+export type LiveNodegroupProfile = z.infer<typeof LiveNodegroupProfile>;
+
+export const LiveProfile = z.object({
+  workloads: z.record(z.string().regex(K8S_NAME), LiveWorkloadProfile),
+  nodegroups: z.record(z.string().regex(/^[A-Za-z0-9][A-Za-z0-9_-]{0,62}$/), LiveNodegroupProfile),
+  /** case id(s) the numbers were calibrated from */
+  calibratedFrom: z.array(z.string()).default([]),
+});
+export type LiveProfile = z.infer<typeof LiveProfile>;
+
 export const TierProfile = z.object({
   services: z.record(z.string(), ServiceProfile).default({}),
+  /** staging/prod: size the LIVE cluster from edge requests/s (estimateLive) */
+  live: LiveProfile.optional(),
   /** Node ceiling = baseCpu + Σ(maxReplicas·cpu)·overhead (previews etc. live in baseCpu). */
   nodes: z.object({ baseCpu: z.number().min(0).default(0), baseMemoryGi: z.number().min(0).default(0), overhead: z.number().min(1).max(3).default(1.15), warmFraction: z.number().min(0).max(1).default(0.25) }).optional(),
   /** Atlas: hot data that must fit in RAM. */
@@ -155,3 +195,41 @@ export const EstimateInput = z.object({
   headroom: z.number().min(1).max(3).default(1.3),
 });
 export type EstimateInput = z.infer<typeof EstimateInput>;
+
+export const EstimateLiveInput = z.object({
+  /** expected PEAK edge requests/second (e.g. 2500 for a 00:20-style burst) */
+  rps: z.number().min(1).max(100_000),
+  /** multiplier on rps when you only know a typical level (1 = rps already is the peak) */
+  peakFactor: z.number().min(1).max(20).default(1),
+  /** safety margin over the peak */
+  headroom: z.number().min(1).max(3).default(1.2),
+});
+export type EstimateLiveInput = z.infer<typeof EstimateLiveInput>;
+
+// ── Capacity cases (twizz-gitops capacity/cases.yaml): what happened, what ran, what to do ──
+export const CapacityCase = z.object({
+  id: z.string().regex(/^[a-z0-9][a-z0-9-]{2,63}$/),
+  tier: z.enum(["staging", "production"]),
+  title: z.string().max(120),
+  /** ISO start/end of the event (UTC) */
+  window: z.object({ from: z.string(), to: z.string() }),
+  edge: z.object({
+    baselineRps: z.number().min(0),
+    peakRps: z.number().min(0),
+    /** minutes from baseline to 80% of the peak */
+    rampMinutes: z.number().min(0),
+    /** minutes above 2× baseline */
+    durationMinutes: z.number().min(0),
+  }),
+  ran: z.object({
+    workloads: z.record(z.string(), z.object({ replicas: z.number().int().min(0), peakMcpuPerPod: z.number().min(0).optional() })).default({}),
+    nodegroups: z.record(z.string(), z.object({ desired: z.number().int().min(0), peakCpuPct: z.number().min(0).max(100).optional() })).default({}),
+  }),
+  outcome: z.object({ p95MsBefore: z.number().min(0), p95MsMax: z.number().min(0), err5xx: z.number().min(0).default(0), verdict: z.string().max(400) }),
+  /** what the sizing should have been: an estimateLive input and/or a named template */
+  recommend: z.object({ rps: z.number().min(1).optional(), headroom: z.number().min(1).max(3).optional(), template: z.string().optional(), note: z.string().max(600).optional() }),
+});
+export type CapacityCase = z.infer<typeof CapacityCase>;
+
+export const CapacityCasesFile = z.object({ cases: z.array(CapacityCase).default([]) });
+export type CapacityCasesFile = z.infer<typeof CapacityCasesFile>;

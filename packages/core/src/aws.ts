@@ -145,6 +145,15 @@ export class AWSService {
     return { status: "timeout", rows: [] };
   }
 
+  /** A FIXED server-side Logs Insights query over a cluster's Container Insights
+   * performance group (traffic-window breakdowns, docs/NEBULA.md §N5.4). Callers pass
+   * their own constant query text — never user input — and the field names to read. */
+  async queryPerformance(clusterName: string, queryString: string, fields: readonly string[], startTime: number, endTime: number): Promise<{ status: InsightsStatus; rows: Array<Record<string, string>> }> {
+    if (!/^[A-Za-z0-9-]{1,100}$/.test(clusterName)) throw new Error(`invalid cluster name "${clusterName}"`);
+    const { status, rows } = await this.runInsightsQuery(`/aws/containerinsights/${clusterName}/performance`, queryString, startTime, endTime, { attempts: 30 });
+    return { status, rows: rows.map((r) => Object.fromEntries(fields.map((f) => [f, r(f)]))) };
+  }
+
   async getLivePods(clusterName: string): Promise<LivePod[]> {
     const logGroup = `/aws/containerinsights/${clusterName}/performance`;
     const now = Math.floor(Date.now() / 1000);

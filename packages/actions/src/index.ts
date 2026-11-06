@@ -18,3 +18,4 @@ export * from "./capacity-prices";
 export { AtlasSize, TierSize } from "@twizz-idp/shared";
 export * from "./live-capacity";
 export * from "./prod-atlas";
+export * from "./traffic";
