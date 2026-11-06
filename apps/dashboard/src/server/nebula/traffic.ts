@@ -12,6 +12,14 @@ import { namedEnvDeps } from "./deps";
 
 const MIN = 60_000;
 
+/** Logs Insights `bin()` values are UTC without a zone ("2026-11-05 22:18:00.000"); accept an
+ * explicit zone too, and drop anything unparseable instead of mis-joining it. */
+export function insightsTime(v: string): number | null {
+  const iso = v.includes("T") ? v : v.replace(" ", "T");
+  const t = Date.parse(/[zZ]|[+-]\d{2}:?\d{2}$/.test(iso) ? iso : `${iso}Z`);
+  return Number.isFinite(t) ? t : null;
+}
+
 async function edgeDims(tier: MonitorTier): Promise<{ ns: string; dims: Record<string, string>; latency: boolean }> {
   const t = MONITOR_TARGETS[tier];
   if (t.lb.kind === "elb") return { ns: "AWS/ELB", dims: { LoadBalancerName: t.lb.name }, latency: false };
@@ -89,24 +97,31 @@ export async function trafficWindow(tier: MonitorTier, fromIso: string, toIso: s
   const e5 = at(r.e5);
 
   const workloadNames = profile ? Object.keys(profile.workloads).map((n) => n) : [];
-  const expired = Date.now() - from > 24 * 60 * MIN;
+  // Container Insights keeps pod/node data ~1 day: query the RETAINED part of the window
+  const retainedFrom = Math.max(from, Math.ceil((Date.now() - 24 * 60 * MIN) / MIN) * MIN);
+  const expired = retainedFrom >= to;
+  const partial = !expired && retainedFrom > from;
   let podMetrics: "complete" | "timeout" | "failed" | "expired" = "expired";
   const pods = new Map<number, TrafficMinute["workloads"]>();
   const nodes = new Map<number, NonNullable<TrafficMinute["nodes"]>>();
   if (!expired) {
     const cluster = MONITOR_TARGETS[tier].cluster;
     const [p, n] = await Promise.all([
-      workloadNames.length ? awsService.queryPerformance(cluster, POD_QUERY(workloadNames), ["PodName", "t", "pods", "cpuAvg", "cpuMax"], from / 1000, to / 1000) : Promise.resolve({ status: "complete" as const, rows: [] }),
-      awsService.queryPerformance(cluster, NODE_QUERY, ["t", "nodes", "cpuAvg", "cpuMax"], from / 1000, to / 1000),
+      workloadNames.length ? awsService.queryPerformance(cluster, POD_QUERY(workloadNames), ["PodName", "t", "pods", "cpuAvg", "cpuMax"], retainedFrom / 1000, to / 1000) : Promise.resolve({ status: "complete" as const, rows: [] }),
+      awsService.queryPerformance(cluster, NODE_QUERY, ["t", "nodes", "cpuAvg", "cpuMax"], retainedFrom / 1000, to / 1000),
     ]);
     podMetrics = p.status !== "complete" ? p.status : n.status;
     for (const row of p.rows) {
-      const t = Date.parse(row.t.replace(" ", "T") + "Z");
+      const t = insightsTime(row.t);
+      if (t === null) continue;
       const m = pods.get(t) ?? {};
       m[row.PodName] = { pods: Number(row.pods), mcpuAvg: Math.round(Number(row.cpuAvg)), mcpuMax: Math.round(Number(row.cpuMax)) };
       pods.set(t, m);
     }
-    for (const row of n.rows) nodes.set(Date.parse(row.t.replace(" ", "T") + "Z"), { count: Number(row.nodes), cpuAvgPct: Math.round(Number(row.cpuAvg)), cpuMaxPct: Math.round(Number(row.cpuMax)) });
+    for (const row of n.rows) {
+      const t = insightsTime(row.t);
+      if (t !== null) nodes.set(t, { count: Number(row.nodes), cpuAvgPct: Math.round(Number(row.cpuAvg)), cpuMaxPct: Math.round(Number(row.cpuMax)) });
+    }
   }
   const minutes: TrafficMinute[] = [];
   for (let t = from; t < to; t += MIN) {
@@ -125,7 +140,13 @@ export async function trafficWindow(tier: MonitorTier, fromIso: string, toIso: s
     to: new Date(to).toISOString(),
     minutes,
     podMetrics,
-    note: expired ? "pod and node metrics are kept 1 day: only edge req/s, p95 and 5xx for this window" : !workloadNames.length ? "no live profile: pod breakdown skipped" : undefined,
+    note: expired
+      ? "pod and node metrics are kept 1 day: only edge req/s, p95 and 5xx for this window"
+      : partial
+        ? `pod and node metrics only from ${new Date(retainedFrom).toISOString()} (1-day retention); earlier minutes have edge metrics only`
+        : !workloadNames.length
+          ? "no live profile: pod breakdown skipped"
+          : undefined,
   };
 }
 

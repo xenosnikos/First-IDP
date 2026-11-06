@@ -267,6 +267,16 @@ describe("named templates with a baseline floor", () => {
     expect(planLive(T, NOW(), CAMPAIGN).warnings.join()).toMatch(/not scaled symmetrically/);
   });
 
+  it("a TRAFFIC ESTIMATE keeps the step-down guards: Max → baseline-sized estimate is refused (Codex review)", () => {
+    const est = { template: { name: "estimate-150", floor: BASELINE, liftStepDown: false } };
+    const v = planLive(T, at(MAX), BASELINE, est).violations.join("\n");
+    expect(v).toMatch(/below ×0.5/); // 120 → 40 pods in one apply
+    expect(v).toMatch(/shrink one node per apply/); // 15 → 5 nodes in one apply
+    // …but scaling UP by estimate is unaffected, and the floor still holds
+    expect(planLive(T, NOW(), CAMPAIGN, { template: { name: "estimate-2500", floor: BASELINE, liftStepDown: false } }).violations).toEqual([]);
+    expect(planLive(T, at(CAMPAIGN), tpl(30, 20, [4, 4, 8]), est).violations.join("\n")).toMatch(/below the baseline template/);
+  });
+
   it("a template without a floor gets the normal rules", () => {
     const v = planLive(T, at(MAX), BASELINE, { template: { name: "baseline" } }).violations.join("\n");
     expect(v).toMatch(/below ×0.5/);

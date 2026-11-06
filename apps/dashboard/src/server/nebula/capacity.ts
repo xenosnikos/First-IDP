@@ -155,9 +155,13 @@ export async function liveTemplateOpts(tier: LiveTier, input: { preset?: string;
   if (input.custom || (!input.preset && !input.estimate)) return {};
   const presets = await loadPresets(namedEnvDeps().promotions);
   const floor = presets.find((p) => p.name === BASELINE_TEMPLATE)?.tiers[tier]?.live;
-  // a traffic estimate plans like a template: floored by baseline, never below it (§N5.4)
-  const name = input.estimate ? `estimate-${Math.round(input.estimate.rps)}` : input.preset!;
-  return { template: { name, ...(floor ? { floor } : {}) } };
+  if (input.estimate) {
+    // a traffic estimate: floored by baseline (REQUIRED — fail closed without it), but it keeps
+    // the ×0.5 / one-node step-down guards; only reviewed named templates may drop in one apply
+    if (!floor) throw new Error(`no "${BASELINE_TEMPLATE}" template with a ${tier} live section: traffic estimates need it as their floor`);
+    return { template: { name: `estimate-${Math.round(input.estimate.rps)}`, floor, liftStepDown: false } };
+  }
+  return { template: { name: input.preset!, ...(floor ? { floor } : {}) } };
 }
 
 export async function readLive(tier: LiveTier): Promise<{ state: LiveState } | { error: string }> {

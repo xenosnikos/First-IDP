@@ -270,3 +270,20 @@ describe("traffic-driven capacity (§N5.4)", () => {
     expect(text).toContain("2500");
   });
 });
+
+describe("traffic estimate hardening (Codex review 2026-11-06)", () => {
+  it("a profile may only name allowlisted workloads and node groups", async () => {
+    const { checkProfileTargets } = await import("../../routers/capacity");
+    expect(() => checkProfileTargets("production", { workloads: { "moly-backend-deployment": {} }, nodegroups: { "eks-prod-node-group-m5-2x-extra": {} } })).not.toThrow();
+    expect(() => checkProfileTargets("production", { workloads: { "kube-proxy": {} }, nodegroups: {} })).toThrow(/allowlist/);
+    expect(() => checkProfileTargets("production", { workloads: {}, nodegroups: { "some-other-group": {} } })).toThrow(/allowlist/);
+  });
+
+  it("Logs Insights bin timestamps parse as UTC; zoned values are accepted; junk is dropped", async () => {
+    const { insightsTime } = await import("../../nebula/traffic");
+    expect(insightsTime("2026-11-05 22:18:00.000")).toBe(Date.parse("2026-11-05T22:18:00.000Z"));
+    expect(insightsTime("2026-11-05T22:18:00.000Z")).toBe(Date.parse("2026-11-05T22:18:00.000Z"));
+    expect(insightsTime("2026-11-06T00:18:00+02:00")).toBe(Date.parse("2026-11-05T22:18:00.000Z"));
+    expect(insightsTime("not a time")).toBeNull();
+  });
+});

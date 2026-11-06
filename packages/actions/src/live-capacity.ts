@@ -132,11 +132,15 @@ export const BASELINE_TEMPLATE = "baseline";
  * one-node-per-apply drain guard are lifted for whatever the floor names, and
  * nothing may go below the floor. Step-up limits, caps, never-zero and
  * one-group-per-apply still hold. Without a floor the normal rules apply. */
-export type LivePlanOpts = { template?: { name: string; floor?: LiveTierSize } };
+/** `liftStepDown` (default true): a REVIEWED named template may step down to its own values in
+ * one apply. A traffic estimate passes false: floored by baseline, but it keeps the ×0.5 and
+ * one-node-per-apply drain guards (Codex review 2026-11-06). */
+export type LivePlanOpts = { template?: { name: string; floor?: LiveTierSize; liftStepDown?: boolean } };
 
 /** Pure: the ops that take `live` to `desired`, with every rule checked. */
 export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize, opts: LivePlanOpts = {}): LivePlan {
   const floor = opts.template?.floor;
+  const liftDown = opts.template?.liftStepDown !== false;
   const violations: string[] = [];
   const warnings: string[] = [];
   const ops: LiveOp[] = [];
@@ -189,7 +193,7 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize, 
       if (want.replicas > t.caps.maxReplicas) violations.push(`${prefix} ${want.replicas} replicas exceeds the ${t.tier} cap of ${t.caps.maxReplicas}`);
       const floorReplicas = floor?.workloads[name]?.replicas;
       if (floorReplicas !== undefined && want.replicas < floorReplicas) violations.push(`${prefix} ${want.replicas} replicas is below the ${BASELINE_TEMPLATE} template (${floorReplicas})`);
-      const step = within(t, w.replicas, want.replicas, floorReplicas !== undefined);
+      const step = within(t, w.replicas, want.replicas, floorReplicas !== undefined && liftDown);
       if (step) violations.push(`${prefix} replicas ${step}`);
       if (want.replicas !== w.replicas) {
         workloadOps.push({ kind: "scale", namespace: w.namespace, name, from: w.replicas, to: want.replicas });
@@ -237,7 +241,7 @@ export function planLive(t: LiveTarget, live: LiveState, desired: LiveTierSize, 
   // drain guard: pods here mostly carry no requests, so the scheduler cannot see
   // load — shrink capacity one node, one group, per apply
   // (a template with a floor may shrink a group it names to its own values in one apply)
-  for (const o of nodegroupDowns) if (o.kind === "nodegroup" && o.from.desired - o.to.desired > 1 && !floor?.nodegroups[o.name]) violations.push(`node group ${o.name}: desired ${o.from.desired} → ${o.to.desired} — shrink one node per apply`);
+  for (const o of nodegroupDowns) if (o.kind === "nodegroup" && o.from.desired - o.to.desired > 1 && !(liftDown && floor?.nodegroups[o.name])) violations.push(`node group ${o.name}: desired ${o.from.desired} → ${o.to.desired} — shrink one node per apply`);
   if (nodegroupDowns.length > 1) violations.push(`${nodegroupDowns.length} node groups shrink at once — shrink one group per apply`);
 
   // order: grow nodes first, then workloads, then shrink nodes

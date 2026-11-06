@@ -14,6 +14,22 @@ import { currentFor, liveTemplateOpts, nodePoolUsedCpu, observe, presetsAndProfi
 const tierSchema = z.enum(CAPACITY_TIERS);
 export const planInput = z.object({ tier: tierSchema, preset: z.string().max(24).optional(), custom: TierSize.optional() });
 
+/** What a traffic profile may resize (Codex review: a profile edit must not widen what an
+ * estimate touches). Workloads and node groups outside these lists are refused. */
+export const LIVE_PROFILE_ALLOWLIST: Record<LiveTier, { workloads: readonly string[]; nodegroups: readonly string[] }> = {
+  production: { workloads: ["moly-backend-deployment", "lolygram-discovery-deployment"], nodegroups: ["eks-prod-node-group-m5-2x-extra"] },
+  staging: { workloads: ["moly-backend-deployment"], nodegroups: [] },
+};
+
+export function checkProfileTargets(tier: LiveTier, profile: { workloads: Record<string, unknown>; nodegroups: Record<string, unknown> }) {
+  const allow = LIVE_PROFILE_ALLOWLIST[tier];
+  const bad = [
+    ...Object.keys(profile.workloads).filter((w) => !allow.workloads.includes(w)).map((w) => `workload ${w}`),
+    ...Object.keys(profile.nodegroups).filter((g) => !allow.nodegroups.includes(g)).map((g) => `node group ${g}`),
+  ];
+  if (bad.length) throw new TRPCError({ code: "PRECONDITION_FAILED", message: `capacity/profiles.yaml ${tier}.live names ${bad.join(", ")}, outside Nebula's allowlist for traffic estimates` });
+}
+
 /** A traffic estimate → a live size, server-side from the gitops profile (`<tier>.live`)
  * and floored by the tier's `baseline` template (docs/NEBULA.md §N5.4). The client
  * sends only numbers; it never supplies the size. */
@@ -23,6 +39,9 @@ export async function resolveEstimate(tier: LiveTier, est: EstimateLiveInput) {
   const profile = profiles?.tiers[tier]?.live;
   if (!profile) throw new TRPCError({ code: "PRECONDITION_FAILED", message: profilesError ?? `capacity/profiles.yaml has no ${tier}.live profile: traffic estimates are not calibrated for ${tier}` });
   const floor = presets.find((p) => p.name === BASELINE_TEMPLATE)?.tiers[tier]?.live;
+  // fail closed: an estimate is only safe with the baseline template as its floor
+  if (!floor) throw new TRPCError({ code: "PRECONDITION_FAILED", message: `no "${BASELINE_TEMPLATE}" template with a ${tier} live section in capacity/presets.yaml: traffic estimates need it as their floor` });
+  checkProfileTargets(tier, profile);
   const estimate = estimateLive(LIVE_TARGETS[tier], profile, est, floor);
   return { label: `estimate-${Math.round(est.rps)}`, size: { services: {}, live: estimate.size } as TierSize, estimate, profile, floor, presets };
 }
@@ -134,7 +153,7 @@ export const capacityRouter = router({
     let runningNow: LiveTierSize | null = null;
     if ("error" in live) plan = { error: live.error };
     else {
-      const p = planLive(t, live.state, r.estimate.size, { template: { name: r.label, ...(r.floor ? { floor: r.floor } : {}) } });
+      const p = planLive(t, live.state, r.estimate.size, { template: { name: r.label, floor: r.floor, liftStepDown: false } });
       plan = { ...p, opsText: p.ops.map(describeLiveOp) };
       runningNow = liveAsSize(t, live.state);
     }

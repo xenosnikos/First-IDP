@@ -777,14 +777,22 @@ sized at `targetMcpu` 600m (≈37 req/s per pod); node groups: `allocatableCpu`,
   its `planHash`, and what runs now, the estimate and each named template assessed at that load.
 - `trafficPeaks` (`traffic_peaks`): ≤ 14 days, ALB per-minute points.
 - `trafficWindow` (`traffic_window`): ≤ 3 h minute by minute; pods/nodes from Container
-  Insights, which keeps them 1 day.
+  Insights, which keeps them about 1 day. A window crossing that cutoff gets pod/node data
+  for its retained part and says so.
 - `cases` (`capacity_cases`): `capacity/cases.yaml`, each case replayed against today's profile.
 
 **Apply.**
 - `actions.applyLiveCapacity` takes exactly one of `preset` / `custom` / `estimate`.
 - An estimate is resolved server-side; the client sends only req/s, peak factor and headroom.
-  It plans like a template (baseline floor, step-up limits, caps) and its numbers are bound
-  into the nonce fields.
+  Its numbers are bound into the nonce fields.
+- It is floored by `baseline`, which is **required**: an estimate fails closed if the tier has no
+  baseline live section.
+- Unlike a reviewed named template, it **keeps the step-down guards**: ×0.5 per apply and one
+  node per apply. A low estimate can't drain prod in one click (Codex review 2026-11-06).
+- Step-up limits and caps apply as usual.
+- A profile may only name allowlisted workloads and node groups (`LIVE_PROFILE_ALLOWLIST` in
+  `routers/capacity.ts`). Editing `capacity/profiles.yaml` changes prod sizing coefficients, so
+  it needs the same review as the presets.
 - MCP `apply_live_capacity` takes `preset` or `estimateRps` (never a custom size), still
   operator + `capacity:<tier>`.
 
