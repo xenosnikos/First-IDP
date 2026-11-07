@@ -10,6 +10,7 @@ import { Button } from "@/components/nebula/button";
 import { Field, PageHeader, Row, inputStyle } from "@/components/nebula/plate";
 import { GateDialog } from "@/components/nebula/gate-dialog";
 import { mayHaveWritten, useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
+import { LiveProgress } from "./live-progress";
 
 type Out = inferRouterOutputs<AppRouter>["capacity"];
 type TierView = Out["tier"];
@@ -300,7 +301,8 @@ export function CapacityView({ operator, login }: { operator: boolean; login: st
                 <div key={x}>✓ {x}</div>
               ))}
               {r.failed && <div style={{ color: "var(--n-fail)" }}>✗ {r.failed} — stopped here; nothing after it ran</div>}
-              <p style={{ margin: "10px 0 0", color: "var(--n-ink-muted)" }}>{r.cluster}: applied live. Node groups take a few minutes to add or drain nodes.</p>
+              <p style={{ margin: "10px 0 14px", color: "var(--n-ink-muted)" }}>{r.cluster}: applied live. Node groups take a few minutes to add or drain nodes.</p>
+              {action?.kind === "live" && <LiveProgress tier={action.tier} preset={action.preset} custom={action.custom} />}
             </div>
           ) : "mergedSha" in r ? (
             <p style={{ marginBottom: 14, color: "var(--n-ink-muted)", lineHeight: 1.6 }}>Merged #{r.prNumber} ({r.mergedSha.slice(0, 7)}). Argo CD applies {r.label} to {r.tier} within ~3 minutes.</p>

@@ -226,13 +226,26 @@ export const capacityRouter = router({
   /** Rollout validation (§N5.4): is the live cluster at the target of a template or an
    * estimate — spec, ready pods, joined nodes — and how does it hold at the load right now? */
   verify: protectedProcedure
-    .input(z.object({ tier: z.enum(["staging", "production"]), preset: z.string().max(24).optional(), estimate: EstimateLiveInput.optional() }).refine((v) => (v.preset === undefined) !== (v.estimate === undefined), "give exactly one of preset or estimate"))
+    .input(
+      z
+        .object({
+          tier: z.enum(["staging", "production"]),
+          preset: z.string().max(24).optional(),
+          estimate: EstimateLiveInput.optional(),
+          // the UI's own custom live size (read-only comparison; nothing is applied from it)
+          custom: TierSize.optional(),
+          // false = skip the CloudWatch load window (the progress modal polls every few seconds)
+          load: z.boolean().default(true),
+        })
+        .refine((v) => [v.preset, v.estimate, v.custom].filter((x) => x !== undefined).length === 1, "give exactly one of preset, estimate or custom"),
+    )
     .query(async ({ input }) => {
       const { label, size } = await resolveSize(input.tier, input);
       if (!size.live) throw new TRPCError({ code: "BAD_REQUEST", message: `"${label}" has no live sizing for ${input.tier}` });
       const live = await readLive(input.tier);
       if ("error" in live) throw new TRPCError({ code: "PRECONDITION_FAILED", message: `${LIVE_TARGETS[input.tier].cluster} not readable: ${live.error}` });
       const check = verifyLive(live.state, size.live);
+      if (!input.load) return { tier: input.tier, target: label, readAt: live.state.readAt, check, problemsError: live.state.problemsError ?? null, loadNow: null };
       const now = Date.now();
       const { profiles } = await presetsAndProfiles();
       const profile = profiles?.tiers[input.tier]?.live;
@@ -243,6 +256,7 @@ export const capacityRouter = router({
         target: label,
         readAt: live.state.readAt,
         check,
+        problemsError: live.state.problemsError ?? null,
         loadNow: { peakRps10m: peak, p95MsLast: w?.minutes.filter((m) => m.p95Ms !== null).at(-1)?.p95Ms ?? null, assessment: profile && peak !== null ? assessLive(profile, liveAsSize(LIVE_TARGETS[input.tier], live.state), peak) : null },
       };
     }),

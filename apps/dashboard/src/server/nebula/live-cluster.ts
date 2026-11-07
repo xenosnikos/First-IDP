@@ -5,7 +5,7 @@
 // hard-timed; nothing here can create or delete a Deployment, Pod or Secret
 // (RBAC refuses it even if the code tried).
 import { eksAccess, listNodegroups, updateNodegroupScaling } from "@twizz-idp/core";
-import type { LiveClusterPort, LiveResources, LiveState, LiveTarget, LiveWorkload } from "@twizz-idp/actions";
+import type { LiveClusterPort, LivePodProblem, LiveResources, LiveState, LiveTarget, LiveWorkload } from "@twizz-idp/actions";
 
 const TIMEOUT_MS = 10_000;
 const MERGE = { headers: { "Content-Type": "application/merge-patch+json" } };
@@ -52,11 +52,53 @@ type HpaItem = {
   status?: { currentReplicas?: number; desiredReplicas?: number };
 };
 
+export type PodItem = {
+  metadata?: { name?: string; deletionTimestamp?: Date | string; ownerReferences?: Array<{ kind?: string; name?: string }> };
+  status?: {
+    phase?: string;
+    conditions?: Array<{ type?: string; status?: string; reason?: string; message?: string }>;
+    containerStatuses?: Array<{ name?: string; state?: { waiting?: { reason?: string; message?: string } }; lastState?: { terminated?: { reason?: string } }; restartCount?: number }>;
+  };
+};
+
+const STUCK_WAITING = new Set(["CrashLoopBackOff", "ImagePullBackOff", "ErrImagePull", "CreateContainerConfigError", "CreateContainerError", "InvalidImageName", "RunContainerError"]);
+const STUCK_TERMINATING_MS = 5 * 60_000;
+
+/** Pods a resize can strand or reveal: unschedulable, crash/pull loops, stuck terminating
+ * (e.g. a PodDisruptionBudget holding a drain). Names + reasons only — never env or logs. */
+export function podProblems(namespace: string, items: PodItem[], now = Date.now()): LivePodProblem[] {
+  const out: LivePodProblem[] = [];
+  for (const p of items ?? []) {
+    const pod = p.metadata?.name ?? "";
+    const rs = p.metadata?.ownerReferences?.find((o) => o.kind === "ReplicaSet")?.name;
+    const workload = rs ? rs.replace(/-[a-z0-9]{6,10}$/, "") : undefined;
+    const base = { namespace, pod, ...(workload ? { workload } : {}) };
+    const del = p.metadata?.deletionTimestamp ? new Date(p.metadata.deletionTimestamp).getTime() : NaN;
+    if (Number.isFinite(del) && now - del > STUCK_TERMINATING_MS) {
+      out.push({ ...base, reason: "StuckTerminating", message: `terminating for ${Math.round((now - del) / 60_000)} min (a PodDisruptionBudget or finalizer may be holding it)` });
+      continue;
+    }
+    if (p.status?.phase === "Pending") {
+      const sched = p.status.conditions?.find((c) => c.type === "PodScheduled" && c.status === "False");
+      if (sched) {
+        out.push({ ...base, reason: sched.reason ?? "Unschedulable", message: (sched.message ?? "no node fits this pod").slice(0, 300) });
+        continue;
+      }
+    }
+    const waiting = p.status?.containerStatuses?.find((c) => c.state?.waiting?.reason && STUCK_WAITING.has(c.state.waiting.reason));
+    if (waiting?.state?.waiting) {
+      const last = waiting.lastState?.terminated?.reason;
+      out.push({ ...base, reason: waiting.state.waiting.reason!, message: [`container ${waiting.name}`, last ? `last exit: ${last}` : "", waiting.restartCount ? `${waiting.restartCount} restarts` : "", (waiting.state.waiting.message ?? "").slice(0, 200)].filter(Boolean).join(" · ") });
+    }
+  }
+  return out;
+}
+
 export function liveClusterPort(t: LiveTarget): LiveClusterPort {
   return {
     async read(): Promise<LiveState> {
       const c = await clients(t.cluster);
-      const [perNs, nodesRes, apiGroups, nodegroups] = await Promise.all([
+      const [perNs, nodesRes, apiGroups, nodegroups, problems] = await Promise.all([
         Promise.all(
           t.namespaces.map(async (ns) => {
             const [d, h] = await Promise.all([
@@ -69,6 +111,10 @@ export function liveClusterPort(t: LiveTarget): LiveClusterPort {
         withTimeout(c.core.listNode(), "nodes"),
         withTimeout(c.apis.getAPIVersions(), "api groups"),
         withTimeout(listNodegroups(t.cluster), "node groups"),
+        // best effort: a failed pod list must not fail the read (plan/apply don't need it)
+        Promise.all(t.namespaces.map((ns) => withTimeout(c.core.listNamespacedPod(ns), `pods/${ns}`).then((r) => podProblems(ns, r.body.items as PodItem[]))))
+          .then((p) => ({ problems: p.flat().slice(0, 200) }))
+          .catch((e: unknown) => ({ problemsError: e instanceof Error ? e.message : String(e) })),
       ]);
       const workloads: LiveWorkload[] = perNs.flatMap(({ ns, deployments, hpas }) =>
         deployments.map((d) => {
@@ -115,7 +161,7 @@ export function liveClusterPort(t: LiveTarget): LiveClusterPort {
         schedulable: !n.spec?.unschedulable,
       }));
       const groups = ((apiGroups.body as { groups?: Array<{ name?: string }> }).groups ?? []).map((g) => g.name);
-      return { tier: t.tier, cluster: t.cluster, readAt: new Date().toISOString(), workloads, nodegroups, nodes, metricsServer: groups.includes("metrics.k8s.io") };
+      return { tier: t.tier, cluster: t.cluster, readAt: new Date().toISOString(), workloads, nodegroups, nodes, metricsServer: groups.includes("metrics.k8s.io"), ...problems };
     },
 
     async scale(namespace, name, replicas) {

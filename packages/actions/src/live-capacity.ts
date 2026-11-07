@@ -33,7 +33,17 @@ export type LiveWorkload = {
   /** rollout completion: controller observed the spec; updated + available replicas */
   rollout?: { observed: boolean; updated: number; available: number; total?: number; unavailable?: number };
 };
-export type LiveNodegroup = { name: string; status: string; instanceTypes: string[]; capacityType?: string; min: number; desired: number; max: number };
+export type LiveNodegroup = { name: string; status: string; instanceTypes: string[]; capacityType?: string; min: number; desired: number; max: number; issues?: Array<{ code: string; message: string }> };
+/** A pod that is stuck in a way a resize can cause or reveal (rollout progress, §N5.5). */
+export type LivePodProblem = {
+  namespace: string;
+  pod: string;
+  /** owning Deployment, when the pod belongs to one */
+  workload?: string;
+  /** Unschedulable | ImagePullBackOff | CrashLoopBackOff | … | StuckTerminating */
+  reason: string;
+  message: string;
+};
 export type LiveNode = { name: string; nodegroup?: string; instanceType?: string; cpuCores: number; memGi: number; ready?: boolean; schedulable?: boolean };
 export type LiveState = {
   tier: LiveTier;
@@ -44,6 +54,10 @@ export type LiveState = {
   nodes: LiveNode[];
   /** metrics.k8s.io is served (HPAs can work) */
   metricsServer: boolean;
+  /** stuck pods in the target namespaces; undefined = the pod list couldn't be read */
+  problems?: LivePodProblem[];
+  /** why `problems` is missing (the read itself still succeeded) */
+  problemsError?: string;
 };
 
 export interface LiveClusterPort {
