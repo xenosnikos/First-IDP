@@ -110,6 +110,48 @@ describe("verifyLive (rollout validation)", () => {
   });
 });
 
+// 2026-11-07: campaign → baseline reported READY while 5 of 10 nodes were still draining
+describe("verifyLive scale-down (draining) + issues", () => {
+  const base: LiveTierSize = { workloads: { "moly-backend-deployment": { replicas: 40 } }, nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: 5, desired: 5, max: 8 } } };
+  const ng = { name: "eks-prod-node-group-m5-2x-extra", min: 5, desired: 5, max: 8 };
+  const n = (k: number, extra: { ready?: boolean; schedulable?: boolean } = {}) => Array.from({ length: k }, () => ({ nodegroup: ng.name, ...extra }));
+  const wl = [{ name: "moly-backend-deployment", replicas: 40, ready: 40 }];
+  it("PROGRESSING while extra nodes are still listed, with draining / joining counted", () => {
+    const r = verifyLive({ workloads: wl, nodegroups: [ng], nodes: [...n(5), ...n(3, { schedulable: false }), ...n(2)] }, base);
+    expect(r.verdict).toBe("PROGRESSING");
+    expect(r.nodegroups[0]).toMatchObject({ nodes: 7, draining: 3, joining: 0, total: 10, ok: false });
+    expect(r.nodegroups[0].note).toMatch(/5 node\(s\) still draining/);
+  });
+  it("READY once only the target nodes remain", () => {
+    expect(verifyLive({ workloads: wl, nodegroups: [ng], nodes: n(5) }, base).verdict).toBe("READY");
+  });
+  it("counts NotReady nodes as joining on scale-up", () => {
+    const r = verifyLive({ workloads: wl, nodegroups: [{ ...ng, min: 8, desired: 10, max: 14 }], nodes: [...n(7), ...n(2, { ready: false })] }, { ...base, nodegroups: { [ng.name]: { min: 8, desired: 10, max: 14 } } });
+    expect(r.nodegroups[0]).toMatchObject({ nodes: 7, joining: 2, total: 9 });
+  });
+  it("groups stuck pods by workload + reason and lists node-group health issues; issues never change the verdict", () => {
+    const r = verifyLive(
+      {
+        workloads: wl,
+        nodegroups: [{ ...ng, issues: [{ code: "AsgInstanceLaunchFailures", message: "InsufficientInstanceCapacity" }] }],
+        nodes: n(5),
+        problems: [
+          { pod: "moly-backend-deployment-abc-1", workload: "moly-backend-deployment", reason: "Unschedulable", message: "0/5 nodes are available" },
+          { pod: "moly-backend-deployment-abc-2", workload: "moly-backend-deployment", reason: "Unschedulable", message: "0/5 nodes are available" },
+          { pod: "lonely", reason: "CrashLoopBackOff", message: "container x" },
+        ],
+      },
+      base,
+    );
+    expect(r.verdict).toBe("READY");
+    expect(r.issues).toEqual([
+      { kind: "pod", subject: "moly-backend-deployment", reason: "Unschedulable", message: "0/5 nodes are available", count: 2 },
+      { kind: "pod", subject: "lonely", reason: "CrashLoopBackOff", message: "container x", count: 1 },
+      { kind: "nodegroup", subject: ng.name, reason: "AsgInstanceLaunchFailures", message: "InsufficientInstanceCapacity" },
+    ]);
+  });
+});
+
 describe("recommendTemplate", () => {
   const tpl = (name: string, pods: number, nodes: number) => ({ name, size: { workloads: { "moly-backend-deployment": { replicas: pods } }, nodegroups: { "eks-prod-node-group-m5-2x-extra": { min: nodes, desired: nodes, max: nodes } } } as LiveTierSize });
   const T3 = [tpl("max", 120, 15), tpl("baseline", 40, 5), tpl("campaign", 80, 10)];

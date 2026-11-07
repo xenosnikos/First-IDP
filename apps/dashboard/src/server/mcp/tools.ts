@@ -442,7 +442,7 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
 
   reg(
     "capacity_verify",
-    "Rollout validation after apply_live_capacity: is the live cluster at the target of a template (preset) or estimate (estimateRps) — spec, ready pods, joined nodes — READY / PROGRESSING / MISMATCH, plus how what runs holds at the load of the last 10 minutes. Re-run until READY before the event starts. Read-only.",
+    "Rollout validation after apply_live_capacity: is the live cluster at the target of a template (preset) or estimate (estimateRps) — spec, ready pods, joined and draining nodes — READY / PROGRESSING / MISMATCH, `issues` (stuck pods: Unschedulable, crash/pull loops, stuck terminating; node-group health issues), plus how what runs holds at the load of the last 10 minutes. Re-run until READY before the event starts. Read-only.",
     { tier: liveTier, preset: presetName.optional(), estimateRps: estimateShape.rps.optional(), peakFactor: estimateShape.peakFactor, headroom: estimateShape.headroom },
     RO,
     async (a) => {

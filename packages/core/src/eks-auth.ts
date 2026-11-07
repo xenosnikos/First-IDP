@@ -56,7 +56,17 @@ export async function eksAccess(cluster: string): Promise<EksAccess> {
   return { cluster, server, caData, token: eksTokenFor({ cluster, region, creds }) };
 }
 
-export type NodegroupInfo = { name: string; status: string; instanceTypes: string[]; capacityType?: string; min: number; desired: number; max: number };
+export type NodegroupInfo = {
+  name: string;
+  status: string;
+  instanceTypes: string[];
+  capacityType?: string;
+  min: number;
+  desired: number;
+  max: number;
+  /** EKS node-group health issues (e.g. AsgInstanceLaunchFailures, InsufficientFreeAddresses) */
+  issues?: Array<{ code: string; message: string }>;
+};
 
 /** Managed node groups of a cluster with their scaling config. */
 export async function listNodegroups(cluster: string): Promise<NodegroupInfo[]> {
@@ -72,6 +82,7 @@ export async function listNodegroups(cluster: string): Promise<NodegroupInfo[]> 
         min: ng?.scalingConfig?.minSize ?? 0,
         desired: ng?.scalingConfig?.desiredSize ?? 0,
         max: ng?.scalingConfig?.maxSize ?? 0,
+        issues: (ng?.health?.issues ?? []).map((i) => ({ code: String(i.code ?? "Unknown"), message: (i.message ?? "").slice(0, 300) })),
       };
     }),
   );

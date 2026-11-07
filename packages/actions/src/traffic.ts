@@ -227,13 +227,25 @@ export function caseSizing(c: CapacityCase): LiveTierSize {
 export type RolloutCheck = {
   verdict: "READY" | "PROGRESSING" | "MISMATCH";
   workloads: Array<{ name: string; want: number; spec: number | null; ready: number | null; ok: boolean; note?: string }>;
-  nodegroups: Array<{ name: string; want: { min: number; desired: number; max: number }; spec: { min: number; desired: number; max: number } | null; nodes: number; ok: boolean; note?: string }>;
+  /** nodes = Ready + schedulable; joining = registered, not Ready yet; draining = cordoned
+   * (scale-down in progress); total = every node of the group the cluster still lists */
+  nodegroups: Array<{ name: string; want: { min: number; desired: number; max: number }; spec: { min: number; desired: number; max: number } | null; nodes: number; joining: number; draining: number; total: number; ok: boolean; note?: string }>;
+  /** things that block or slow the rollout (stuck pods of the planned workloads, node-group
+   * health issues); they never change the verdict on their own — a human reads them */
+  issues: Array<{ kind: "pod" | "nodegroup"; subject: string; reason: string; message: string; count?: number }>;
+};
+
+type VerifyState = {
+  workloads: Array<{ name: string; replicas: number; ready: number; rollout?: { observed: boolean; updated: number; available: number; total?: number; unavailable?: number } }>;
+  nodegroups: Array<{ name: string; min: number; desired: number; max: number; issues?: Array<{ code: string; message: string }> }>;
+  nodes: Array<{ nodegroup?: string; ready?: boolean; schedulable?: boolean }>;
+  problems?: Array<{ pod: string; workload?: string; reason: string; message: string }>;
 };
 
 /** Compare the live state with a target size. MISMATCH = the spec isn't what was planned
  * (the apply stopped, or something else changed it); PROGRESSING = spec right, pods or
  * nodes still coming; READY = spec right and everything ready. */
-export function verifyLive(state: { workloads: Array<{ name: string; replicas: number; ready: number; rollout?: { observed: boolean; updated: number; available: number; total?: number; unavailable?: number } }>; nodegroups: Array<{ name: string; min: number; desired: number; max: number }>; nodes: Array<{ nodegroup?: string; ready?: boolean; schedulable?: boolean }> }, size: LiveTierSize): RolloutCheck {
+export function verifyLive(state: VerifyState, size: LiveTierSize): RolloutCheck {
   let mismatch = false;
   let progressing = false;
   const workloads = Object.entries(size.workloads ?? {}).map(([name, want]) => {
@@ -271,24 +283,53 @@ export function verifyLive(state: { workloads: Array<{ name: string; replicas: n
   });
   const nodegroups = Object.entries(size.nodegroups ?? {}).map(([name, want]) => {
     const g = state.nodegroups.find((x) => x.name === name);
-    // only Ready, schedulable nodes count (a NotReady or cordoned node adds no capacity)
-    const nodes = state.nodes.filter((n) => n.nodegroup === name && n.ready !== false && n.schedulable !== false).length;
+    const inGroup = state.nodes.filter((n) => n.nodegroup === name);
+    // only Ready, schedulable nodes count as capacity; a cordoned node is draining (scale-down),
+    // a registered-but-NotReady one is still joining (scale-up)
+    const nodes = inGroup.filter((n) => n.ready !== false && n.schedulable !== false).length;
+    const draining = inGroup.filter((n) => n.schedulable === false).length;
+    const joining = inGroup.filter((n) => n.ready === false && n.schedulable !== false).length;
+    const counts = { nodes, joining, draining, total: inGroup.length };
     if (!g) {
       mismatch = true;
-      return { name, want, spec: null, nodes, ok: false, note: "node group not found" };
+      return { name, want, spec: null, ...counts, ok: false, note: "node group not found" };
     }
     const spec = { min: g.min, desired: g.desired, max: g.max };
     if (g.min !== want.min || g.desired !== want.desired || g.max !== want.max) {
       mismatch = true;
-      return { name, want, spec, nodes, ok: false, note: `spec ${g.min}/${g.desired}/${g.max}, plan said ${want.min}/${want.desired}/${want.max}` };
+      return { name, want, spec, ...counts, ok: false, note: `spec ${g.min}/${g.desired}/${g.max}, plan said ${want.min}/${want.desired}/${want.max}` };
     }
     if (nodes < want.desired) {
       progressing = true;
-      return { name, want, spec, nodes, ok: false, note: `${want.desired - nodes} node(s) not Ready+schedulable yet (EC2 + bootstrap take a few minutes)` };
+      return { name, want, spec, ...counts, ok: false, note: `${want.desired - nodes} node(s) not Ready+schedulable yet (EC2 + bootstrap take a few minutes)` };
     }
-    return { name, want, spec, nodes, ok: true };
+    // scale-down: done only when the extra nodes are gone, not when the spec says so
+    if (inGroup.length > want.desired) {
+      progressing = true;
+      return { name, want, spec, ...counts, ok: false, note: `${inGroup.length - want.desired} node(s) still draining / terminating (pods move off first)` };
+    }
+    return { name, want, spec, ...counts, ok: true };
   });
-  return { verdict: mismatch ? "MISMATCH" : progressing ? "PROGRESSING" : "READY", workloads, nodegroups };
+  return { verdict: mismatch ? "MISMATCH" : progressing ? "PROGRESSING" : "READY", workloads, nodegroups, issues: rolloutIssues(state, size) };
+}
+
+/** Stuck pods (grouped by workload + reason) and node-group health issues, for the planned
+ * node groups and every workload in the target namespaces (a drain can strand any of them). */
+export function rolloutIssues(state: VerifyState, size: LiveTierSize): RolloutCheck["issues"] {
+  const out: RolloutCheck["issues"] = [];
+  const groups = new Map<string, { subject: string; reason: string; message: string; count: number }>();
+  for (const p of state.problems ?? []) {
+    const subject = p.workload ?? p.pod;
+    const key = `${subject}\u0000${p.reason}`;
+    const g = groups.get(key);
+    if (g) g.count += 1;
+    else groups.set(key, { subject, reason: p.reason, message: p.message, count: 1 });
+  }
+  for (const g of groups.values()) out.push({ kind: "pod", ...g });
+  for (const name of Object.keys(size.nodegroups ?? {})) {
+    for (const i of state.nodegroups.find((x) => x.name === name)?.issues ?? []) out.push({ kind: "nodegroup", subject: name, reason: i.code, message: i.message });
+  }
+  return out;
 }
 
 /** True when `a` is at least `b` everywhere `b` names (replicas, node-group desired). */
