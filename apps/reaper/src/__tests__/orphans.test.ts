@@ -26,7 +26,7 @@ describe("decideOrphan", () => {
     const renamed: ArgoAppInfo[] = [
       { name: "twizz-admin-pr-139", labels: { "twizz-idp/repo": "front-admin", "twizz-idp/pr": "139" }, destinationNamespace: "pr-twizz-admin-139" },
     ];
-    expect(decideOrphan(ns("pr-twizz-admin-139"), renamed, now)).toMatchObject({ action: "keep", reason: /twizz-admin-pr-139 deploys into it/ });
+    expect(decideOrphan(ns("pr-twizz-admin-139"), renamed, now)).toMatchObject({ action: "keep", reason: expect.stringMatching(/twizz-admin-pr-139 deploys into it/) });
     expect(decideOrphan(ns("pr-twizz-admin-140"), renamed, now)).toMatchObject({ action: "delete" }); // its Application is gone
     expect(decideOrphan(ns("pr-front-admin-139"), renamed, now)).toMatchObject({ action: "keep" }); // label match still holds
     expect(decideOrphan(ns("env-smoke"), [{ name: "other", labels: {}, destinationNamespace: "env-smoke" }], now)).toMatchObject({ action: "keep" });
