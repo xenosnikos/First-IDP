@@ -26,8 +26,8 @@ export function realKubeClient(): KubeClient {
     },
     async listArgoApplications() {
       const res = await custom.listNamespacedCustomObject("argoproj.io", "v1alpha1", "argocd", "applications");
-      const items = ((res.body as { items?: Array<{ metadata?: { name?: string; labels?: Record<string, string> } }> }).items ?? []);
-      return items.map((a) => ({ name: a.metadata?.name ?? "", labels: a.metadata?.labels ?? {} }));
+      const items = ((res.body as { items?: Array<{ metadata?: { name?: string; labels?: Record<string, string> }; spec?: { destination?: { namespace?: string } } }> }).items ?? []);
+      return items.map((a) => ({ name: a.metadata?.name ?? "", labels: a.metadata?.labels ?? {}, destinationNamespace: a.spec?.destination?.namespace }));
     },
     async deleteNamespace(name: string) {
       await core.deleteNamespace(name);

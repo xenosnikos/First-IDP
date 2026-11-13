@@ -21,6 +21,16 @@ describe("decideOrphan", () => {
     expect(decideOrphan(ns("pr-twizz-sentinel-139"), apps, now)).toMatchObject({ action: "delete" }); // same number, other repo
     expect(decideOrphan(ns("pr-moly-backend-7"), apps, now)).toMatchObject({ action: "keep" }); // repo-less app label still matches
   });
+  it("keeps a pr-* namespace an Application deploys into, even when its repo label differs", () => {
+    // front-admin previews: the repo was renamed, the namespace kept the old name
+    const renamed: ArgoAppInfo[] = [
+      { name: "twizz-admin-pr-139", labels: { "twizz-idp/repo": "front-admin", "twizz-idp/pr": "139" }, destinationNamespace: "pr-twizz-admin-139" },
+    ];
+    expect(decideOrphan(ns("pr-twizz-admin-139"), renamed, now)).toMatchObject({ action: "keep", reason: /twizz-admin-pr-139 deploys into it/ });
+    expect(decideOrphan(ns("pr-twizz-admin-140"), renamed, now)).toMatchObject({ action: "delete" }); // its Application is gone
+    expect(decideOrphan(ns("pr-front-admin-139"), renamed, now)).toMatchObject({ action: "keep" }); // label match still holds
+    expect(decideOrphan(ns("env-smoke"), [{ name: "other", labels: {}, destinationNamespace: "env-smoke" }], now)).toMatchObject({ action: "keep" });
+  });
   it("never touches namespaces without the preview label, whatever their name", () => {
     expect(decideOrphan(ns("env-ghost", {}), apps, now)).toMatchObject({ action: "keep", reason: /label/ });
     expect(decideOrphan(ns("pr-x-1", { "twizz-idp/preview": "false" }), apps, now)).toMatchObject({ action: "keep" });
