@@ -2,15 +2,15 @@ export const PREVIEW_LABEL = "twizz-idp/preview";
 export const DEFAULT_GRACE_MINUTES = 10;
 
 export type NamespaceInfo = { name: string; labels: Record<string, string>; createdAt: Date | undefined };
-export type ArgoAppInfo = { name: string; labels: Record<string, string> };
+export type ArgoAppInfo = { name: string; labels: Record<string, string>; destinationNamespace?: string };
 
 export type OrphanDecision = { namespace: string; action: "delete" | "keep"; reason: string };
 
 /** Conservative orphan detection for preview namespaces Argo CD created but
  * will never delete. Deletes ONLY when: the namespace carries
  * `twizz-idp/preview=true`, is older than the grace period, matches a known
- * shape, and its owning Application is gone. Everything else is kept with a
- * reason. */
+ * shape, and its owning Application is gone (none deploys into it and none
+ * matches by name or labels). Everything else is kept with a reason. */
 export function decideOrphan(
   ns: NamespaceInfo,
   apps: ArgoAppInfo[],
@@ -24,6 +24,12 @@ export function decideOrphan(
   if (!ns.createdAt) return keep("unknown creation time");
   const ageMin = (now.getTime() - ns.createdAt.getTime()) / 60_000;
   if (ageMin < graceMinutes) return keep(`only ${ageMin.toFixed(1)} min old (grace ${graceMinutes} min)`);
+
+  // An Application that deploys into the namespace owns it, whatever its labels
+  // say: front-admin previews carry twizz-idp/repo=front-admin but still live in
+  // pr-twizz-admin-<n>, which the label match below reads as another repo.
+  const deployer = apps.find((a) => a.destinationNamespace === ns.name);
+  if (deployer) return keep(`Application ${deployer.name} deploys into it`);
 
   if (ns.name.startsWith("env-")) {
     const owner = apps.find((a) => a.name === ns.name);

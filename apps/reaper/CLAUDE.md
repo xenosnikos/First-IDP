@@ -7,7 +7,8 @@ closes the two gaps GitOps leaves open:
    `teardownNamedEnv` (manifest commit + per-env secret delete). Argo prunes the
    app; the chart's PostDelete hook drops the db.
 2. **Orphan namespaces** — namespaces labelled `twizz-idp/preview=true` whose
-   Argo Application is gone (`env-<name>` → `env-<name>`; `pr-<repo>-<n>` →
+   Argo Application is gone: no Application has it as destination namespace,
+   and none matches by shape (`env-<name>` → `env-<name>`; `pr-<repo>-<n>` →
    labels `twizz-idp/repo`/`twizz-idp/pr`). Argo never deletes namespaces it
    created. Grace period 10 min; unlabelled namespaces are never touched.
 
