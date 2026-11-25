@@ -428,6 +428,10 @@ export type TierView = {
   actionable: number;
   /** distinct advisories affecting this tier */
   advisories: number;
+  /** how many of them are in CISA KEV */
+  kev: number;
+  /** worst severity among them; null: none (or no cve scan yet) */
+  highestSeverity: LifecycleSeverity | null;
   counts: Record<LifecycleComponentStatus, number>;
   /** actionable first, then by name; empty when the caller asked for counts only */
   components: ComponentRow[];
@@ -435,11 +439,23 @@ export type TierView = {
 
 const MAX_ADVISORY_IDS = 50;
 
-/** advisory rows → per-component join */
-export function advisoriesByComponent(advisories: readonly LifecycleAdvisory[]): Map<string, ComponentAdvisories> {
+/** The component an advisory row is about. PLO's cve job names a repository's
+ * lockfile `…:__lockfile` while its plan/source jobs name the same component
+ * after its display name, so an exact id match is tried first and the
+ * transitive tier then falls back to (tier, target): there is exactly one
+ * lockfile component per repository. Never a guess across tiers or targets. */
+export function advisoryComponentId(x: { componentId: string; tier: LifecycleTier; target: string }, components: ReadonlyArray<{ id: string; tier: LifecycleTier; target: string }>): string {
+  if (components.some((c) => c.id === x.componentId)) return x.componentId;
+  if (x.tier !== "npm-transitive") return x.componentId;
+  const same = components.filter((c) => c.tier === "npm-transitive" && c.target === x.target);
+  return same.length === 1 ? same[0].id : x.componentId;
+}
+
+/** advisory rows → per-component join (`components`: what plan/source reported, for `advisoryComponentId`) */
+export function advisoriesByComponent(advisories: readonly LifecycleAdvisory[], components: ReadonlyArray<{ id: string; tier: LifecycleTier; target: string }> = []): Map<string, ComponentAdvisories> {
   const out = new Map<string, ComponentAdvisories>();
   for (const a of [...advisories].sort(compareAdvisories)) {
-    for (const id of new Set(a.affected.map((x) => x.componentId))) {
+    for (const id of new Set(a.affected.map((x) => advisoryComponentId(x, components)))) {
       const cur = out.get(id) ?? { count: 0, highest: null, kev: 0, ids: [], from: "cve" as const };
       cur.count += 1;
       if (a.kev) cur.kev += 1;
@@ -451,6 +467,12 @@ export function advisoriesByComponent(advisories: readonly LifecycleAdvisory[]):
   return out;
 }
 
+/** The tiers a `source` run reports: what lives in the application repositories. A source
+ * snapshot is assembled next to the container that runs repository code, so its rows are taken
+ * for these tiers ONLY — it can never replace (or add) a control-plane, add-on, node or Helm row,
+ * whatever id it names. PLO's publisher enforces the same on its side (src/nebula/rundir.ts). */
+export const SOURCE_RUN_TIERS: readonly LifecycleTier[] = ["base-images", "npm-direct", "npm-transitive"];
+
 /** plan + source components by id; when both runs report one, the newer run wins */
 export function mergeComponents(plan: SnapshotRow | null, source: SnapshotRow | null): Array<LifecycleComponent & { snapshot: "plan" | "source" }> {
   const out = new Map<string, LifecycleComponent & { snapshot: "plan" | "source" }>();
@@ -461,14 +483,22 @@ export function mergeComponents(plan: SnapshotRow | null, source: SnapshotRow | 
     .filter((x): x is { row: SnapshotRow; snapshot: "plan" | "source" } => !!x.row)
     // older first, so the newer run overwrites
     .sort((a, b) => a.row.finishedAt.getTime() - b.row.finishedAt.getTime());
-  for (const { row, snapshot } of ordered) for (const c of row.data.components ?? []) out.set(c.id, { ...c, snapshot });
+  for (const { row, snapshot } of ordered) {
+    for (const c of row.data.components ?? []) {
+      if (snapshot === "source" && !SOURCE_RUN_TIERS.includes(c.tier)) continue;
+      // …and a source row never takes the place of an infrastructure row a plan reported under that id
+      if (snapshot === "source" && out.has(c.id) && !SOURCE_RUN_TIERS.includes(out.get(c.id)!.tier)) continue;
+      out.set(c.id, { ...c, snapshot });
+    }
+  }
   return [...out.values()];
 }
 
 export function buildTiers(sel: SnapshotSelection<SnapshotRow>, opts: { components?: boolean } = {}): TierView[] {
   const cve = sel.cve.data?.data.advisories;
-  const joined = cve ? advisoriesByComponent(cve) : null;
-  const rows = mergeComponents(sel.plan.data, sel.source.data).map((c): ComponentRow => {
+  const merged = mergeComponents(sel.plan.data, sel.source.data);
+  const joined = cve ? advisoriesByComponent(cve, merged) : null;
+  const rows = merged.map((c): ComponentRow => {
     const advisories: ComponentAdvisories = joined
       ? (joined.get(c.id) ?? { count: 0, highest: null, kev: 0, ids: [], from: "cve" })
       : { count: c.security?.advisories ?? 0, highest: null, kev: 0, ids: [], from: "plan" };
@@ -479,8 +509,12 @@ export function buildTiers(sel: SnapshotSelection<SnapshotRow>, opts: { componen
     const counts = Object.fromEntries(LIFECYCLE_COMPONENT_STATUSES.map((s) => [s, 0])) as Record<LifecycleComponentStatus, number>;
     for (const c of mine) counts[c.status] += 1;
     const ids = new Set<string>(mine.map((c) => c.id));
-    const advisories = cve ? cve.filter((a) => a.affected.some((x) => ids.has(x.componentId))).length : mine.reduce((n, c) => n + c.advisories.count, 0);
-    return { tier, label: TIER_LABEL[tier], total: mine.length, actionable: mine.filter((c) => c.actionable).length, advisories, counts, components: opts.components === false ? [] : mine };
+    // an advisory counts for the tier it names even when no plan/source component joins to it:
+    // a tier must never read "0 advisories" because two jobs spell a component id differently
+    const advisories = cve ? cve.filter((a) => a.affected.some((x) => x.tier === tier || ids.has(x.componentId))).length : mine.reduce((n, c) => n + c.advisories.count, 0);
+    const kev = cve ? cve.filter((a) => a.kev && a.affected.some((x) => x.tier === tier || ids.has(x.componentId))).length : 0;
+    const worst = cve ? cve.filter((a) => a.affected.some((x) => x.tier === tier || ids.has(x.componentId))).reduce<LifecycleSeverity | null>((w, a) => (w === null || severityRank(a.severity) > severityRank(w) ? a.severity : w), null) : null;
+    return { tier, label: TIER_LABEL[tier], total: mine.length, actionable: mine.filter((c) => c.actionable).length, advisories, kev, highestSeverity: worst, counts, components: opts.components === false ? [] : mine };
   });
 }
 
@@ -526,7 +560,8 @@ export function buildAdvisories(sel: SnapshotSelection<SnapshotRow>, now: Date):
   const list = [...(scan?.data.advisories ?? [])].sort(compareAdvisories);
   const prev = scan?.ok && sel.cve.previous?.data.advisories ? sel.cve.previous : null;
   const before = prev ? knownIds(prev.data.advisories ?? []) : null;
-  const components = new Map(mergeComponents(sel.plan.data, sel.source.data).map((c) => [c.id, c]));
+  const merged = mergeComponents(sel.plan.data, sel.source.data);
+  const components = new Map(merged.map((c) => [c.id, c]));
   const counts: Record<LifecycleSeverity, number> = { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 };
   const tiers = new Set<LifecycleTier>();
   const environments = new Set<string>();
@@ -539,7 +574,7 @@ export function buildAdvisories(sel: SnapshotSelection<SnapshotRow>, now: Date):
       affected: a.affected.map((x) => {
         tiers.add(x.tier);
         for (const e of x.environments) environments.add(e);
-        const c = components.get(x.componentId);
+        const c = components.get(advisoryComponentId(x, merged));
         return { ...x, known: !!c, status: c?.status ?? null, pr: c?.pr ?? null };
       }),
     };
@@ -688,6 +723,13 @@ export function isBundleImageTag(tag: string | null | undefined, headSha: string
   return new RegExp(`^nb-${PLO_ENV_PREFIX}[a-z0-9-]{1,${ENV_NAME_MAX - PLO_ENV_PREFIX.length}}-${headSha.slice(0, 12)}$`).test(tag);
 }
 
+/** The ONE image tag of a bundle preview env at a commit: `nb-<envName>-<sha12>`
+ * (the central builder's `nebulaTag`). Staging runs the bundle exactly when its
+ * tag is this — not merely "some nb-plo-* tag at that commit". */
+export function bundleImageTag(envName: string, headSha: string): string {
+  return `nb-${envName}-${headSha.slice(0, 12)}`;
+}
+
 /** A Nebula registry service a bundled repository may map to. */
 export type LifecycleServiceInput = {
   /** registry name, e.g. `twizz-sentinel` */
@@ -716,9 +758,40 @@ export type PreviewEnvInput = {
   buildReason: string | null;
   /** Argo verdict of Application `env-<name>` (lib/nebula/status `argoWord`); null when not read */
   argo: StatusWord | null;
+  /** Argo reports the env's pods on exactly `imageTag` (`argoRunsImage`); false when it reports
+   * another image, no image, or was not read. Synced + Healthy alone is NOT this: right after a
+   * manifest changes, Argo still says Synced + Healthy about the image it deployed before. */
+  runsImage: boolean;
+  /** when Argo finished the sync that put the env where it is now; null: unknown */
+  rolledOutAt: string | null;
+  /** the Service port the manifest records (`config.port`); null: not recorded. The preview smoke
+   * calls the env's Service inside the cluster on this port. */
+  port: number | null;
+  /** the manifest's owner is a Nebula operator — the only people who can create a bundle preview */
+  trusted: boolean;
   expiresAt: string;
   url: string;
 };
+
+/** Does an Argo Application (its `status.summary.images`) run `ecrRepo:tag` and
+ * nothing else from that repository? `images` undefined/empty → false: an
+ * Application that reports no image proves nothing (fail closed). */
+export function argoRunsImage(images: readonly string[] | null | undefined, ecrRepo: string, tag: string | null | undefined): boolean {
+  if (!images || images.length === 0 || !tag || !ecrRepo) return false;
+  let seen = false;
+  for (const image of images) {
+    const slash = image.lastIndexOf("/");
+    const rest = slash < 0 ? image : image.slice(slash + 1);
+    const at = rest.indexOf("@");
+    const colon = rest.indexOf(":");
+    const name = at >= 0 && (colon < 0 || at < colon) ? rest.slice(0, at) : colon >= 0 ? rest.slice(0, colon) : rest;
+    if (name !== ecrRepo) continue;
+    // pinned by digest, untagged, or another tag of the same repository: not (only) this image
+    if (at >= 0 || colon < 0 || rest.slice(colon + 1) !== tag) return false;
+    seen = true;
+  }
+  return seen;
+}
 
 /** An OPEN promotion PR on the release train. */
 export type PromotionInput = { service: string; imageTag: string; number: number; url: string; headSha: string };
@@ -731,6 +804,10 @@ export type StagingTargetInput = {
   currentTag: string | null;
   /** Argo verdict of `staging-<service>`; null when not read */
   argo: StatusWord | null;
+  /** Argo reports staging's pods on exactly `currentTag` (see `argoRunsImage`) */
+  runsImage: boolean;
+  /** when Argo finished the sync that put staging where it is now; null: unknown */
+  rolledOutAt: string | null;
   /** set when this service's staging state could not be read */
   error: string | null;
 };
@@ -786,9 +863,18 @@ export type SmokeVerdict = {
 };
 
 /** The verdict for (scope, bundleKey) is that of the LATEST request for it:
- * re-running suspends an older pass until the new run finishes. A result
- * counts only when it came back for that request (snapshot.requestId), names
- * the same scope and bundle, and every check passed (at least one). */
+ * re-running suspends an older pass until the new run finishes.
+ *
+ * Who is trusted for what: the REQUEST row is Nebula's own (an operator made
+ * it through the gate; its id, scope, bundle key, targets and times are
+ * Nebula's). The RESULT is whatever the holder of the ingest token posted. So
+ * a result counts only when it is bound to the request on every side Nebula
+ * controls: it names that request (snapshot.requestId), it is the ONE run the
+ * request was answered with (request.runId — bound at ingest, while the
+ * request was claimed, and never rebindable), it arrived after the request was
+ * claimed and not after it was completed, it names the same scope and bundle,
+ * every check passed (at least one) and every check is one of the request's
+ * own targets. A later snapshot can therefore never change this verdict. */
 export function smokeVerdict(scope: LifecycleSmokeScope, bundleKey: string, requests: readonly RequestRow[], smokeRows: readonly SnapshotRow[]): SmokeVerdict {
   const none = { runId: null, finishedAt: null, results: [] };
   const mine = requests
@@ -805,11 +891,20 @@ export function smokeVerdict(scope: LifecycleSmokeScope, bundleKey: string, requ
   if (req.status === "expired") return { verdict: "none", detail: "the last request expired before plo-dispatch claimed it", request, ...none };
   if (req.status === "failed") return { verdict: "fail", detail: req.error ? `the smoke run failed: ${req.error}` : "the smoke run failed", request, ...none };
   if (req.status !== "done") return { verdict: "none", detail: `request is in an unknown state "${req.status}"`, request, ...none };
-  const snap = [...smokeRows].sort(newestFirst).find((s) => s.job === "smoke" && s.data.requestId === req.id && !!s.data.smoke);
+  if (!req.runId) return { verdict: "fail", detail: "the request completed but no smoke result was received for it", request, ...none };
+  const snap = smokeRows.find((s) => s.job === "smoke" && s.runId === req.runId && s.data.requestId === req.id && !!s.data.smoke);
   if (!snap || !snap.data.smoke) return { verdict: "fail", detail: "the request completed but no smoke result was received for it", request, ...none };
   const smoke = snap.data.smoke;
   const got = { runId: snap.runId, finishedAt: snap.finishedAt.toISOString(), results: smoke.results };
   if (smoke.scope !== scope || smoke.bundleKey !== bundleKey) return { verdict: "fail", detail: "the result received is for a different scope or bundle", request, ...got };
+  // received = the server's own clock at ingest (createdAt), never the run's self-reported times
+  const received = snap.createdAt.getTime();
+  if (!req.claimedAt || received < req.claimedAt.getTime()) return { verdict: "fail", detail: "the result received predates the request it claims to answer", request, ...got };
+  if (!req.finishedAt || received > req.finishedAt.getTime()) return { verdict: "fail", detail: "the result was received after the request had been completed", request, ...got };
+  const params = LifecycleSmokeParams.safeParse(req.params);
+  const targets = params.success ? params.data.targets : [];
+  const foreign = smoke.results.filter((r) => !targets.some((t) => r.name.startsWith(`${t.name}/`) && r.url.startsWith(`${t.baseUrl}/`)));
+  if (foreign.length && smoke.results.every((r) => r.ok)) return { verdict: "fail", detail: `${foreign.length} of ${smoke.results.length} checks are not checks of the requested targets`, request, ...got };
   if (!snap.ok) return { verdict: "fail", detail: snap.data.error ? `the smoke run failed: ${snap.data.error}` : "the smoke run reported a failure", request, ...got };
   if (smoke.results.length === 0) return { verdict: "fail", detail: "the smoke run checked nothing", request, ...got };
   const failed = smoke.results.filter((r) => !r.ok);
@@ -831,10 +926,11 @@ export type BundleView = LifecycleBundle & {
   note: string | null;
   /** name the preview env gets (`plo-<yymm>-<service>`); null when not previewable */
   envName: string | null;
-  /** the live named env built from this bundle's head sha, if any */
+  /** THE preview env of this bundle: named `envName`, built by an operator from exactly this
+   * repository, bundle branch and head sha — never merely "some plo-* env on that commit" */
   env: (PreviewEnvInput & { up: boolean }) | null;
   /** promotable services only */
-  staging: { host: string; currentTag: string | null; argo: StatusWord | null; deployed: boolean; promotion: PromotionInput | null; error: string | null } | null;
+  staging: { host: string; currentTag: string | null; argo: StatusWord | null; runsImage: boolean; rolledOutAt: string | null; deployed: boolean; promotion: PromotionInput | null; error: string | null } | null;
 };
 
 export type PreviewStepKey = "bundle-ready" | "preview-requested" | "preview-up" | "smoke-preview" | "stg-requested" | "stg-deployed" | "smoke-stg" | "awaiting-signoff" | "signed-off";
@@ -938,26 +1034,45 @@ export function buildPreview(input: PreviewInput): PreviewView {
   const nowMs = input.now.getTime();
 
   const targets = bundleTargets(src?.data.bundles ?? [], input.services);
+  const notMine: string[] = [];
   const bundles = targets.map((t): BundleView => {
     const { bundle, service } = t;
-    const live = (input.envs ?? []).filter(
-      (e) => t.previewable && e.name.startsWith(PLO_ENV_PREFIX) && !!e.sourceRepo && sameRepo(e.sourceRepo, bundle.github) && e.sourceSha === bundle.headSha && !(Date.parse(e.expiresAt) <= nowMs),
-    );
-    // a deployable env beats one still building, which beats a failed build
-    const rank = { ready: 0, building: 1, failed: 2 } as const;
-    const env = [...live].sort((a, b) => rank[a.build] - rank[b.build] || a.name.localeCompare(b.name))[0] ?? null;
+    // The bundle's preview env is ONE env, by its exact deterministic name. Whatever else carries
+    // that name — built from another commit or branch, for another service, or created by someone
+    // who is not an operator — is not adopted: it is named as a blocker and the flow stops there.
+    let env: PreviewEnvInput | null = null;
+    for (const e of (input.envs ?? []).filter((x) => t.previewable && !!t.envName && x.name === t.envName && !(Date.parse(x.expiresAt) <= nowMs))) {
+      const why = !e.sourceRepo || !sameRepo(e.sourceRepo, bundle.github)
+        ? "it is not built from this repository"
+        : e.sourceSha !== bundle.headSha
+          ? `it is built from ${(e.sourceSha ?? "another commit").slice(0, 7)}, not from the bundle head ${bundle.headSha!.slice(0, 7)}`
+          : e.sourceRef !== bundle.branch
+            ? `it is built from branch ${e.sourceRef ?? "?"}, not from ${bundle.branch}`
+            : e.service !== service?.service
+              ? `it runs service ${e.service}, not ${service?.service}`
+              : !e.trusted
+                ? `it was created by ${e.owner}, who is not a Nebula operator`
+                : null;
+      if (why) notMine.push(`${e.name} exists but is not this bundle's preview (${why}) — tear it down on /environments, then create the preview`);
+      else env = e;
+    }
+    const expectedTag = t.envName && bundle.headSha ? bundleImageTag(t.envName, bundle.headSha) : null;
     const promotable = !!service?.promotable && t.previewable;
     let staging: BundleView["staging"] = null;
     if (promotable && service && bundle.headSha) {
       const st = input.staging?.find((s) => s.service === service.service) ?? null;
-      const promotion = (input.promotions ?? []).find((p) => p.service === service.service && isBundleImageTag(p.imageTag, bundle.headSha!)) ?? null;
+      const promotion = (input.promotions ?? []).find((p) => p.service === service.service && p.imageTag === expectedTag) ?? null;
       const error = input.staging === null ? "staging state could not be read" : !st ? "no staging target reported for this service" : st.error;
       staging = {
         host: st?.host ?? service.stagingHost ?? "",
         currentTag: st?.currentTag ?? null,
         argo: st?.argo ?? null,
-        // gitops says staging is on this bundle's image AND Argo confirms it rolled out
-        deployed: !error && isBundleImageTag(st?.currentTag, bundle.headSha) && st?.argo === "PASS",
+        runsImage: !!st?.runsImage,
+        rolledOutAt: st?.rolledOutAt ?? null,
+        // gitops says staging is on THIS bundle's image, Argo is Synced + Healthy, AND Argo reports
+        // the pods on that very image. The last part is what makes it true: for the minutes between
+        // a promotion merge and Argo's next poll, Synced + Healthy still describes the previous image.
+        deployed: !error && !!expectedTag && st?.currentTag === expectedTag && st?.argo === "PASS" && st.runsImage === true,
         promotion,
         error,
       };
@@ -969,7 +1084,7 @@ export function buildPreview(input: PreviewInput): PreviewView {
       previewable: t.previewable,
       note: t.note,
       envName: t.envName,
-      env: env ? { ...env, up: env.build === "ready" && !!env.imageTag && env.argo === "PASS" } : null,
+      env: env ? { ...env, up: env.build === "ready" && !!env.imageTag && env.imageTag === expectedTag && env.argo === "PASS" && env.runsImage === true } : null,
       staging,
     };
   });
@@ -989,8 +1104,12 @@ export function buildPreview(input: PreviewInput): PreviewView {
   });
 
   const bundled = bundles.filter((b) => !!b.headSha);
-  if (!src || !key || bundled.length === 0) {
-    const why = !src ? "no source run has reported yet" : !key ? "the last source run produced no bundle" : "the last source run bundled nothing";
+  // a failed source run may carry a partial bundle: it is shown, and nothing can be done with it
+  const failedRun = !!src && !src.ok;
+  if (failedRun) blockers.push(`the source run ${src!.runId} FAILED${src!.data.error ? ` (${src!.data.error})` : ""} and no successful one is on record — its bundle is partial and cannot be previewed, deployed or signed off; wait for the next source run`);
+  else if (sel.source.last && src && sel.source.last.id !== src.id && !sel.source.last.ok) blockers.push(`the newest source run ${sel.source.last.runId} failed${sel.source.last.data.error ? ` (${sel.source.last.data.error})` : ""}; showing the bundle of the last successful run ${src.runId}`);
+  if (!src || !key || bundled.length === 0 || failedRun) {
+    const why = !src ? "no source run has reported yet" : failedRun ? "the last source run failed, so there is no bundle to act on" : !key ? "the last source run produced no bundle" : "the last source run bundled nothing";
     const refuse = no(`there is no bundle: ${why}`);
     return done("no-bundle", why, { preview: emptySmoke, stg: emptySmoke }, null, { createPreview: refuse, smokePreview: refuse, deployStg: refuse, smokeStg: refuse, signoff: refuse }, true);
   }
@@ -1003,6 +1122,7 @@ export function buildPreview(input: PreviewInput): PreviewView {
   const conflicts = bundles.reduce((n, b) => n + b.conflicts.length, 0);
   if (conflicts) blockers.push(`${conflicts} pull request${conflicts === 1 ? "" : "s"} could not be merged into the bundle (conflicts)`);
   for (const b of bundles) if (!b.previewable && b.note && b.headSha) blockers.push(`${b.github}: ${b.note}`);
+  blockers.push(...notMine);
   if (expected.length === 0) blockers.push("no bundled repository maps to a Nebula service, so there is nothing to preview or sign off here");
 
   const withEnv = expected.filter((b) => b.env);
@@ -1010,21 +1130,49 @@ export function buildPreview(input: PreviewInput): PreviewView {
   const failedBuilds = expected.filter((b) => b.env?.build === "failed");
   const previewUp = expected.length > 0 && expected.every((b) => b.env?.up);
   for (const b of failedBuilds) blockers.push(`${b.env!.name}: build failed${b.env!.buildReason ? ` (${b.env!.buildReason})` : ""}`);
-  for (const b of expected) if (b.env && b.env.build === "ready" && !b.env.up) blockers.push(`${b.env.name}: Argo reports ${b.env.argo ?? "nothing"} — not confirmed up`);
+  for (const b of expected) {
+    if (!b.env || b.env.build !== "ready" || b.env.up) continue;
+    if (b.env.argo !== "PASS") blockers.push(`${b.env.name}: Argo reports ${b.env.argo ?? "nothing"} — not confirmed up`);
+    else blockers.push(`${b.env.name}: Argo is Synced + Healthy but does not report the pods on ${b.env.imageTag ?? "the bundle image"} yet — not confirmed up`);
+  }
 
   const stgDeployed = hasStagingRoute && promotable.every((b) => b.staging?.deployed);
-  const stgStarted = promotable.some((b) => b.staging && (b.staging.deployed || !!b.staging.promotion || isBundleImageTag(b.staging.currentTag, b.headSha!)));
+  const onBundleTag = (b: BundleView) => !!b.staging && !!b.envName && b.staging.currentTag === bundleImageTag(b.envName, b.headSha!);
+  const stgStarted = promotable.some((b) => b.staging && (b.staging.deployed || !!b.staging.promotion || onBundleTag(b)));
   for (const b of promotable) {
     if (b.staging?.error) blockers.push(`${b.service} staging: ${b.staging.error}`);
-    else if (b.staging && !b.staging.deployed && isBundleImageTag(b.staging.currentTag, b.headSha!)) blockers.push(`${b.service} staging: gitops is on the bundle image but Argo reports ${b.staging.argo ?? "nothing"}`);
+    else if (b.staging && !b.staging.deployed && onBundleTag(b))
+      blockers.push(
+        b.staging.argo === "PASS"
+          ? `${b.service} staging: gitops is on the bundle image but Argo does not report the pods on it yet (it has not rolled out)`
+          : `${b.service} staging: gitops is on the bundle image but Argo reports ${b.staging.argo ?? "nothing"}`,
+      );
   }
 
   const signed = [...input.signoffs].filter((s) => s.bundleKey === key).sort((a, b) => a.at.getTime() - b.at.getTime())[0];
   const signoff = signed ? { by: signed.actor, at: signed.at.toISOString() } : null;
 
-  const previewPass = smoke.preview.verdict === "pass";
-  const stgPass = smoke.stg.verdict === "pass";
-  const signoffReady = hasStagingRoute ? stgDeployed && stgPass : expected.length > 0 && previewPass;
+  // A pass is evidence about what runs NOW only when it was requested after that last rolled out.
+  // Unknown rollout time = not evidence (fail closed). A preview env that has since expired keeps
+  // its recorded pass: the request was made by Nebula for exactly this bundle key.
+  const requestedAt = (v: SmokeVerdict) => (v.request ? Date.parse(v.request.createdAt) : NaN);
+  const after = (v: SmokeVerdict, rolledOutAt: string | null) => {
+    const r = rolledOutAt ? Date.parse(rolledOutAt) : NaN;
+    return Number.isFinite(r) && Number.isFinite(requestedAt(v)) && requestedAt(v) > r;
+  };
+  const previewStale = smoke.preview.verdict === "pass" ? expected.filter((b) => b.env && !after(smoke.preview, b.env.rolledOutAt)) : [];
+  const stgStale = smoke.stg.verdict === "pass" ? promotable.filter((b) => !after(smoke.stg, b.staging?.rolledOutAt ?? null)) : [];
+  const stale = (label: string, env: string, at: string | null) => (at ? `${env} rolled out at ${at}, after the ${label} smoke was requested — run the ${label} smoke again` : `Argo does not say when ${env} rolled out, so the ${label} smoke cannot be tied to what runs now — run the ${label} smoke again`);
+  const previewStaleWhy = previewStale.length ? stale("preview", previewStale[0].env!.name, previewStale[0].env!.rolledOutAt) : null;
+  const stgStaleWhy = stgStale.length ? stale("staging", `${stgStale[0].service} staging`, stgStale[0].staging?.rolledOutAt ?? null) : null;
+  if (previewStaleWhy) blockers.push(previewStaleWhy);
+  if (stgStaleWhy && stgDeployed) blockers.push(stgStaleWhy);
+
+  const previewPass = smoke.preview.verdict === "pass" && !previewStaleWhy;
+  const stgPass = smoke.stg.verdict === "pass" && !stgStaleWhy;
+  // EVERY bundled service must have passed its preview smoke: the staging smoke only ever
+  // calls the release-train services, so it can never stand in for the others.
+  const signoffReady = expected.length > 0 && previewPass && (hasStagingRoute ? stgDeployed && stgPass : true);
 
   let state: PreviewState;
   let detail: string;
@@ -1034,12 +1182,15 @@ export function buildPreview(input: PreviewInput): PreviewView {
   } else if (signoffReady) {
     state = "awaiting-signoff";
     detail = hasStagingRoute ? "the staging smoke passed — waiting for an operator to sign off" : "the preview smoke passed and nothing here has a staging route in Nebula — waiting for an operator to sign off";
+  } else if (hasStagingRoute && stgDeployed && stgPass && !previewPass) {
+    state = "smoke-preview-fail";
+    detail = `the staging smoke passed, but the preview smoke for this bundle has not (${previewStaleWhy ?? smoke.preview.detail}) — every bundled service must pass its preview smoke before the sign-off`;
   } else if (stgDeployed && smoke.stg.verdict === "fail") {
     state = "smoke-stg-fail";
     detail = smoke.stg.detail;
   } else if (stgDeployed) {
     state = "stg-deployed";
-    detail = smoke.stg.verdict === "running" ? smoke.stg.detail : "staging runs the bundle — run the staging smoke";
+    detail = smoke.stg.verdict === "running" ? smoke.stg.detail : (stgStaleWhy ?? "staging runs the bundle — run the staging smoke");
   } else if (stgStarted) {
     state = "stg-requested";
     detail = "the staging promotion is open or rolling out";
@@ -1051,7 +1202,7 @@ export function buildPreview(input: PreviewInput): PreviewView {
     detail = smoke.preview.detail;
   } else if (previewUp) {
     state = "preview-up";
-    detail = smoke.preview.verdict === "running" ? smoke.preview.detail : "every preview env is up — run the preview smoke";
+    detail = smoke.preview.verdict === "running" ? smoke.preview.detail : (previewStaleWhy ?? "every preview env is up — run the preview smoke");
   } else if (withEnv.length > 0) {
     state = "preview-requested";
     detail = `${withEnv.filter((b) => b.env!.up).length} of ${expected.length} preview envs up`;
@@ -1073,7 +1224,7 @@ export function buildPreview(input: PreviewInput): PreviewView {
       (!hasStagingRoute
         ? no("no bundled service is on the release train: no staging route in Nebula (deploys via the repo's own pipeline on merge)")
         : !previewPass
-          ? no("the latest preview smoke for this bundle has not passed")
+          ? no(previewStaleWhy ?? "the latest preview smoke for this bundle has not passed")
           : input.staging === null || input.promotions === null
             ? no("staging state could not be read")
             : toPromote.length === 0
@@ -1087,9 +1238,11 @@ export function buildPreview(input: PreviewInput): PreviewView {
       nothing ??
       (signoffReady
         ? yes
-        : hasStagingRoute
-          ? no(!stgDeployed ? "staging is not running this bundle" : "the latest staging smoke for this bundle has not passed")
-          : no("the latest preview smoke for this bundle has not passed")),
+        : hasStagingRoute && !stgDeployed
+          ? no("staging is not running this bundle")
+          : hasStagingRoute && !stgPass
+            ? no(stgStaleWhy ?? "the latest staging smoke for this bundle has not passed")
+            : no(previewStaleWhy ?? "the latest preview smoke for this bundle has not passed")),
   };
   return done(state, detail, smoke, signoff, actions, hasStagingRoute);
 }

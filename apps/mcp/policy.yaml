@@ -35,7 +35,7 @@ write_tools:
       imageTag: ["build-*"]              # immutable tags only; aliases refused in code
       name: ["*"]
     deny:
-      name: ["*prod*", "*staging*", "shared", "dev"]
+      name: ["*prod*", "*staging*", "shared", "dev", "plo-*"]   # plo-* is reserved for Lifecycle bundle previews (§N9)
       # ttlHours 1..336 and the live-env cap (NEBULA_MAX_NAMED_ENVS, default 6) enforced in code
 
   teardown_named_env:
@@ -184,28 +184,42 @@ write_tools:
       kind: ["plan", "cve"]              # read-only runs; smoke has its own tool
 
   lifecycle_create_preview:
+    each: [envs]                         # a space-joined list: every NAME must match, not the joined string
     allow:
       bundleKey: ["*"]
       setHash: ["*"]                     # the exact (repository, commit) set
-      envs: ["plo-*"]                    # space-joined names it creates; each also checked as create_env_from_repo
+      envs: ["plo-*"]                    # the names it creates; each also checked as create_env_from_repo
       ttlHours: ["72"]
     deny:
       envs: ["*staging*"]
       # all-or-nothing against the live-env cap, and refused if a bundle branch moved: enforced in code
 
   lifecycle_request_smoke:
+    each: [targets]                      # a space-joined list: every PAIR must match, not the joined string
     allow:
       scope: ["preview", "stg"]
       bundleKey: ["*"]
       setHash: ["*"]
-      targets: ["*.prv.twizz.com"]       # service=origin pairs built in code; each origin re-checked in code
+      # service=origin pairs built in code; each origin is re-checked in code against the form of its scope:
+      #   preview  the env's Service inside the cluster (the public preview host is behind the SSO gate)
+      #   stg      the fixed staging host of the release train
+      targets:
+        - "*=http://*.env-plo-*.svc.cluster.local"
+        - "*=http://*.env-plo-*.svc.cluster.local:*"
+        - "*=https://*-stg.prv.twizz.com"
+    deny:
+      # one "=", nothing after the host but (for a Service) one port, and never a plo-* host as staging
+      targets: ["*=*=*", "*=*://*/*", "*=*://*@*", "*=*://*?*", "*=*://*#*", "*=https://*:*", "*=http://*:*:*", "*=https://plo-*"]
 
   lifecycle_deploy_stg:
+    each: [promote]                      # a space-joined list: every PAIR must match, not the joined string
     allow:
       scope: ["stg"]
       bundleKey: ["*"]
       setHash: ["*"]
       promote: ["*:nb-plo-*"]            # service:tag pairs; each also checked as promote_release
+    deny:
+      promote: ["*:*:*"]                 # exactly one service and one tag per pair
       # opens promotion PRs only; merging stays merge_promotion
 
   lifecycle_signoff:

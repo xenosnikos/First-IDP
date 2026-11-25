@@ -6,6 +6,7 @@
 // Types come from the router (inferRouterOutputs); nothing here re-declares a
 // server DTO, and every import from the server side is type-only.
 import type { inferRouterOutputs } from "@trpc/server";
+import { lifecycleSafeLink } from "@twizz-idp/shared";
 import type { AppRouter } from "@/server/routers/_app";
 import { fmtDuration, type StatusWord } from "./status";
 
@@ -328,16 +329,50 @@ export function tierSummary(t: Pick<TierView, "total" | "counts" | "advisories">
   return [plural(t.total, "component"), ...parts, ...(t.advisories > 0 ? [plural(t.advisories, "advisory", "advisories")] : [])].join(" · ");
 }
 
-/** The word a whole tier carries in its plate header. */
-export function tierWord(t: Pick<TierView, "total" | "actionable" | "counts">): StatusWord {
-  if (t.total === 0) return "UNKNOWN";
+/** The word a whole tier carries in its plate header: the most urgent thing
+ * in it. Advisories count — a tier whose components are all "current" is not
+ * OK while one of them carries a known-exploited, critical or high advisory
+ * (a zero-day with no fix yet, or a plan that lags the daily CVE scan), and
+ * never green while it carries any advisory at all. */
+export function tierWord(t: Pick<TierView, "total" | "actionable" | "counts"> & Partial<Pick<TierView, "advisories" | "kev" | "highestSeverity">>): StatusWord {
+  const advisories = t.advisories ?? 0;
+  if (t.total === 0) return advisories > 0 ? "WATCH" : "UNKNOWN";
   if (t.counts.failed > 0) return "FAIL";
   if (t.counts.blocked > 0) return "DENIED";
   if (t.counts["awaiting-approval"] > 0) return "AWAITING HUMAN";
   if (t.counts.escalated > 0) return "WATCH";
+  if ((t.kev ?? 0) > 0 || t.highestSeverity === "critical" || t.highestSeverity === "high") return "WATCH";
   if (t.counts.outdated > 0) return "PENDING";
   if (t.counts["pr-open"] > 0) return "RUNNING";
+  if (advisories > 0) return "WATCH";
   return "OK";
+}
+
+// ── links ─────────────────────────────────────────────────────────────────
+
+const PREVIEW_HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.prv\.twizz\.com$/;
+
+/** The `href` an outbound link on /lifecycle may carry, or null (render the
+ * label as plain text). Two kinds of target exist: the hosts a snapshot may
+ * link to (GitHub, the advisory databases — the shared allowlist, enforced at
+ * ingest too) and Nebula's own preview-domain hosts. `https:` only, exact
+ * host, no credentials, no port. A `javascript:` or look-alike URL can
+ * therefore neither crash the render nor send an operator somewhere else. */
+export function safeExternalHref(raw: unknown): string | null {
+  const listed = lifecycleSafeLink(raw);
+  if (listed) return listed;
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > 2000) return null;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u0020\u007f\\]/.test(raw)) return null;
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:" || u.username || u.password || u.port || !PREVIEW_HOST_RE.test(u.hostname)) return null;
+  if (!raw.toLowerCase().startsWith(`https://${u.hostname}/`) && raw.toLowerCase() !== `https://${u.hostname}`) return null;
+  return u.href;
 }
 
 // ── advisories: filter ────────────────────────────────────────────────────

@@ -147,7 +147,7 @@
       }
     },
     {
-      "id": "npm-dependency:twizz-sentinel:lockfile (transitive security fixes)",
+      "id": "npm-dependency:twizz-sentinel:__lockfile",
       "tier": "npm-transitive",
       "domain": "npm-dependency",
       "name": "lockfile (transitive security fixes)",
@@ -190,7 +190,7 @@
       ],
       "componentIds": [
         "npm-dependency:twizz-sentinel:zod",
-        "npm-dependency:twizz-sentinel:lockfile (transitive security fixes)"
+        "npm-dependency:twizz-sentinel:__lockfile"
       ],
       "pr": {
         "repo": "twizz-app/twizz-sentinel",
@@ -238,7 +238,7 @@
       "componentIds": [
         "base-image:Moly-backend:Dockerfile node:20.11.0-alpine3.19"
       ],
-      "escalationUrl": "https://github.com/twizz-app/Moly-backend/issues/320"
+      "escalationUrl": "https://github.com/twizz-app/platform-lifecycle-orchestrator/issues/320"
     }
   ],
   "bundles": [

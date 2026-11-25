@@ -82,14 +82,23 @@ export function request(kind: string, over: Partial<RequestRow> = {}): RequestRo
   return { id: `req${String(reqSeq).padStart(5, "0")}`, kind, params: {}, requestedBy: "nick", status: "pending", createdAt: ago(10 * 60_000), claimedAt: null, finishedAt: null, runId: null, error: null, ...over };
 }
 
+/** where a preview smoke calls the sentinel env of the 2026-11 bundle: its Service inside the cluster (the
+ * public preview host is behind the ingress SSO gate), and the fixed staging host a stg smoke calls */
+export const PREVIEW_SVC = "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090";
+export const STG_ORIGIN = "https://sentinel-stg.prv.twizz.com";
+
 export function smokeRequest(scope: "preview" | "stg", key: string, over: Partial<RequestRow> = {}): RequestRow {
-  return request("smoke", { params: { scope, bundleKey: key, targets: [{ name: "twizz-sentinel", baseUrl: "https://plo-2611-twizz-sentinel.prv.twizz.com" }] }, ...over });
+  return request("smoke", { params: { scope, bundleKey: key, targets: [{ name: "twizz-sentinel", baseUrl: scope === "stg" ? STG_ORIGIN : PREVIEW_SVC }] }, ...over });
 }
 
+/** The result of `req` as plo-dispatch reports it: under the run id the request was answered with
+ * (`req.runId`), one check per entry in `results`, each a check OF the request's first target. */
 export function smokeSnap(req: RequestRow, scope: "preview" | "stg", key: string, results: Array<{ ok: boolean }>, at: Date = ago(5 * 60_000), doc: Partial<LifecycleSnapshotDoc> = {}): SnapshotRow {
+  const target = (req.params as { targets?: Array<{ name: string; baseUrl: string }> }).targets?.[0] ?? { name: "x", baseUrl: "https://x.prv.twizz.com" };
   return snap("smoke", at, {
+    ...(req.runId ? { runId: req.runId } : {}),
     requestId: req.id,
-    smoke: { scope, bundleKey: key, results: results.map((r, i) => ({ name: `check-${i}`, url: `https://x.prv.twizz.com/c${i}`, ok: r.ok, status: r.ok ? 200 : 503, ms: 40, detail: r.ok ? "ok" : "unexpected status" })) },
+    smoke: { scope, bundleKey: key, results: results.map((r, i) => ({ name: `${target.name}/check-${i}`, url: `${target.baseUrl}/c${i}`, ok: r.ok, status: r.ok ? 200 : 503, ms: 40, detail: r.ok ? "ok" : "unexpected status" })) },
     ...doc,
   });
 }
@@ -106,6 +115,11 @@ export function env(name: string, repo: string, sha: string, over: Partial<Previ
     build: "ready",
     buildReason: null,
     argo: "PASS",
+    // Argo reports the pods on this image, rolled out three hours ago; created by an operator
+    runsImage: true,
+    rolledOutAt: ago(3 * HOUR).toISOString(),
+    port: 8090,
+    trusted: true,
     expiresAt: new Date(NOW.getTime() + 48 * HOUR).toISOString(),
     url: `https://${name}.prv.twizz.com`,
     ...over,

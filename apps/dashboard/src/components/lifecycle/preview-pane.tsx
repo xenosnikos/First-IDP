@@ -257,6 +257,11 @@ export function PreviewPane({ view, now, operator, onAct }: { view: LifecyclePre
   if (view.state === "no-bundle") {
     return (
       <div>
+        {view.sourceRun && !view.sourceRun.ok && (
+          <Notice word="FAIL">
+            The last source run ({view.sourceRun.runId}, {relTime(view.sourceRun.finishedAt, now)}) failed. A failed run&apos;s bundle is partial, so nothing here can be previewed, deployed or signed off until a source run succeeds.
+          </Notice>
+        )}
         {view.blockers.map((b, i) => (
           <Notice key={i} word="WATCH">{b}</Notice>
         ))}

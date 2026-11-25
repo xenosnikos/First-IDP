@@ -99,6 +99,12 @@ export type ArgoStatus = {
   health: string | null;
   /** true when the cluster could not be queried at all */
   unreachable?: boolean;
+  /** `status.summary.images`: the images the Application's live pods run. Synced + Healthy says
+   * nothing about WHICH image — between a gitops change and Argo's next poll it still describes
+   * the previous one — so anything that must know what runs reads this (lifecycle `argoRunsImage`). */
+  images?: string[];
+  /** `status.operationState.finishedAt` of the last sync that finished; null while one runs or when unknown */
+  operationFinishedAt?: string | null;
 };
 
 export type ArgoVerdict = { word: StatusWord; detail: string };

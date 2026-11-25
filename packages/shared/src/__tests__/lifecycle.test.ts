@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import {
+  LIFECYCLE_LINK_HOSTS,
   LIFECYCLE_LIMITS,
+  LIFECYCLE_SMOKE_ORIGIN_RE,
+  lifecycleParsePreviewSmokeOrigin,
+  lifecyclePreviewSmokeOrigin,
+  lifecycleSafeLink,
   LifecycleCompleteBody,
   LifecycleSnapshotDoc,
   isLifecycleRequestKind,
@@ -85,7 +90,7 @@ describe("LifecycleSnapshotDoc", () => {
     expect(paths({ ...base, discoveryErrors: [{ domain: "helm", error: "e".repeat(2001) }] })).toEqual(["discoveryErrors.0.error:too_big"]);
     expect(paths({ ...base, components: Array.from({ length: 5000 }, () => component) })).toEqual([]);
     expect(paths({ ...base, components: Array.from({ length: 5001 }, () => component) })).toEqual(["components:too_big"]);
-    const adv = { id: "A", aliases: [], source: "osv", severity: "low", kev: false, summary: "", url: "", affected: [] };
+    const adv = { id: "A", aliases: [], source: "osv", severity: "low", kev: false, summary: "", url: "https://osv.dev/vulnerability/A", affected: [] };
     expect(paths({ ...base, job: "cve", advisories: Array.from({ length: 2000 }, () => adv) })).toEqual([]);
     expect(paths({ ...base, job: "cve", advisories: Array.from({ length: 2001 }, () => adv) })).toEqual(["advisories:too_big"]);
   });
@@ -94,7 +99,7 @@ describe("LifecycleSnapshotDoc", () => {
     expect(paths({ ...base, components: [{ ...component, tier: "kernel" }] })).toEqual(["components.0.tier:invalid_enum_value"]);
     expect(paths({ ...base, components: [{ ...component, status: "done" }] })).toEqual(["components.0.status:invalid_enum_value"]);
     expect(paths({ ...base, components: [{ ...component, pr: { ...pr, number: 0 } }] })).toEqual(["components.0.pr.number:too_small"]);
-    const adv = { id: "A", aliases: [], source: "osv", severity: "low", kev: false, summary: "", url: "", affected: [] };
+    const adv = { id: "A", aliases: [], source: "osv", severity: "low", kev: false, summary: "", url: "https://osv.dev/vulnerability/A", affected: [] };
     expect(paths({ ...base, advisories: [{ ...adv, epss: 1.2 }] })).toEqual(["advisories.0.epss:too_big"]);
     expect(paths({ ...base, advisories: [{ ...adv, source: "snyk" }] })).toEqual(["advisories.0.source:invalid_enum_value"]);
     expect(paths({ ...base, bundleKey: "not-a-hash" })).toEqual(["bundleKey:invalid_string"]);
@@ -129,7 +134,7 @@ describe("request params + complete body", () => {
   });
 
   it("smoke needs a scope, a sha256 bundle key and at least one URL target", () => {
-    const ok = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "https://plo-2611-twizz-sentinel.prv.twizz.com" }] };
+    const ok = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] };
     expect(parseLifecycleRequestParams("smoke", ok)).toEqual(ok);
     expect(() => parseLifecycleRequestParams("smoke", { ...ok, scope: "prod" })).toThrow();
     expect(() => parseLifecycleRequestParams("smoke", { ...ok, bundleKey: "abc" })).toThrow();
@@ -152,5 +157,148 @@ describe("request params + complete body", () => {
     expect(LifecycleCompleteBody.safeParse({ ok: true, status: "done" }).success).toBe(false);
     expect(LifecycleCompleteBody.safeParse({ ok: false, error: "e".repeat(2001) }).success).toBe(false);
     expect(LifecycleCompleteBody.safeParse({ ok: true, runId: "bad id" }).success).toBe(false);
+  });
+});
+
+// ── external review 2026-11-25, idp #9: anything rendered as a link is https on an allowlisted host ──
+describe("links: https only, allowlisted hosts, at schema level", () => {
+  const adv = { id: "A", aliases: [], source: "osv", severity: "low", kev: false, summary: "", url: "https://osv.dev/vulnerability/A", affected: [] };
+  const cs = { id: "cs1", stage: "source", target: "t", domain: "d", tier: "npm-direct", autonomy: "pr", status: "pr-open", rationale: [], componentIds: [] };
+
+  it("lifecycleSafeLink accepts only https on an exact allowlisted host", () => {
+    expect(lifecycleSafeLink("https://github.com/twizz-app/twizz-sentinel/pull/41")).toBe("https://github.com/twizz-app/twizz-sentinel/pull/41");
+    expect(lifecycleSafeLink("https://osv.dev/vulnerability/GHSA-rv95-896h-c2vc")).not.toBeNull();
+    expect(lifecycleSafeLink("https://nodejs.org/en/blog/release/v22.11.0")).not.toBeNull();
+    for (const bad of [
+      "javascript:alert(1)",
+      "JaVaScRiPt:alert(1)",
+      " javascript:alert(1)",
+      "java\tscript:alert(1)",
+      "data:text/html,<script>alert(1)</script>",
+      "vbscript:x",
+      "file:///etc/passwd",
+      "http://github.com/a/b/pull/1",
+      "//github.com/a/b",
+      "/relative",
+      "",
+      "https://evil.example/login",
+      "https://github.com.evil.example/a/b/pull/1",
+      "https://evil.example/github.com",
+      "https://github.com@evil.example/a",
+      "https://user:pw@github.com/a",
+      "https://github.com:8443/a",
+      "https://sub.github.com/a",
+      "https:\\\\github.com/a",
+      "https://github.com\\@evil.example/",
+      "https://osv.dev/x\ny",
+      "https://169.254.169.254/latest/meta-data",
+    ]) expect(lifecycleSafeLink(bad), JSON.stringify(bad)).toBeNull();
+    expect(lifecycleSafeLink(42)).toBeNull();
+    expect(lifecycleSafeLink(null)).toBeNull();
+    expect(LIFECYCLE_LINK_HOSTS).toContain("github.com");
+  });
+
+  it("a pull request url must be THAT pull request on github.com", () => {
+    const at = (url: string, over: Record<string, unknown> = {}) => paths({ ...base, components: [{ ...component, pr: { ...pr, url, ...over } }] });
+    expect(at(pr.url)).toEqual([]);
+    expect(at("https://GitHub.com/Twizz-App/twizz-sentinel/pull/41")).toEqual([]); // owner/name are case-insensitive on GitHub
+    expect(at("javascript:alert(1)")).toContain("components.0.pr.url:custom");
+    expect(at("https://evil.example/login")).toContain("components.0.pr.url:custom");
+    expect(at("http://github.com/twizz-app/twizz-sentinel/pull/41")).toContain("components.0.pr.url:custom");
+    // a real github URL, but of another pull request or repository: the label would lie about where it goes
+    expect(at("https://github.com/twizz-app/twizz-sentinel/pull/42")).toEqual(["components.0.pr.url:custom"]);
+    expect(at("https://github.com/evil/twizz-sentinel/pull/41")).toEqual(["components.0.pr.url:custom"]);
+    expect(at("https://github.com/twizz-app/twizz-sentinel/pull/41/files")).toEqual(["components.0.pr.url:custom"]);
+    expect(at(pr.url, { repo: "not a slug" })).toContain("components.0.pr.repo:invalid_string");
+    // the same rule wherever a PrRef appears
+    expect(paths({ ...base, job: "source", bundles: [{ repo: "r", github: "twizz-app/twizz-sentinel", baseBranch: "main", branch: "plo/bundle/2026-11", headSha: null, included: [{ ...pr, url: "https://evil.example/x" }], conflicts: [{ pr: { ...pr, url: "javascript:1" }, files: [] }], environments: [] }] })).toEqual(["bundles.0.included.0.url:custom", "bundles.0.conflicts.0.pr.url:custom"]);
+    expect(paths({ ...base, changeSets: [{ ...cs, pr: { ...pr, url: "data:text/html,x" } }] })).toContain("changeSets.0.pr.url:custom");
+  });
+
+  it("an advisory url is https on an advisory host; an escalation url is https on github.com", () => {
+    const a = (url: string) => paths({ ...base, job: "cve", advisories: [{ ...adv, url }] });
+    expect(a("https://osv.dev/vulnerability/GHSA-xxxx")).toEqual([]);
+    expect(a("https://nodejs.org/en/blog/release/v22.11.0")).toEqual([]);
+    expect(a("https://github.com/advisories/GHSA-xxxx")).toEqual([]);
+    expect(a("https://nvd.nist.gov/vuln/detail/CVE-2026-0001")).toEqual([]);
+    for (const bad of ["javascript:alert(document.cookie)", "http://osv.dev/x", "https://osv.dev.evil.example/x", "https://evil.example/osv.dev", "", "osv.dev/x"]) expect(a(bad), bad).toEqual(["advisories.0.url:custom"]);
+    const e = (escalationUrl: string) => paths({ ...base, changeSets: [{ ...cs, escalationUrl }] });
+    expect(e("https://github.com/twizz-app/platform-lifecycle-orchestrator/issues/12")).toEqual([]);
+    for (const bad of ["http://github.com/a/b/issues/1", "https://evil.example/issues/1", "javascript:x"]) expect(e(bad), bad).toEqual(["changeSets.0.escalationUrl:custom"]);
+    expect(paths({ ...base, changeSets: [cs] })).toEqual([]); // optional
+  });
+});
+
+// ── external review 2026-11-25, idp #12 + gitops #3: a smoke target has ONE form per scope ──
+//   preview  the env's Service inside the cluster (the public preview host answers 302: SSO gate)
+//   stg      the fixed https staging host of the release train
+describe("smoke request targets", () => {
+  const SVC = "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090";
+  const STG = "https://sentinel-stg.prv.twizz.com";
+  const ok = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: SVC }] };
+  const stg = { scope: "stg", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: STG }] };
+
+  it("refuses every other scheme, host, port, path or credential — with nothing else wrong in the row", () => {
+    expect(parseLifecycleRequestParams("smoke", ok)).toEqual(ok);
+    expect(parseLifecycleRequestParams("smoke", stg)).toEqual(stg);
+    for (const baseUrl of [
+      "file:///etc/passwd",
+      "http://169.254.169.254",
+      "http://169.254.169.254/latest/meta-data/",
+      "https://169.254.169.254",
+      "http://plo-2611-twizz-sentinel.prv.twizz.com",
+      "https://plo-2611-twizz-sentinel.prv.twizz.com",
+      "https://plo-2611-twizz-sentinel.prv.twizz.com/",
+      "https://sentinel-stg.prv.twizz.com/health",
+      "https://sentinel-stg.prv.twizz.com:8443",
+      "https://user:pw@sentinel-stg.prv.twizz.com",
+      "https://evil.com/-stg.prv.twizz.com",
+      "https://evil.com?-stg.prv.twizz.com",
+      "https://a.b-stg.prv.twizz.com",
+      "https://prv.twizz.com",
+      "https://x-stg.prv.twizz.com.evil.example",
+      "https://X-stg.prv.twizz.com",
+      "https://argocd.prv.twizz.com",
+      "https://nebula.prv.twizz.com",
+      "http://dashboard.nebula.svc.cluster.local",
+      "http://kubernetes.default.svc.cluster.local:443",
+      "http://twizz-sentinel.env-mine.svc.cluster.local:8090",
+      "https://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090",
+      `${SVC}/health`,
+      `${SVC}@evil.com`,
+      "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:80",
+      "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:0",
+      "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local.evil.example:8090",
+      "http://10.0.0.1:8090",
+      "gopher://x-stg.prv.twizz.com",
+    ]) {
+      expect(() => parseLifecycleRequestParams("smoke", { ...ok, targets: [{ name: "twizz-sentinel", baseUrl }] }), `preview ${baseUrl}`).toThrow();
+      expect(() => parseLifecycleRequestParams("smoke", { ...stg, targets: [{ name: "twizz-sentinel", baseUrl }] }), `stg ${baseUrl}`).toThrow();
+    }
+    expect(() => parseLifecycleRequestParams("smoke", { ...ok, targets: [{ name: "a b", baseUrl: SVC }] })).toThrow();
+    expect(LIFECYCLE_SMOKE_ORIGIN_RE.test(STG)).toBe(true);
+    expect(LIFECYCLE_SMOKE_ORIGIN_RE.test(SVC)).toBe(true);
+  });
+
+  it("a target of one scope is never accepted for the other, and a preview Service must be the target's own", () => {
+    expect(() => parseLifecycleRequestParams("smoke", { ...ok, targets: stg.targets })).toThrow();
+    expect(() => parseLifecycleRequestParams("smoke", { ...stg, targets: ok.targets })).toThrow();
+    // `moly-backend` pointed at the sentinel Service (or the env's redis): refused
+    expect(() => parseLifecycleRequestParams("smoke", { ...ok, targets: [{ name: "moly-backend", baseUrl: SVC }] })).toThrow();
+    expect(() => parseLifecycleRequestParams("smoke", { ...ok, targets: [{ name: "twizz-sentinel", baseUrl: SVC.replace("//twizz-sentinel.", "//redis.") }] })).toThrow();
+    // staging evidence never comes from a plo-* host
+    expect(() => parseLifecycleRequestParams("smoke", { ...stg, targets: [{ name: "twizz-sentinel", baseUrl: "https://plo-x-stg.prv.twizz.com" }] })).toThrow();
+  });
+
+  it("builds and reads back the in-cluster origin of a preview env; port 80 is never written", () => {
+    expect(lifecyclePreviewSmokeOrigin("twizz-sentinel", "plo-2611-twizz-sentinel", 8090)).toBe(SVC);
+    expect(lifecyclePreviewSmokeOrigin("twizz-admin", "plo-2611-twizz-admin", 80)).toBe("http://twizz-admin.env-plo-2611-twizz-admin.svc.cluster.local");
+    expect(lifecycleParsePreviewSmokeOrigin(SVC)).toEqual({ service: "twizz-sentinel", envName: "plo-2611-twizz-sentinel", port: 8090 });
+    expect(lifecycleParsePreviewSmokeOrigin("http://twizz-admin.env-plo-2611-twizz-admin.svc.cluster.local")).toEqual({ service: "twizz-admin", envName: "plo-2611-twizz-admin", port: 80 });
+    for (const [service, env, port] of [["twizz-sentinel", "mine", 8090], ["Twizz", "plo-2611-x", 8090], ["twizz-sentinel", "plo-2611-x", 0], ["twizz-sentinel", "plo-2611-x", 70000], ["twizz-sentinel", "plo-2611-x", 80.5], ["a.b", "plo-2611-x", 8090]] as const) {
+      expect(lifecyclePreviewSmokeOrigin(service, env, port), `${service} ${env} ${port}`).toBeNull();
+    }
+    expect(lifecycleParsePreviewSmokeOrigin("http://twizz-sentinel.env-plo-2611-x.svc.cluster.local:99999")).toBeNull();
+    expect(lifecycleParsePreviewSmokeOrigin(STG)).toBeNull();
   });
 });

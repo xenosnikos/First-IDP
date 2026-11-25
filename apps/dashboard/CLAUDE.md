@@ -49,6 +49,10 @@ writes are gated `actions.lifecycle*`, §N9).
 
 `app/api/lifecycle/{ingest,requests/claim,requests/[id]/complete}` are PLO's machine routes (§N9):
 bearer `LIFECYCLE_INGEST_TOKEN`, POST only, never in the middleware matcher, never a session route.
+A state change and its AuditLog row are ONE transaction (`store.transaction`); a snapshot is never
+replaced; `bundleKey` is recomputed (`lifecycleBundleKey`); a smoke result is bound to its claimed
+request. Optional `LIFECYCLE_DISPATCH_TOKEN` = the dispatcher's own credential. Anything from a
+snapshot that becomes a link goes through `<Ext>` (`safeExternalHref`: https, allowlisted host).
 
 ## MCP endpoint (docs/NEBULA.md §N7)
 `src/app/api/mcp/route.ts` (stateless Streamable HTTP) → `server/mcp/auth.ts` + `identity.ts` (HARD gate:

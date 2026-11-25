@@ -7,6 +7,10 @@ import { substituteBuildArgs, type TwizzYamlV2 } from "@twizz-idp/shared";
 import {
   DEFAULT_MAX_NAMED_ENVS,
   GITOPS,
+  LIFECYCLE_ENV_PREFIX,
+  RESERVED_ENV_NAME_MESSAGE,
+  envEcrRepo,
+  isReservedEnvName,
   TTL_HOURS,
   countEnvs,
   deriveEnvSecret,
@@ -62,6 +66,9 @@ export type CreateEnvFromRepoInput = {
   prNumber?: number;
   prUrl?: string;
   actor: string;
+  /** Set (to the reserved prefix) ONLY by `createLifecyclePreview`: the one caller allowed to
+   * create an env in the reserved `plo-` namespace. Everyone else is refused such a name. */
+  reserved?: string;
 };
 
 export function isValidRepo(repo: string): boolean {
@@ -105,6 +112,8 @@ export async function createEnvFromRepo(deps: EnvFromRepoDeps, input: CreateEnvF
   const now = deps.now ?? (() => new Date());
   const { name, repo, ref, sha } = input;
   if (!isValidName(name)) throw new Error(`invalid env name "${name}"`);
+  // `plo-*` is the Lifecycle bundle preview's namespace: refused unless the caller is that action
+  if (isReservedEnvName(name) && input.reserved !== LIFECYCLE_ENV_PREFIX) throw new Error(RESERVED_ENV_NAME_MESSAGE);
   if (!isValidRepo(repo)) throw new Error(`repo must be ${ORG}/<name>, got "${repo}"`);
   if (!isValidBranch(ref)) throw new Error(`invalid ref "${ref}"`);
   if (!SHA_RE.test(sha)) throw new Error("sha must be a 40-hex commit id");
@@ -178,7 +187,9 @@ export async function createEnvFromRepo(deps: EnvFromRepoDeps, input: CreateEnvF
   await deps.gitops.commit(changes, `nebula: create env ${name} from ${repo}@${ref} (${input.actor})`);
 
   // 3. the build
-  const buildInputs = { repo: repo.split("/")[1], ref, sha, service: svc.service, envName: name, dockerfile: input.config.dockerfile, context: input.config.context, buildArgs };
+  // `service` is the builder's ECR repository: the same one the chart pulls from (svc.ecrRepo),
+  // which for moly-backend / frontend / business is not the service name
+  const buildInputs = { repo: repo.split("/")[1], ref, sha, service: svc.ecrRepo, envName: name, dockerfile: input.config.dockerfile, context: input.config.context, buildArgs };
   try {
     await deps.builds.dispatch(buildInputs);
   } catch (e) {
@@ -193,7 +204,7 @@ export async function createEnvFromRepo(deps: EnvFromRepoDeps, input: CreateEnvF
     service: svc.service,
     expectedTag,
     secret: secretName,
-    displayTitle: deps.builds.displayTitle({ envName: name, service: svc.service, sha }),
+    displayTitle: deps.builds.displayTitle({ envName: name, service: svc.ecrRepo, sha }),
     manifest,
   };
 }
@@ -217,7 +228,8 @@ export async function rebuildEnv(deps: EnvFromRepoDeps, input: { name: string; s
   // The deployable manifest (if any) stays: the running env keeps its image
   // until the watcher promotes the new build over it.
   await deps.gitops.commit([{ path: manifestPath(m.name, true), content: manifestToYaml(next) }], `nebula: rebuild ${m.name} at ${sha.slice(0, 7)} (${input.actor})`);
-  const service = m.service;
+  // the builder's ECR repository (see envEcrRepo), not necessarily the service name
+  const service = envEcrRepo(m);
   await deps.builds.dispatch({
     repo: m.source.repo.split("/")[1],
     ref: m.source.ref,
@@ -246,7 +258,9 @@ export async function setEnvVars(deps: Pick<NamedEnvDeps, "gitops" | "secrets">,
   }
   await deps.secrets.putJson(secretName, merged);
   const names = [...new Set([...(m.config?.envVarNames ?? []), ...Object.keys(input.vars).filter((k) => input.vars[k] !== "")])].filter((k) => merged[k] !== undefined).sort();
-  const next: NamedEnvManifest = { ...m, config: { port: m.config?.port ?? 8080, healthPath: m.config?.healthPath ?? "/health", rev: (m.config?.rev ?? 0) + 1, envVarNames: names } };
+  // keep everything else the manifest records about the build (dockerfile, context, build args): a rebuild
+  // reads them, and /lifecycle ties a bundle image to the repository's own build through them
+  const next: NamedEnvManifest = { ...m, config: { ...(m.config ?? {}), port: m.config?.port ?? 8080, healthPath: m.config?.healthPath ?? "/health", rev: (m.config?.rev ?? 0) + 1, envVarNames: names } };
   await deps.gitops.putFile(found.path, manifestToYaml(next), `nebula: env vars rev ${next.config!.rev} for ${m.name} (${input.actor})`, found.sha);
   return { name: m.name, rev: next.config!.rev, envVarNames: names };
 }

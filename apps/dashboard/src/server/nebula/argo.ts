@@ -14,9 +14,14 @@ const LABEL = "twizz-idp/named-env=true";
 export const STAGING_LABEL = "twizz-idp/tier=staging";
 const TIMEOUT_MS = 6_000;
 
-type AppItem = {
+export type AppItem = {
   metadata?: { name?: string };
-  status?: { sync?: { status?: string }; health?: { status?: string } };
+  status?: {
+    sync?: { status?: string };
+    health?: { status?: string };
+    summary?: { images?: unknown };
+    operationState?: { phase?: string; finishedAt?: string };
+  };
 };
 
 export type ArgoStatusMap = { reachable: boolean; reason?: string; apps: Record<string, ArgoStatus> };
@@ -33,6 +38,17 @@ export async function loadKubeConfig() {
     return { k8s, kc, source: "kubeconfig" as const };
   }
   return null;
+}
+
+/** One Application → what Nebula reads of it. Besides sync/health: the images
+ * its live pods run and when its last sync finished. A sync that is still
+ * running (or an Application that never synced) has no finish time. */
+export function toArgoStatus(it: AppItem): ArgoStatus {
+  const raw = it.status?.summary?.images;
+  const images = Array.isArray(raw) ? raw.filter((x): x is string => typeof x === "string" && x.length > 0 && x.length <= 500).slice(0, 200) : [];
+  const op = it.status?.operationState;
+  const finished = op && op.phase === "Succeeded" && typeof op.finishedAt === "string" && Number.isFinite(Date.parse(op.finishedAt)) ? op.finishedAt : null;
+  return { sync: it.status?.sync?.status ?? "Unknown", health: it.status?.health?.status ?? "Unknown", images, operationFinishedAt: finished };
 }
 
 /** One list call, label-selected, hard-timed. Returns per-Application
@@ -59,7 +75,7 @@ export async function readArgoApplications(label: string = LABEL): Promise<ArgoS
     for (const it of items) {
       const name = it.metadata?.name;
       if (!name) continue;
-      apps[name] = { sync: it.status?.sync?.status ?? "Unknown", health: it.status?.health?.status ?? "Unknown" };
+      apps[name] = toArgoStatus(it);
     }
     return { reachable: true, apps };
   } catch (e) {

@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { NamedEnvManifest } from "@twizz-idp/actions";
+import { lifecycleBundleKey, type NamedEnvManifest } from "@twizz-idp/actions";
 import type { PrismaClient } from "@twizz-idp/db";
-import { bundleSetHash, invalidateLifecycleCache, lifecycleServices, readSnapshots, requestDedupeKey, toPreviewEnv } from "../lifecycle";
+import { SHARED_SMOKE_TOKEN_NOTICE, bundleSetHash, invalidateLifecycleCache, lifecycleServices, readRequestsForPreview, readSignoffs, readSnapshots, requestDedupeKey, sourceKeyProblem, toPreviewEnv } from "../lifecycle";
 import { lifecycleRouter } from "../../routers/lifecycle";
 import type { Context } from "../../context";
 import { DAY, HOUR, KEY, OTHER_KEY, SHA_BACKEND, SHA_SENTINEL, ago, bundle, snap } from "./lifecycle-fixtures";
@@ -41,9 +41,33 @@ describe("registry → model inputs", () => {
       build: "ready",
       buildReason: null,
       argo: "PASS",
+      // Argo's Application was not handed in: nothing says what runs, so nothing is claimed
+      runsImage: false,
+      rolledOutAt: null,
+      // this manifest records no build config, so no Service port: the preview smoke has no address for it
+      port: null,
+      // `nick` is a default operator
+      trusted: true,
       expiresAt: "2026-11-28T12:00:00.000Z",
       url: "https://plo-2611-twizz-sentinel.prv.twizz.com",
     });
+    // the Service port the preview smoke calls is the one the manifest records (twizz.yaml `port` at that commit)
+    expect(toPreviewEnv({ ...base, imageTag: "nb-plo-2611-twizz-sentinel-a1a1a1a1a1a1", config: { port: 8090, healthPath: "/health", rev: 1, envVarNames: [] } }, false, "PASS").port).toBe(8090);
+    // what RUNS comes from Argo's own report of the Application, never from Synced + Healthy alone
+    const tag = "nb-plo-2611-twizz-sentinel-a1a1a1a1a1a1";
+    const app = (images: string[] | undefined, operationFinishedAt: string | null = "2026-11-25T10:00:00Z") => ({ sync: "Synced", health: "Healthy", images, operationFinishedAt });
+    const ecr = "848281935985.dkr.ecr.eu-west-1.amazonaws.com/twizz-sentinel";
+    expect(toPreviewEnv({ ...base, imageTag: tag }, false, "PASS", app([`${ecr}:${tag}`, "redis:7"]))).toMatchObject({ runsImage: true, rolledOutAt: "2026-11-25T10:00:00Z" });
+    expect(toPreviewEnv({ ...base, imageTag: tag }, false, "PASS", app([`${ecr}:nb-plo-2611-twizz-sentinel-000000000000`]))).toMatchObject({ runsImage: false });
+    expect(toPreviewEnv({ ...base, imageTag: tag }, false, "PASS", app([`${ecr}:${tag}`, `${ecr}:nb-plo-2611-twizz-sentinel-000000000000`]))).toMatchObject({ runsImage: false }); // mid-rollout: both
+    expect(toPreviewEnv({ ...base, imageTag: tag }, false, "PASS", app([]))).toMatchObject({ runsImage: false });
+    expect(toPreviewEnv({ ...base, imageTag: tag }, false, "PASS", app(undefined, null))).toMatchObject({ runsImage: false, rolledOutAt: null });
+    expect(toPreviewEnv({ ...base, imageTag: tag }, true, "PASS", app([`${ecr}:${tag}`]))).toMatchObject({ runsImage: false, rolledOutAt: null }); // still building
+    // the owner is what makes an env a bundle preview candidate at all
+    expect(toPreviewEnv({ ...base, owner: "rohitagrohia", imageTag: tag }, false, "PASS").trusted).toBe(false);
+    vi.stubEnv("NEBULA_OPERATORS", "someone-else");
+    expect(toPreviewEnv({ ...base, imageTag: tag }, false, "PASS").trusted).toBe(false);
+    vi.unstubAllEnvs();
     const building = toPreviewEnv({ ...base, build: { status: "RUNNING", expectedTag: "t", startedAt: "2026-11-25T11:00:00Z" } }, true, "PASS");
     expect(building).toMatchObject({ build: "building", imageTag: null, argo: null });
     expect(toPreviewEnv({ ...base, build: { status: "FAIL", expectedTag: "t", startedAt: "x", reason: "docker build exited 1" } }, true, null)).toMatchObject({ build: "failed", buildReason: "docker build exited 1" });
@@ -178,14 +202,78 @@ describe("lifecycle router", () => {
 
   it("builds the views from stored snapshots", async () => {
     vi.stubEnv("GITHUB_TOKEN", "");
-    const source = snap("source", ago(DAY), { bundleKey: KEY, bundles: [bundle("twizz-app/twizz-sentinel", SHA_SENTINEL)] });
+    // the key Nebula itself computes for this bundle — any other is not accepted (see the next test)
+    const REAL_KEY = lifecycleBundleKey([{ github: "twizz-app/twizz-sentinel", headSha: SHA_SENTINEL }])!;
+    const source = snap("source", ago(DAY), { bundleKey: REAL_KEY, bundles: [bundle("twizz-app/twizz-sentinel", SHA_SENTINEL)] });
     const c = caller(fakePrisma({ snapshots: [source, snap("plan", ago(2 * DAY))] }).prisma);
     const overview = await c.overview({ components: false });
-    expect(overview.bundle).toMatchObject({ ok: { state: "bundle-ready", key12: KEY.slice(0, 12) } });
+    expect(overview.bundle).toMatchObject({ ok: { state: "bundle-ready", key12: REAL_KEY.slice(0, 12) } });
     expect("ok" in overview.data && overview.data.ok.runs.plan?.ok).toBe(true);
     const preview = await c.preview();
     // the named envs could not be read (no GitHub token): no write is offered
     expect("ok" in preview.data && preview.data.ok.actions.createPreview).toEqual({ allowed: false, reason: "the named-env manifests could not be read" });
+  });
+
+  // external review 2026-11-25, idp #2: the key is a claim until Nebula recomputes it
+  it("a source snapshot whose bundleKey is not the hash of its own bundles never becomes a bundle", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "");
+    const honest = lifecycleBundleKey([{ github: "twizz-app/twizz-sentinel", headSha: SHA_SENTINEL }])!;
+    // the key of the tested commit, re-pointed at another commit (stored before ingest checked it, or written around it)
+    const forged = snap("source", ago(HOUR), { runId: "source-forged", bundleKey: honest, bundles: [bundle("twizz-app/twizz-sentinel", SHA_BACKEND)] });
+    const c = caller(fakePrisma({ snapshots: [forged] }).prisma);
+    const preview = await c.preview();
+    expect(preview).toMatchObject({ data: { ok: { state: "no-bundle", bundleKey: null } } });
+    expect("ok" in preview.data && preview.data.ok.blockers.join("\n")).toMatch(/source snapshot source-forged is ignored: its bundleKey is not the hash of its own bundles/);
+    expect("ok" in preview.data && Object.values(preview.data.ok.actions).every((a) => !a.allowed)).toBe(true);
+    expect(sourceKeyProblem(forged)).toMatch(/is ignored/);
+    expect(sourceKeyProblem(snap("source", ago(HOUR), { bundleKey: honest, bundles: [bundle("twizz-app/twizz-sentinel", SHA_SENTINEL)] }))).toBeNull();
+    expect(sourceKeyProblem(snap("source", ago(HOUR), { bundles: [bundle("twizz-app/twizz-sentinel", null)] }))).toBeNull();
+    expect(sourceKeyProblem(snap("source", ago(HOUR), { bundles: [bundle("twizz-app/twizz-sentinel", SHA_SENTINEL)] }))).toMatch(/is ignored/);
+    expect(sourceKeyProblem(snap("plan", ago(HOUR)))).toBeNull();
+  });
+
+  it("says so, on the page, while smoke results are accepted on the shared ingest token", async () => {
+    vi.stubEnv("GITHUB_TOKEN", "");
+    vi.stubEnv("LIFECYCLE_INGEST_TOKEN", "i".repeat(40));
+    vi.stubEnv("LIFECYCLE_DISPATCH_TOKEN", "");
+    const c = caller(fakePrisma({ snapshots: [] }).prisma);
+    const shared = await c.preview();
+    expect("ok" in shared.data && shared.data.ok.blockers).toContain(SHARED_SMOKE_TOKEN_NOTICE);
+    vi.stubEnv("LIFECYCLE_DISPATCH_TOKEN", "d".repeat(40));
+    invalidateLifecycleCache();
+    const split = await c.preview();
+    expect("ok" in split.data && split.data.ok.blockers).not.toContain(SHARED_SMOKE_TOKEN_NOTICE);
+    // the same secret twice is not a second credential
+    vi.stubEnv("LIFECYCLE_DISPATCH_TOKEN", "i".repeat(40));
+    const same = await c.preview();
+    expect("ok" in same.data && same.data.ok.blockers).toContain(SHARED_SMOKE_TOKEN_NOTICE);
+  });
+
+  // external review 2026-11-25, idp #15: fixed look-back windows must not drop the evidence of an open bundle
+  it("reads smoke requests on their own and sign-offs by bundle key, so neither can age out behind unrelated rows", async () => {
+    const calls: Array<{ model: string; where: unknown; take: unknown }> = [];
+    const smoke = { id: "smoke-old", kind: "smoke", params: {}, requestedBy: "nick", status: "done", createdAt: ago(20 * DAY), claimedAt: null, finishedAt: null, runId: null, error: null };
+    const plans = Array.from({ length: 100 }, (_, i) => ({ ...smoke, id: `plan-${i}`, kind: "plan", createdAt: ago(i * HOUR) }));
+    const prisma = {
+      lifecycleRequest: {
+        findMany: async (args: { where?: { kind?: string }; take?: number }) => {
+          calls.push({ model: "request", where: args.where ?? null, take: args.take });
+          return args.where?.kind === "smoke" ? [smoke] : plans;
+        },
+      },
+      auditLog: {
+        findMany: async (args: { where: unknown; take?: number }) => {
+          calls.push({ model: "audit", where: args.where, take: args.take });
+          return [];
+        },
+      },
+    } as unknown as PrismaClient;
+    const requests = await readRequestsForPreview(prisma);
+    expect(requests).toHaveLength(101);
+    expect(requests.map((r) => r.id)).toContain("smoke-old");
+    expect(calls).toContainEqual({ model: "request", where: { kind: "smoke" }, take: 200 });
+    await readSignoffs(prisma, KEY);
+    expect(calls.at(-1)).toMatchObject({ model: "audit", where: { action: "nebula.lifecycle_signoff", allowed: true, resource: { contains: `"bundleKey":"${KEY}"` } } });
   });
 
   it("returns a database failure as data, never as a thrown error", async () => {

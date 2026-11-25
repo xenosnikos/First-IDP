@@ -230,6 +230,26 @@ describe("tiers", () => {
     expect(mergeComponents(null, null)).toEqual([]);
   });
 
+  // PLO handoff after the 2026-11-25 review: the source snapshot is assembled next to untrusted repository
+  // code. Whatever it claims, it only ever supplies rows of the tiers a source run really reports.
+  it("a source snapshot can neither replace nor add an infrastructure row", () => {
+    const plan = snap("plan", ago(5 * DAY), { components: [component("eks:prod:cp", { tier: "control-plane", status: "outdated", target: "EKS-Moly-Prod" }), component("helm:prod:cert-manager", { tier: "helm", status: "outdated" })] });
+    const source = snap("source", ago(1 * DAY), {
+      components: [
+        component("eks:prod:cp", { tier: "control-plane", status: "current" }), // "prod is up to date", says the source job
+        component("helm:prod:cert-manager", { tier: "npm-direct", status: "current" }), // the same id, dressed as an npm row
+        component("eks:prod:invented", { tier: "addons", status: "current" }),
+        component("npm:s:express", { tier: "npm-direct", status: "pr-open" }),
+      ],
+    });
+    const merged = mergeComponents(plan, source);
+    expect(merged.map((c) => [c.id, c.tier, c.status, c.snapshot]).sort()).toEqual([
+      ["eks:prod:cp", "control-plane", "outdated", "plan"],
+      ["helm:prod:cert-manager", "helm", "outdated", "plan"],
+      ["npm:s:express", "npm-direct", "pr-open", "source"],
+    ]);
+  });
+
   it("joins advisories to components: count, worst severity, KEV, ids worst first", () => {
     const plan = snap("plan", ago(DAY), { components: [component("npm:s:express"), component("npm:s:zod"), component("eks:stg:cp", { tier: "control-plane" })] });
     const cve = snap("cve", ago(HOUR), {
@@ -246,7 +266,11 @@ describe("tiers", () => {
     // one advisory hitting the same component twice counts once
     expect(express.advisories).toEqual({ count: 3, highest: "critical", kev: 1, ids: ["GHSA-kev", "GHSA-crit", "GHSA-low"], from: "cve" });
     expect(direct.components.find((c) => c.id === "npm:s:zod")!.advisories).toEqual({ count: 0, highest: null, kev: 0, ids: [], from: "cve" });
-    expect(direct.advisories).toBe(3);
+    // (external review 2026-11-25, idp #7) was 3: the orphan — a critical advisory PLO filed under this tier
+    // for a component no plan/source row carries — did not count, so a tier could read "0 advisories"
+    // with a critical one in it. An advisory counts for the tier it names, joined to a row or not.
+    expect(direct.advisories).toBe(4);
+    expect(direct).toMatchObject({ kev: 1, highestSeverity: "critical" });
     expect(tiers.find((t) => t.tier === "control-plane")!.advisories).toBe(1);
     expect(advisoriesByComponent([]).size).toBe(0);
   });

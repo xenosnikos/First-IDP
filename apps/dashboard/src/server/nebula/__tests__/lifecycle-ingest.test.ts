@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -14,11 +15,14 @@ import {
   handleIngest,
   readCappedBody,
   type AuditWrite,
+  identifyIngestCaller,
+  sameJson,
   type ClaimedRequest,
   type IngestDeps,
   type LifecycleIngestStore,
   type SnapshotWrite,
 } from "../lifecycle-ingest";
+import { lifecycleBundleKey } from "@twizz-idp/actions";
 import { KEY } from "./lifecycle-fixtures";
 
 const TOKEN = "t0ken-".repeat(8); // 48 chars
@@ -28,34 +32,71 @@ const URL_BASE = "http://dashboard.nebula.svc.cluster.local/api/lifecycle";
 type Req = { id: string; kind: string; params: unknown; status: string; createdAt: Date; claimedAt: Date | null; finishedAt: Date | null; runId: string | null; error: string | null };
 
 /** An in-memory store. `claimOldestPending` finds and marks in one synchronous
- * step — the property the SQL statement provides in Postgres. */
+ * step — the property the SQL statement provides in Postgres. `transaction`
+ * has the property a database transaction provides: when the callback throws,
+ * every write it made (snapshots, requests, audit rows) is undone. */
 class FakeStore implements LifecycleIngestStore {
   snapshots: Array<SnapshotWrite & { id: string; createdAt: Date }> = [];
   requests: Req[] = [];
   audits: AuditWrite[] = [];
   calls: string[] = [];
   failAudit = false;
-  failUpsert = false;
+  /** fail only the audit rows of this action */
+  failAuditOf: string | null = null;
+  failInsert = false;
   private n = 0;
+  private depth = 0;
+
+  async transaction<T>(fn: (tx: LifecycleIngestStore) => Promise<T>): Promise<T> {
+    if (this.depth > 0) return fn(this);
+    const before = { snapshots: this.snapshots.map((x) => ({ ...x })), requests: this.requests.map((x) => ({ ...x })), audits: [...this.audits] };
+    this.depth += 1;
+    try {
+      return await fn(this);
+    } catch (e) {
+      // rollback: restore the rows IN PLACE so references a test holds stay valid
+      this.snapshots = before.snapshots;
+      for (const r of this.requests) Object.assign(r, before.requests.find((x) => x.id === r.id));
+      this.requests = this.requests.filter((r) => before.requests.some((x) => x.id === r.id));
+      this.audits = before.audits;
+      throw e;
+    } finally {
+      this.depth -= 1;
+    }
+  }
+  async findSnapshot(runId: string) {
+    this.calls.push("findSnapshot");
+    const s = this.snapshots.find((x) => x.runId === runId);
+    // what Postgres hands back: the JSON document, not the object that was written
+    return s ? { id: s.id, job: s.job, data: JSON.parse(JSON.stringify(s.data)) as unknown } : null;
+  }
+  async insertSnapshot(row: SnapshotWrite, now: Date) {
+    this.calls.push("insertSnapshot");
+    if (this.failInsert) throw new Error("connection refused to postgres://nebula:hunter2@db");
+    if (this.snapshots.some((s) => s.runId === row.runId)) throw new Error("Unique constraint failed on the fields: (`runId`)");
+    this.n += 1;
+    const id = `cmsnap${String(this.n).padStart(6, "0")}`;
+    this.snapshots.push({ ...row, id, createdAt: now });
+    return { id };
+  }
+  async bindRun(id: string, runId: string) {
+    this.calls.push("bindRun");
+    const r = this.requests.find((x) => x.id === id && x.status === "claimed" && x.runId === null);
+    if (!r) return false;
+    r.runId = runId;
+    return true;
+  }
+  async getRequest(id: string) {
+    this.calls.push("getRequest");
+    const r = this.requests.find((x) => x.id === id);
+    return r ? { id: r.id, kind: r.kind, params: r.params, status: r.status, runId: r.runId } : null;
+  }
 
   addRequest(kind: string, over: Partial<Req> = {}): Req {
     this.n += 1;
     const r: Req = { id: `cmreq${String(this.n).padStart(6, "0")}`, kind, params: {}, status: "pending", createdAt: new Date(NOW.getTime() - 60_000), claimedAt: null, finishedAt: null, runId: null, error: null, ...over };
     this.requests.push(r);
     return r;
-  }
-  async upsertSnapshot(row: SnapshotWrite, now: Date) {
-    this.calls.push("upsertSnapshot");
-    if (this.failUpsert) throw new Error("connection refused to postgres://nebula:hunter2@db");
-    const existing = this.snapshots.find((s) => s.runId === row.runId);
-    if (existing) {
-      Object.assign(existing, row, { createdAt: now });
-      return { id: existing.id, replaced: true };
-    }
-    this.n += 1;
-    const id = `cmsnap${String(this.n).padStart(6, "0")}`;
-    this.snapshots.push({ ...row, id, createdAt: now });
-    return { id, replaced: false };
   }
   async pruneSnapshots(job: string, keep: number) {
     this.calls.push("pruneSnapshots");
@@ -94,13 +135,9 @@ class FakeStore implements LifecycleIngestStore {
     Object.assign(r, patch, { finishedAt: now });
     return true;
   }
-  async requestStatus(id: string) {
-    this.calls.push("requestStatus");
-    return this.requests.find((x) => x.id === id)?.status ?? null;
-  }
   async audit(entry: AuditWrite) {
     this.calls.push("audit");
-    if (this.failAudit) throw new Error("audit table unavailable");
+    if (this.failAudit || (this.failAuditOf !== null && entry.action === this.failAuditOf && entry.allowed)) throw new Error("audit table unavailable");
     this.audits.push(entry);
   }
 }
@@ -311,7 +348,7 @@ describe("POST /api/lifecycle/ingest", () => {
     const { id } = (await res.json()) as { id: string };
     expect(store.snapshots).toHaveLength(1);
     expect(store.snapshots[0]).toMatchObject({ id, job: "plan", runId: "2026-11-25.plan", ok: true, createdAt: NOW, startedAt: new Date("2026-11-25T11:50:00.000Z"), finishedAt: new Date("2026-11-25T11:55:00.000Z") });
-    expect(store.audits).toEqual([{ action: "lifecycle.ingest", resource: "2026-11-25.plan", allowed: true, detail: expect.objectContaining({ id, job: "plan", ok: true, replaced: false, components: 0, advisories: 0, bundles: 0, pruned: 0, requestId: null }) }]);
+    expect(store.audits).toEqual([{ action: "lifecycle.ingest", resource: "2026-11-25.plan", allowed: true, detail: expect.objectContaining({ id, job: "plan", ok: true, components: 0, advisories: 0, bundles: 0, pruned: 0, requestId: null }) }]);
     expect(AUDIT.ingest).toBe("lifecycle.ingest");
     expect(res.headers.get("cache-control")).toBe("no-store");
   });
@@ -412,19 +449,40 @@ describe("POST /api/lifecycle/ingest", () => {
     expect(JSON.stringify(store.audits)).not.toMatch(/hunter2|ghp_x/);
   });
 
-  it("is idempotent on runId: the same runId replaces its row", async () => {
+  it("is idempotent on runId: the SAME snapshot again is a 200 that changes nothing; a different one under that runId is a 409 — a stored snapshot is never replaced", async () => {
     const store = new FakeStore();
-    const first = (await (await handleIngest(post("/ingest", snapshot({ runId: "r1", ok: false, error: "partial" })), deps(store))).json()) as { id: string };
+    const body = snapshot({ runId: "r1", ok: false, error: "partial" });
+    const first = (await (await handleIngest(post("/ingest", body), deps(store))).json()) as { id: string };
     const later = new Date(NOW.getTime() + 5_000);
-    const again = (await (await handleIngest(post("/ingest", snapshot({ runId: "r1", ok: true, finishedAt: "2026-11-25T11:58:00.000Z" })), deps(store, { now: () => later }))).json()) as { id: string };
-    expect(again.id).toBe(first.id);
+    // PLO's retry after a lost answer: the same bytes
+    const retry = await handleIngest(post("/ingest", body), deps(store, { now: () => later }));
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toEqual({ id: first.id, duplicate: true });
     expect(store.snapshots).toHaveLength(1);
-    expect(store.snapshots[0]).toMatchObject({ ok: true, createdAt: later, finishedAt: new Date("2026-11-25T11:58:00.000Z") });
-    expect(store.snapshots[0].data.error).toBeUndefined();
-    expect(store.audits.map((a) => (a.detail as { replaced: boolean }).replaced)).toEqual([false, true]);
+    expect(store.snapshots[0]).toMatchObject({ ok: false, createdAt: NOW });
+    // the same runId with other content would rewrite what Nebula already recorded: refused, audited, nothing changed
+    const rewrite = await handleIngest(post("/ingest", snapshot({ runId: "r1", ok: true, finishedAt: "2026-11-25T11:58:00.000Z" })), deps(store, { now: () => later }));
+    expect(rewrite.status).toBe(409);
+    expect(((await rewrite.json()) as { error: string }).error).toMatch(/already stored with different content/);
+    expect(store.snapshots).toHaveLength(1);
+    expect(store.snapshots[0]).toMatchObject({ ok: false, createdAt: NOW, finishedAt: new Date("2026-11-25T11:55:00.000Z") });
+    expect(store.snapshots[0].data.error).toBe("partial");
+    // …nor under another job
+    expect((await handleIngest(post("/ingest", snapshot({ runId: "r1", job: "cve", components: undefined, advisories: [] })), deps(store))).status).toBe(409);
+    expect(store.audits.map((a) => [a.allowed, (a.detail as { duplicate?: boolean }).duplicate ?? false])).toEqual([[true, false], [true, true], [false, false], [false, false]]);
     // a different runId is a different row
     await handleIngest(post("/ingest", snapshot({ runId: "r2" })), deps(store));
     expect(store.snapshots).toHaveLength(2);
+  });
+
+  it("sameJson ignores key order (jsonb does not keep it) and nothing else", () => {
+    expect(sameJson({ a: 1, b: [1, { c: 2, d: null }] }, { b: [1, { d: null, c: 2 }], a: 1 })).toBe(true);
+    expect(sameJson({ a: 1, b: undefined }, { a: 1 })).toBe(true);
+    expect(sameJson({ a: 1 }, { a: "1" })).toBe(false);
+    expect(sameJson([1, 2], [2, 1])).toBe(false);
+    expect(sameJson({ a: [] }, { a: {} })).toBe(false);
+    expect(sameJson({ a: 1 }, { a: 1, b: 2 })).toBe(false);
+    expect(sameJson(null, {})).toBe(false);
   });
 
   it(`keeps the newest ${SNAPSHOT_RETENTION} snapshots per job`, async () => {
@@ -444,15 +502,16 @@ describe("POST /api/lifecycle/ingest", () => {
     expect(store.audits.filter((a) => (a.detail as { pruned: number }).pruned === 1)).toHaveLength(5);
   });
 
-  it("a replaced runId counts as the newest and is never pruned by its own ingest", async () => {
+  it("an identical re-post is not a newer row and prunes nothing", async () => {
     const store = new FakeStore();
     for (let i = 0; i < 60; i++) {
       const at = new Date(NOW.getTime() - (100 - i) * 60_000);
       await handleIngest(post("/ingest", snapshot({ runId: `plan-${i}`, startedAt: at.toISOString(), finishedAt: at.toISOString() })), deps(store, { now: () => at }));
     }
-    const res = await handleIngest(post("/ingest", snapshot({ runId: "plan-0" })), deps(store));
+    const first = new Date(NOW.getTime() - 100 * 60_000);
+    const res = await handleIngest(post("/ingest", snapshot({ runId: "plan-0", startedAt: first.toISOString(), finishedAt: first.toISOString() })), deps(store));
     const { id } = (await res.json()) as { id: string };
-    expect(store.snapshots.find((s) => s.id === id)?.runId).toBe("plan-0");
+    expect(store.snapshots.find((s) => s.id === id)).toMatchObject({ runId: "plan-0", createdAt: first });
     expect(store.snapshots).toHaveLength(60);
   });
 
@@ -463,7 +522,7 @@ describe("POST /api/lifecycle/ingest", () => {
     const r1 = await handleIngest(post("/ingest", snapshot()), deps(noAudit));
     expect(r1.status).toBe(500);
     const noDb = new FakeStore();
-    noDb.failUpsert = true;
+    noDb.failInsert = true;
     const r2 = await handleIngest(post("/ingest", snapshot()), deps(noDb));
     expect(r2.status).toBe(500);
     expect(await r2.text()).toBe('{"error":"could not store the snapshot"}');
@@ -483,7 +542,7 @@ describe("POST /api/lifecycle/ingest", () => {
 });
 
 describe("POST /api/lifecycle/requests/claim", () => {
-  const smokeParams = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "https://plo-2611-twizz-sentinel.prv.twizz.com" }] };
+  const smokeParams = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] };
   const claim = async (store: FakeStore, over: Partial<IngestDeps> = {}) => {
     const res = await handleClaim(post("/requests/claim", ""), deps(store, over));
     return { status: res.status, body: (await res.json()) as { request: { id: string; kind: string; params: unknown } | null } };
@@ -545,14 +604,18 @@ describe("POST /api/lifecycle/requests/claim", () => {
     const t = (m: number) => new Date(NOW.getTime() - m * 60_000);
     const badKind = store.addRequest("run --stage prod --execute", { createdAt: t(50) });
     const badParams = store.addRequest("plan", { createdAt: t(40), params: { stage: "prod", execute: true } });
-    const badSmoke = store.addRequest("smoke", { createdAt: t(30), params: { ...smokeParams, targets: [{ name: "x", baseUrl: "file:///etc/passwd", extra: 1 }] } });
+    // (external review 2026-11-25, idp #12) this row used to carry `extra: 1` as well, so it was refused for the
+    // unknown key and the test never showed that the URL itself is refused. Nothing else is wrong with it now.
+    const badSmoke = store.addRequest("smoke", { createdAt: t(30), params: { ...smokeParams, targets: [{ name: "twizz-sentinel", baseUrl: "file:///etc/passwd" }] } });
+    const imds = store.addRequest("smoke", { createdAt: t(29), params: { ...smokeParams, targets: [{ name: "twizz-sentinel", baseUrl: "http://169.254.169.254" }] } });
     const good = store.addRequest("cve", { createdAt: t(20) });
     const { body } = await claim(store);
     expect(body.request).toEqual({ id: good.id, kind: "cve", params: {} });
+    for (const r of [imds]) expect(r).toMatchObject({ status: "failed", error: "request params are not valid for its kind" });
     expect(badKind).toMatchObject({ status: "failed", error: expect.stringMatching(/unknown request kind/) });
     expect(badParams).toMatchObject({ status: "failed", error: "request params are not valid for its kind" });
     expect(badSmoke.status).toBe("failed");
-    expect(store.audits.filter((a) => a.action === "lifecycle.request.claim").map((a) => a.allowed)).toEqual([false, false, false, true]);
+    expect(store.audits.filter((a) => a.action === "lifecycle.request.claim").map((a) => a.allowed)).toEqual([false, false, false, false, true]);
   });
 
   it("gives up after a bounded number of unusable rows", async () => {
@@ -569,6 +632,32 @@ describe("POST /api/lifecycle/requests/claim", () => {
     store.failAudit = true;
     vi.spyOn(console, "error").mockImplementation(() => undefined);
     expect((await claim(store)).status).toBe(500);
+  });
+
+  // external review 2026-11-25, idp #10 / gitops #9: the claim used to commit BEFORE its audit row, so an audit
+  // failure answered 500 with the request stranded in `claimed` for two hours and nobody running it
+  it("a claim whose audit row cannot be written is rolled back: the request is pending again and the next claim gets it", async () => {
+    const store = new FakeStore();
+    const r = store.addRequest("plan");
+    store.failAudit = true;
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await claim(store)).status).toBe(500);
+    expect(r).toMatchObject({ status: "pending", claimedAt: null });
+    expect(store.audits).toEqual([]);
+    // the audit table is back: PLO's next attempt gets the very same request, with its audit row
+    store.failAudit = false;
+    expect((await claim(store)).body.request).toEqual({ id: r.id, kind: "plan", params: {} });
+    expect(r.status).toBe("claimed");
+    expect(store.audits).toEqual([{ action: "lifecycle.request.claim", resource: r.id, allowed: true, detail: { kind: "plan" } }]);
+  });
+
+  it("a bad row that cannot be audited is not silently failed either", async () => {
+    const store = new FakeStore();
+    const bad = store.addRequest("bogus");
+    store.failAudit = true;
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await claim(store)).status).toBe(500);
+    expect(bad.status).toBe("pending");
   });
 });
 
@@ -605,6 +694,22 @@ describe("POST /api/lifecycle/requests/:id/complete", () => {
     expect(store.audits).toHaveLength(1);
   });
 
+  // external review 2026-11-25, idp #10: `done` used to be committed before its audit row; when the audit failed
+  // the call was a 500, and PLO's retry got "200 already" — a completed request with no audit row, for ever
+  it("a completion whose audit row cannot be written is rolled back: the retry completes it, with its audit row", async () => {
+    const store = new FakeStore();
+    const r = store.addRequest("plan", { status: "claimed", claimedAt: NOW });
+    store.failAudit = true;
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await complete(store, r.id, { ok: true, runId: "run-9" })).status).toBe(500);
+    expect(r).toMatchObject({ status: "claimed", finishedAt: null, runId: null });
+    expect(store.audits).toEqual([]);
+    store.failAudit = false;
+    expect(await complete(store, r.id, { ok: true, runId: "run-9" })).toEqual({ status: 200, body: { ok: true, status: "done" } });
+    expect(r).toMatchObject({ status: "done", runId: "run-9" });
+    expect(store.audits).toEqual([{ action: "lifecycle.request.complete", resource: r.id, allowed: true, detail: { ok: true, runId: "run-9", error: null } }]);
+  });
+
   it("409 for a request that was never claimed or has expired", async () => {
     const store = new FakeStore();
     const pending = store.addRequest("plan");
@@ -634,5 +739,235 @@ describe("POST /api/lifecycle/requests/:id/complete", () => {
     expect((await complete(store, r.id, { ok: false, error: "e".repeat(2001) })).status).toBe(400);
     expect((await complete(store, r.id, { ok: true, pad: "p".repeat(COMPLETE_BODY_BYTES) })).status).toBe(413);
     expect(r.status).toBe("claimed");
+  });
+});
+
+// ── external review 2026-11-25, idp #2 / gitops #1 (dashboard side): what the ingest-token holder can and cannot do ──
+describe("the ingest-token holder is not trusted: bundle keys", () => {
+  const A = "twizz-app/twizz-sentinel";
+  const B = "twizz-app/Moly-backend";
+  const bundleOf = (github: string, headSha: string | null) => ({ repo: github.split("/")[1], github, baseBranch: "main", branch: "plo/bundle/2026-11", headSha, included: [], conflicts: [], environments: ["staging"] });
+  const source = (over: Record<string, unknown>) => snapshot({ job: "source", runId: "src-1", components: undefined, ...over });
+  const issuesOf = async (res: Response) => ((await res.json()) as { issues?: Array<{ path: string; code: string }> }).issues;
+
+  it("lifecycleBundleKey is PLO's formula: sha256 over the sorted `github@headSha` lines of the bundles that have a head", () => {
+    const lines = [`${B}@${"b".repeat(40)}`, `${A}@${"a".repeat(40)}`].sort();
+    const expected = createHash("sha256").update(lines.join("\n"), "utf8").digest("hex");
+    expect(lifecycleBundleKey([bundleOf(A, "a".repeat(40)), bundleOf(B, "b".repeat(40)), bundleOf("twizz-app/frontend", null)])).toBe(expected);
+    expect(lifecycleBundleKey([bundleOf(B, "b".repeat(40)), bundleOf(A, "a".repeat(40))])).toBe(expected);
+    expect(lifecycleBundleKey([bundleOf(A, "a".repeat(40))])).not.toBe(expected);
+    expect(lifecycleBundleKey([bundleOf(A, null)])).toBeNull();
+    expect(lifecycleBundleKey([])).toBeNull();
+  });
+
+  it("a source snapshot is stored only when its bundleKey IS the hash of its bundles", async () => {
+    const store = new FakeStore();
+    const bundles = [bundleOf(A, "a".repeat(40)), bundleOf(B, "b".repeat(40))];
+    const key = lifecycleBundleKey(bundles)!;
+    expect((await handleIngest(post("/ingest", source({ bundles, bundleKey: key })), deps(store))).status).toBe(200);
+    expect(store.audits.at(-1)?.detail).toMatchObject({ job: "source", bundleKey: key });
+
+    // the laundering move: the SAME key, re-pointed at a commit nobody tested
+    const moved = [bundleOf(A, "c".repeat(40)), bundleOf(B, "b".repeat(40))];
+    const forged = await handleIngest(post("/ingest", source({ runId: "src-2", bundles: moved, bundleKey: key })), deps(store));
+    expect(forged.status).toBe(400);
+    expect(await issuesOf(forged)).toEqual([{ path: "bundleKey", code: "not_the_hash_of_bundles" }]);
+    // a key with no bundles, bundles with no key, a key although nothing has a head
+    for (const body of [source({ runId: "src-3", bundleKey: key }), source({ runId: "src-4", bundles }), source({ runId: "src-5", bundles: [bundleOf(A, null)], bundleKey: key })]) {
+      expect((await handleIngest(post("/ingest", body), deps(store))).status).toBe(400);
+    }
+    // nothing bundled, no key: fine
+    expect((await handleIngest(post("/ingest", source({ runId: "src-6", bundles: [bundleOf(A, null)] })), deps(store))).status).toBe(200);
+    expect(store.snapshots.map((s) => s.runId)).toEqual(["src-1", "src-6"]);
+    expect(store.audits.filter((a) => !a.allowed)).toHaveLength(4);
+  });
+
+  it("only a source snapshot may carry a bundle, only a smoke snapshot a smoke result", async () => {
+    const store = new FakeStore();
+    const bundles = [bundleOf(A, "a".repeat(40))];
+    const res = await handleIngest(post("/ingest", snapshot({ job: "cve", runId: "cve-1", components: undefined, advisories: [], bundles, bundleKey: lifecycleBundleKey(bundles) })), deps(store));
+    expect(res.status).toBe(400);
+    expect(await issuesOf(res)).toEqual([{ path: "bundles", code: "only_in_a_source_snapshot" }, { path: "bundleKey", code: "only_in_a_source_snapshot" }]);
+    const smuggled = await handleIngest(post("/ingest", snapshot({ runId: "plan-9", smoke: { scope: "stg", bundleKey: KEY, results: [] } })), deps(store));
+    expect(await issuesOf(smuggled)).toEqual([{ path: "smoke", code: "only_in_a_smoke_snapshot" }]);
+    const bare = await handleIngest(post("/ingest", snapshot({ job: "smoke", runId: "smoke-9", components: undefined })), deps(store));
+    expect(await issuesOf(bare)).toEqual([{ path: "smoke", code: "required_in_a_smoke_snapshot" }, { path: "requestId", code: "required_in_a_smoke_snapshot" }]);
+    expect(store.snapshots).toEqual([]);
+  });
+});
+
+describe("the ingest-token holder is not trusted: smoke results", () => {
+  const params = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] };
+  const result = (ok = true) => ({ name: "twizz-sentinel/health", url: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090/health", ok, status: ok ? 200 : 503, ms: 12, detail: ok ? "status 200" : "status 503, expected 200" });
+  const smoke = (requestId: string | undefined, over: Record<string, unknown> = {}) =>
+    snapshot({ job: "smoke", runId: "smoke-1", components: undefined, ...(requestId ? { requestId } : {}), smoke: { scope: "preview", bundleKey: KEY, results: [result()] }, ...over });
+  const ingest = async (store: FakeStore, body: unknown, at = NOW) => {
+    const res = await handleIngest(post("/ingest", body), deps(store, { now: () => at }));
+    return { status: res.status, body: (await res.json()) as { id?: string; error?: string; duplicate?: boolean } };
+  };
+
+  it("is accepted only as the answer to a smoke request Nebula created, while that request is claimed — and binds its run to it", async () => {
+    const store = new FakeStore();
+    const req = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params });
+    const ok = await ingest(store, smoke(req.id));
+    expect(ok.status).toBe(200);
+    expect(req.runId).toBe("smoke-1");
+    expect(store.snapshots).toHaveLength(1);
+    expect(store.audits.at(-1)).toMatchObject({ allowed: true, detail: { job: "smoke", requestId: req.id } });
+  });
+
+  it("refuses a smoke result nobody asked for: no such request, another kind, not claimed yet, already completed, expired", async () => {
+    const store = new FakeStore();
+    const plan = store.addRequest("plan", { status: "claimed", claimedAt: NOW });
+    const pending = store.addRequest("smoke", { params });
+    const done = store.addRequest("smoke", { status: "done", claimedAt: NOW, finishedAt: NOW, runId: "smoke-0", params });
+    const failed = store.addRequest("smoke", { status: "failed", claimedAt: NOW, finishedAt: NOW, params });
+    const expired = store.addRequest("smoke", { status: "expired", params });
+    const cases: Array<[string, RegExp]> = [
+      ["cmdoesnotexist01", /must answer a smoke request Nebula created/],
+      [plan.id, /must answer a smoke request Nebula created/],
+      [pending.id, /is pending, not claimed/],
+      [done.id, /is done, not claimed/],
+      [failed.id, /is failed, not claimed/],
+      [expired.id, /is expired, not claimed/],
+    ];
+    for (const [id, why] of cases) {
+      const r = await ingest(store, smoke(id, { runId: `forged-${id}` }));
+      expect(r.status, id).toBe(409);
+      expect(r.body.error, id).toMatch(why);
+    }
+    expect(store.snapshots).toEqual([]);
+    // the retroactive flip: a FAILED real smoke cannot be turned into a pass by a later snapshot
+    expect(done.runId).toBe("smoke-0");
+    expect(failed.runId).toBeNull();
+    expect(store.audits.map((a) => a.allowed)).toEqual(cases.map(() => false));
+  });
+
+  it("refuses a result for another scope or another bundle than the request it names", async () => {
+    const store = new FakeStore();
+    const req = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params });
+    expect((await ingest(store, smoke(req.id, { smoke: { scope: "stg", bundleKey: KEY, results: [result()] } }))).status).toBe(409);
+    expect((await ingest(store, smoke(req.id, { smoke: { scope: "preview", bundleKey: "f".repeat(64), results: [result()] } }))).body.error).toMatch(/different scope or bundle/);
+    expect(req.runId).toBeNull();
+    expect(store.snapshots).toEqual([]);
+  });
+
+  it("a request is answered ONCE: a second result, or a rewrite of the first, is refused — a recorded verdict never changes", async () => {
+    const store = new FakeStore();
+    const req = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params });
+    const failing = smoke(req.id, { runId: "real-run", ok: false, error: "1 of 1 checks failed", smoke: { scope: "preview", bundleKey: KEY, results: [result(false)] } });
+    expect((await ingest(store, failing)).status).toBe(200);
+    // another pod with the same token posts a green result for the same request…
+    const second = await ingest(store, smoke(req.id, { runId: "forged-run" }));
+    expect(second.status).toBe(409);
+    expect(second.body.error).toMatch(/already has a result/);
+    // …or tries to replace the stored one under its own run id
+    const rewrite = await ingest(store, smoke(req.id, { runId: "real-run" }));
+    expect(rewrite.status).toBe(409);
+    expect(rewrite.body.error).toMatch(/already stored with different content/);
+    expect(req.runId).toBe("real-run");
+    expect(store.snapshots).toHaveLength(1);
+    expect(store.snapshots[0].data.smoke?.results[0].ok).toBe(false);
+    // PLO's own retry of the real result is still fine
+    expect((await ingest(store, failing)).body).toMatchObject({ duplicate: true });
+  });
+
+  it("a smoke run that failed before checking anything is recorded and bound too — and can never be followed by a green one", async () => {
+    const store = new FakeStore();
+    const req = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params });
+    const crashed = snapshot({ job: "smoke", runId: "crashed-run", components: undefined, requestId: req.id, ok: false, error: "smoke: inventory not readable" });
+    expect((await ingest(store, crashed)).status).toBe(200);
+    expect(req.runId).toBe("crashed-run");
+    expect((await ingest(store, smoke(req.id, { runId: "green-after-all" }))).status).toBe(409);
+    // a run that says ok without showing a single result is not a smoke result
+    expect((await ingest(store, snapshot({ job: "smoke", runId: "empty-ok", components: undefined, requestId: req.id }))).status).toBe(400);
+  });
+
+  it("when the snapshot cannot be stored, the request is NOT left bound to a run that does not exist", async () => {
+    const store = new FakeStore();
+    const req = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params });
+    store.failAuditOf = "lifecycle.ingest";
+    vi.spyOn(console, "error").mockImplementation(() => undefined);
+    expect((await ingest(store, smoke(req.id))).status).toBe(500);
+    expect(req.runId).toBeNull();
+    expect(store.snapshots).toEqual([]);
+    store.failAuditOf = null;
+    expect((await ingest(store, smoke(req.id))).status).toBe(200);
+    expect(req.runId).toBe("smoke-1");
+  });
+
+  it("complete keeps the run the request was answered with: another runId is refused", async () => {
+    const store = new FakeStore();
+    const req = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params });
+    await ingest(store, smoke(req.id, { runId: "real-run" }));
+    const other = await handleComplete(post(`/requests/${req.id}/complete`, { ok: true, runId: "another-run" }), req.id, deps(store));
+    expect(other.status).toBe(409);
+    expect(req).toMatchObject({ status: "claimed", runId: "real-run" });
+    const same = await handleComplete(post(`/requests/${req.id}/complete`, { ok: true, runId: "real-run" }), req.id, deps(store));
+    expect(same.status).toBe(200);
+    expect(req).toMatchObject({ status: "done", runId: "real-run" });
+    // completing without naming a run keeps the bound one too
+    const req2 = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params: { scope: "stg", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "https://sentinel-stg.prv.twizz.com" }] } });
+    await ingest(store, smoke(req2.id, { runId: "run-2", smoke: { scope: "stg", bundleKey: KEY, results: [result()] } }));
+    await handleComplete(post(`/requests/${req2.id}/complete`, { ok: true }), req2.id, deps(store));
+    expect(req2).toMatchObject({ status: "done", runId: "run-2" });
+  });
+});
+
+describe("the dispatcher's own credential (LIFECYCLE_DISPATCH_TOKEN)", () => {
+  const DISPATCH = "d1spatch-".repeat(6); // 54 chars
+  const params = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] };
+  const smokeBody = (requestId: string) => snapshot({ job: "smoke", runId: "smoke-1", components: undefined, requestId, smoke: { scope: "preview", bundleKey: KEY, results: [] } });
+  const split = (store: FakeStore) => deps(store, { dispatchToken: DISPATCH });
+
+  it("identifyIngestCaller: one shared token is both roles; two tokens are two separate credentials", () => {
+    expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, undefined)).toMatchObject({ ok: true, split: false, roles: new Set(["publisher", "dispatcher"]) });
+    expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, DISPATCH)).toMatchObject({ ok: true, split: true, roles: new Set(["publisher"]) });
+    expect(identifyIngestCaller(`Bearer ${DISPATCH}`, TOKEN, DISPATCH)).toMatchObject({ ok: true, split: true, roles: new Set(["dispatcher"]) });
+    expect(identifyIngestCaller(`Bearer ${DISPATCH}`, TOKEN, undefined)).toMatchObject({ ok: false, status: 401 });
+    expect(identifyIngestCaller("Bearer nope-nope-nope-nope-nope-nope-nope", TOKEN, DISPATCH)).toMatchObject({ ok: false, status: 401 });
+    // a misconfigured second token is a 503 for everyone, never a silent fall back to the shared one
+    expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, "short")).toMatchObject({ ok: false, status: 503 });
+    expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, TOKEN)).toMatchObject({ ok: false, status: 503 });
+    expect(identifyIngestCaller(`Bearer ${DISPATCH}`, undefined, DISPATCH)).toMatchObject({ ok: false, status: 503 });
+  });
+
+  it("with it set, the publisher token cannot claim, complete or post a smoke result", async () => {
+    const store = new FakeStore();
+    const req = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params });
+    store.addRequest("plan");
+    expect((await handleClaim(post("/requests/claim", ""), split(store))).status).toBe(403);
+    expect((await handleComplete(post(`/requests/${req.id}/complete`, { ok: true }), req.id, split(store))).status).toBe(403);
+    const forged = await handleIngest(post("/ingest", smokeBody(req.id)), split(store));
+    expect(forged.status).toBe(403);
+    expect(store.snapshots).toEqual([]);
+    expect(store.requests.map((r) => r.status)).toEqual(["claimed", "pending"]);
+    expect(store.audits.at(-1)).toMatchObject({ action: "lifecycle.ingest", allowed: false, detail: { reason: "a smoke snapshot needs the dispatcher credential" } });
+    // it still publishes what it is for
+    expect((await handleIngest(post("/ingest", snapshot({ runId: "plan-1" })), split(store))).status).toBe(200);
+  });
+
+  it("with it set, the dispatcher token runs the queue and posts smoke results — and cannot publish a bundle", async () => {
+    const store = new FakeStore();
+    const req = store.addRequest("smoke", { params });
+    const as = auth(DISPATCH);
+    const claimed = await handleClaim(post("/requests/claim", "", as), split(store));
+    expect(((await claimed.json()) as { request: { id: string } }).request.id).toBe(req.id);
+    expect((await handleIngest(post("/ingest", smokeBody(req.id), as), split(store))).status).toBe(200);
+    expect((await handleComplete(post(`/requests/${req.id}/complete`, { ok: true, runId: "smoke-1" }, as), req.id, split(store))).status).toBe(200);
+    // on-demand plan/cve runs are the dispatcher's too
+    expect((await handleIngest(post("/ingest", snapshot({ job: "cve", runId: "cve-1", components: undefined, advisories: [] }), as), split(store))).status).toBe(200);
+    const bundles = [{ repo: "r", github: "twizz-app/twizz-sentinel", baseBranch: "main", branch: "plo/bundle/2026-11", headSha: "a".repeat(40), included: [], conflicts: [], environments: [] }];
+    const src = await handleIngest(post("/ingest", snapshot({ job: "source", runId: "src-1", components: undefined, bundles, bundleKey: lifecycleBundleKey(bundles) }), as), split(store));
+    expect(src.status).toBe(403);
+  });
+
+  it("is read from the environment by default", async () => {
+    vi.stubEnv("LIFECYCLE_INGEST_TOKEN", TOKEN);
+    vi.stubEnv("LIFECYCLE_DISPATCH_TOKEN", DISPATCH);
+    const store = new FakeStore();
+    store.addRequest("plan");
+    expect((await handleClaim(post("/requests/claim", ""), { store })).status).toBe(403);
+    expect((await handleClaim(post("/requests/claim", "", auth(DISPATCH)), { store })).status).toBe(200);
   });
 });

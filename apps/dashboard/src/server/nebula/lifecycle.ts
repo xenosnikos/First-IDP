@@ -9,14 +9,17 @@
 // single insert the gated operator writes (routers/actions.ts) use to queue an
 // on-demand run. Nothing here touches a kube API or GitHub with a write.
 import { createHash } from "node:crypto";
-import { PROMOTABLE, REGISTRY, listNamedEnvs, listPromotions, readTargetState, releaseTarget, type NamedEnvManifest } from "@twizz-idp/actions";
+import { PROMOTABLE, REGISTRY, envEcrRepo, lifecycleBundleKey, listNamedEnvs, listPromotions, readTargetState, releaseTarget, type NamedEnvManifest } from "@twizz-idp/actions";
 import type { Prisma, PrismaClient } from "@twizz-idp/db";
 import { LifecycleSnapshotDoc, parseLifecycleRequestParams, type LifecycleBundle, type LifecycleRequestKind, type LifecycleRequestParams } from "@twizz-idp/shared";
-import { argoWord } from "@/lib/nebula/status";
+import { isOperator } from "@/lib/nebula/operators";
+import { argoWord, type ArgoStatus } from "@/lib/nebula/status";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "./argo";
 import { namedEnvDeps } from "./deps";
+import { dispatchTokenConfigured } from "./lifecycle-ingest";
 import {
   SIGNOFF_AUDIT_ACTION,
+  argoRunsImage,
   buildAdvisories,
   buildOverview,
   buildPreview,
@@ -59,9 +62,16 @@ export function lifecycleServices(): LifecycleServiceInput[] {
 }
 
 /** A named-env manifest → what the state machine reads. `argo` is the verdict
- * word of Application `env-<name>` (null for an env that is not deployable yet). */
-export function toPreviewEnv(m: NamedEnvManifest, pending: boolean, argo: PreviewEnvInput["argo"]): PreviewEnvInput {
+ * word of Application `env-<name>` (null for an env that is not deployable
+ * yet); `app` is that Application as Argo reported it — what it RUNS and when
+ * it last finished syncing (absent: not read, so the env is not "up"). */
+export function toPreviewEnv(m: NamedEnvManifest, pending: boolean, argo: PreviewEnvInput["argo"], app?: ArgoStatus | null): PreviewEnvInput {
   return {
+    runsImage: !pending && !!app && argoRunsImage(app.images, envEcrRepo(m), m.imageTag ?? null),
+    rolledOutAt: !pending && app ? (app.operationFinishedAt ?? null) : null,
+    port: typeof m.config?.port === "number" ? m.config.port : null,
+    // the owner is written by Nebula into gitops from the signed-in login; only an operator can run lifecycle_create_preview
+    trusted: isOperator(m.owner),
     name: m.name,
     service: m.service,
     owner: m.owner,
@@ -94,6 +104,8 @@ export function bundleSetHash(bundles: readonly LifecycleBundle[], services: rea
 /** how many snapshot rows (metadata only) the selection looks over */
 const META_LOOKBACK = 240;
 const REQUEST_LOOKBACK = 100;
+/** smoke requests are the gates' evidence: read on their own, so plan/cve requests can never push one out */
+const SMOKE_REQUEST_LOOKBACK = 200;
 const SIGNOFF_LOOKBACK = 100;
 
 // Payloads are immutable per (id, createdAt) — a replaced runId gets a new
@@ -137,15 +149,54 @@ export async function readRequests(prisma: PrismaClient, take = REQUEST_LOOKBACK
   return prisma.lifecycleRequest.findMany({ orderBy: [{ createdAt: "desc" }, { id: "desc" }], take });
 }
 
-/** Sign-offs are AuditLog rows written by the gate (`nebula.lifecycle_signoff`). */
-export async function readSignoffs(prisma: PrismaClient): Promise<SignoffInput[]> {
+/** The newest requests PLUS the newest smoke requests, read separately: the
+ * smoke request of an open bundle must not age out of a fixed window because
+ * a hundred plan/cve runs were requested after it (the verdict would silently
+ * fall back to "not requested yet"). */
+export async function readRequestsForPreview(prisma: PrismaClient): Promise<RequestRow[]> {
+  const [recent, smoke] = await Promise.all([
+    readRequests(prisma),
+    prisma.lifecycleRequest.findMany({ where: { kind: "smoke" }, orderBy: [{ createdAt: "desc" }, { id: "desc" }], take: SMOKE_REQUEST_LOOKBACK }),
+  ]);
+  const byId = new Map<string, RequestRow>();
+  for (const r of [...recent, ...smoke]) byId.set(r.id, r);
+  return [...byId.values()];
+}
+
+/** Sign-offs are AuditLog rows written by the gate (`nebula.lifecycle_signoff`).
+ * With a `bundleKey` only that bundle's rows are read (the key is in the
+ * row's `resource`, the gate fields as JSON) — so neither other bundles'
+ * sign-offs nor a run of failed attempts (the gate audits a thrown action as
+ * allowed=true with detail.error) can push the real one out of the window. */
+export async function readSignoffs(prisma: PrismaClient, bundleKey?: string | null): Promise<SignoffInput[]> {
   const rows = await prisma.auditLog.findMany({
-    where: { action: SIGNOFF_AUDIT_ACTION, allowed: true },
+    where: { action: SIGNOFF_AUDIT_ACTION, allowed: true, ...(bundleKey ? { resource: { contains: `"bundleKey":"${bundleKey}"` } } : {}) },
     orderBy: { createdAt: "desc" },
     take: SIGNOFF_LOOKBACK,
     select: { action: true, actor: true, allowed: true, resource: true, detail: true, createdAt: true },
   });
-  return rows.flatMap((r) => parseSignoffAudit(r) ?? []);
+  return rows.flatMap((r) => parseSignoffAudit(r) ?? []).filter((s) => !bundleKey || s.bundleKey === bundleKey);
+}
+
+/** Said on the page until it is fixed: a smoke verdict is the word of whoever
+ * holds the credential that may post it. With one shared ingest token that is
+ * every PLO pod (and anything else that can read the token). */
+export const SHARED_SMOKE_TOKEN_NOTICE =
+  "smoke results are accepted on the shared ingest token (LIFECYCLE_DISPATCH_TOKEN is not set): every holder of LIFECYCLE_INGEST_TOKEN can answer a smoke request — give plo-dispatch its own token (docs/NEBULA.md §N9, \"Who is trusted for what\")";
+function smokeTrustNotice(): string[] {
+  return dispatchTokenConfigured() ? [] : [SHARED_SMOKE_TOKEN_NOTICE];
+}
+
+/** A source snapshot is only as good as its key: `bundleKey` must be the
+ * sha256 of its own bundles' `github@headSha` lines. Ingest rejects one that
+ * is not; this is the same check on the way OUT of the database, so a row
+ * stored before that rule (or written around it) can never reach a gate. */
+export function sourceKeyProblem(row: SnapshotRow): string | null {
+  if (row.job !== "source") return null;
+  const computed = lifecycleBundleKey(row.data.bundles ?? []);
+  const claimed = row.data.bundleKey ?? null;
+  if (computed === claimed) return null;
+  return `source snapshot ${row.runId} is ignored: its bundleKey is not the hash of its own bundles (a bundle key must identify exactly the commits it names)`;
 }
 
 // ── the outside world (GitHub gitops + Argo), for the preview ─────────────
@@ -173,7 +224,10 @@ async function readPreviewSourcesNow(): Promise<PreviewSources> {
   let envs: PreviewEnvInput[] | null = null;
   if ("ok" in list) {
     envs = [
-      ...list.ok.envs.map((m) => toPreviewEnv(m, false, argoWord(argoStatusFor(envArgo, `env-${m.name}`)).word)),
+      ...list.ok.envs.map((m) => {
+        const app = argoStatusFor(envArgo, `env-${m.name}`);
+        return toPreviewEnv(m, false, argoWord(app).word, app);
+      }),
       ...list.ok.pending.map((m) => toPreviewEnv(m, true, null)),
     ];
     for (const b of list.ok.broken) sourceErrors.push(`named env ${b.path} did not parse: ${b.error}`);
@@ -188,11 +242,16 @@ async function readPreviewSourcesNow(): Promise<PreviewSources> {
 
   const staging: StagingTargetInput[] = targets.map(({ entry, state }) => {
     const t = releaseTarget(entry.name, "staging")!;
+    const app = argoStatusFor(stagingArgo, t.argoApp);
+    const currentTag = "ok" in state ? state.ok.imageTag : null;
     return {
       service: entry.name,
       host: t.host,
-      currentTag: "ok" in state ? state.ok.imageTag : null,
-      argo: argoWord(argoStatusFor(stagingArgo, t.argoApp)).word,
+      currentTag,
+      argo: argoWord(app).word,
+      // what staging RUNS, from Argo — gitops only says what it should run
+      runsImage: argoRunsImage(app.images, entry.ecrRepo, currentTag),
+      rolledOutAt: app.operationFinishedAt ?? null,
       error: "ok" in state ? null : state.error,
     };
   });
@@ -221,9 +280,13 @@ export function readPreviewSources(opts: { fresh?: boolean } = {}): Promise<Prev
 /** Everything `buildPreview` needs. `fresh: true` bypasses the 20 s cache of
  * the GitHub/Argo reads — the gated writes MUST use it. */
 export async function readPreviewInput(prisma: PrismaClient, opts: { fresh?: boolean; now?: Date } = {}): Promise<PreviewInput> {
-  const [snaps, requests, signoffs, sources] = await Promise.all([readSnapshots(prisma), readRequests(prisma), readSignoffs(prisma), readPreviewSources(opts)]);
+  const [snaps, requests, sources] = await Promise.all([readSnapshots(prisma), readRequestsForPreview(prisma), readPreviewSources(opts)]);
+  const keyProblems = snaps.rows.flatMap((r) => sourceKeyProblem(r) ?? []);
+  const rows = snaps.rows.filter((r) => !sourceKeyProblem(r));
+  const key = selectSnapshots(rows).source.data?.data.bundleKey ?? null;
+  const signoffs = await readSignoffs(prisma, key);
   return {
-    rows: snaps.rows,
+    rows,
     requests,
     services: lifecycleServices(),
     envs: sources.envs,
@@ -231,7 +294,7 @@ export async function readPreviewInput(prisma: PrismaClient, opts: { fresh?: boo
     staging: sources.staging,
     signoffs,
     now: opts.now ?? new Date(),
-    sourceErrors: [...sources.sourceErrors, ...snaps.unreadable.map((u) => `${u.job} snapshot ${u.runId} is unreadable (stored by another schema version)`)],
+    sourceErrors: [...sources.sourceErrors, ...keyProblems, ...smokeTrustNotice(), ...snaps.unreadable.map((u) => `${u.job} snapshot ${u.runId} is unreadable (stored by another schema version)`)],
   };
 }
 

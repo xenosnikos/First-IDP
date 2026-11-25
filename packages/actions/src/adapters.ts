@@ -383,6 +383,30 @@ export class GithubLifecycleRepos implements LifecycleRepos {
     return comments.some((c) => (c.body ?? "").includes(marker));
   }
 
+  async pullRequest(slug: string, number: number): Promise<{ state: "open" | "closed"; merged: boolean; headSha: string } | null> {
+    try {
+      const { data } = await this.gh.pulls.get({ ...this.split(slug), pull_number: number });
+      return { state: data.state === "open" ? "open" : "closed", merged: !!data.merged, headSha: data.head.sha };
+    } catch (e) {
+      // an issue number, or no such number: not a pull request
+      if ((e as { status?: number }).status === 404) return null;
+      throw e;
+    }
+  }
+
+  async isAncestor(slug: string, ancestor: string, descendant: string): Promise<boolean> {
+    if (ancestor === descendant) return true;
+    try {
+      // base...head: `behind_by` counts the commits of base that head lacks — 0 ⇔ base is contained in head
+      const { data } = await this.gh.repos.compareCommitsWithBasehead({ ...this.split(slug), basehead: `${ancestor}...${descendant}`, per_page: 1 });
+      return data.behind_by === 0 && (data.status === "ahead" || data.status === "identical");
+    } catch (e) {
+      // an unknown commit is not an ancestor
+      if ((e as { status?: number }).status === 404) return false;
+      throw e;
+    }
+  }
+
   async comment(slug: string, pr: number, body: string): Promise<{ url: string }> {
     const { data } = await this.gh.issues.createComment({ ...this.split(slug), issue_number: pr, body });
     return { url: data.html_url };

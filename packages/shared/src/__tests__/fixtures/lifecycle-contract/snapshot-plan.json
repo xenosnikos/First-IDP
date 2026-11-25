@@ -221,7 +221,7 @@
       "rollback": "supported"
     },
     {
-      "id": "npm-dependency:twizz-sentinel:lockfile (transitive security fixes)",
+      "id": "npm-dependency:twizz-sentinel:__lockfile",
       "tier": "npm-transitive",
       "domain": "npm-dependency",
       "name": "lockfile (transitive security fixes)",

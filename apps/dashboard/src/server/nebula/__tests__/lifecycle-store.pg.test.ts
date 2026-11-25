@@ -90,11 +90,11 @@ describe.skipIf(!url)("prismaLifecycleStore on Postgres", () => {
       data: [
         { id: "cmstale0001", kind: "plan", params: {}, requestedBy: "nick", createdAt: new Date(NOW.getTime() - PENDING_EXPIRY_MS - 1000) },
         { id: "cmhung00001", kind: "cve", params: {}, requestedBy: "nick", status: "claimed", createdAt: new Date(NOW.getTime() - 5 * 3_600_000), claimedAt: new Date(NOW.getTime() - CLAIM_TIMEOUT_MS - 1000) },
-        { id: "cmfresh0001", kind: "smoke", params: { scope: "preview", bundleKey: KEY, targets: [{ name: "s", baseUrl: "https://plo-2611-s.prv.twizz.com" }] }, requestedBy: "igor", createdAt: new Date(NOW.getTime() - 60_000) },
+        { id: "cmfresh0001", kind: "smoke", params: { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] }, requestedBy: "igor", createdAt: new Date(NOW.getTime() - 60_000) },
       ],
     });
     const res = await handleClaim(new Request("http://x/api/lifecycle/requests/claim", { method: "POST", headers: { authorization: `Bearer ${TOKEN}` } }), { store: prismaLifecycleStore(prisma), token: TOKEN, now: () => NOW });
-    expect(await res.json()).toEqual({ request: { id: "cmfresh0001", kind: "smoke", params: { scope: "preview", bundleKey: KEY, targets: [{ name: "s", baseUrl: "https://plo-2611-s.prv.twizz.com" }] } } });
+    expect(await res.json()).toEqual({ request: { id: "cmfresh0001", kind: "smoke", params: { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] } } });
     const rows = Object.fromEntries((await prisma.lifecycleRequest.findMany()).map((r) => [r.id, r]));
     expect(rows.cmstale0001).toMatchObject({ status: "expired", error: "not claimed within 24 h" });
     expect(rows.cmhung00001).toMatchObject({ status: "failed", error: "claimed but not completed within 2 h" });
@@ -114,25 +114,31 @@ describe.skipIf(!url)("prismaLifecycleStore on Postgres", () => {
     expect(await store.finishClaimed("cmreq0000", { status: "done", error: null, runId: "r-1" }, NOW)).toBe(true);
     expect(await store.finishClaimed("cmreq0000", { status: "failed", error: "late", runId: null }, NOW)).toBe(false);
     expect(await prisma.lifecycleRequest.findUniqueOrThrow({ where: { id: "cmreq0000" } })).toMatchObject({ status: "done", runId: "r-1", error: null });
-    expect(await store.requestStatus("cmreq0000")).toBe("done");
-    expect(await store.requestStatus("cmnope")).toBeNull();
+    expect(await store.getRequest("cmreq0000")).toMatchObject({ id: "cmreq0000", kind: "plan", status: "done", runId: "r-1" });
+    expect(await store.getRequest("cmnope")).toBeNull();
   });
 
-  it("ingest end to end: insert, replace on runId, retention, audit, history without payloads", async () => {
+  it("ingest end to end: insert, a runId is written once, retention, audit, history without payloads", async () => {
     const store = prismaLifecycleStore(prisma);
     const ingest = (body: unknown, at: Date) =>
       handleIngest(new Request("http://x/api/lifecycle/ingest", { method: "POST", headers: { authorization: `Bearer ${TOKEN}` }, body: JSON.stringify(body) }), { store, token: TOKEN, now: () => at });
     const first = (await (await ingest(doc("run-a", "plan", { ok: false, error: "kube: timeout", requestId: "cmreq0000" }), NOW)).json()) as { id: string };
-    const again = (await (await ingest(doc("run-a"), new Date(NOW.getTime() + 1000))).json()) as { id: string };
-    expect(again.id).toBe(first.id);
+    // the same snapshot again (jsonb has reordered its keys by now): an idempotent 200, the row untouched
+    const retry = await ingest(doc("run-a", "plan", { ok: false, error: "kube: timeout", requestId: "cmreq0000" }), new Date(NOW.getTime() + 1000));
+    expect(retry.status).toBe(200);
+    expect(await retry.json()).toEqual({ id: first.id, duplicate: true });
+    // other content under that runId: refused, never replaced
+    const rewrite = await ingest(doc("run-a"), new Date(NOW.getTime() + 1000));
+    expect(rewrite.status).toBe(409);
     expect(await prisma.lifecycleSnapshot.count()).toBe(1);
     const row = await prisma.lifecycleSnapshot.findUniqueOrThrow({ where: { runId: "run-a" } });
-    expect(row).toMatchObject({ ok: true, job: "plan" });
-    expect(row.createdAt.toISOString()).toBe(new Date(NOW.getTime() + 1000).toISOString());
+    expect(row).toMatchObject({ ok: false, job: "plan" });
+    expect(row.createdAt.toISOString()).toBe(NOW.toISOString());
     expect(row.finishedAt.toISOString()).toBe("2026-11-25T11:55:00.000Z");
+    await expect(store.insertSnapshot({ job: "plan", runId: "run-a", ok: true, startedAt: NOW, finishedAt: NOW, data: doc("run-a") }, NOW)).rejects.toThrow();
 
-    await store.upsertSnapshot({ job: "cve", runId: "cve-1", ok: false, startedAt: NOW, finishedAt: NOW, data: doc("cve-1", "cve", { ok: false, error: "osv: 503", requestId: "cmreq0009" }) }, new Date(NOW.getTime() + 2000));
-    for (let i = 0; i < 4; i++) await store.upsertSnapshot({ job: "smoke", runId: `smoke-${i}`, ok: true, startedAt: NOW, finishedAt: NOW, data: doc(`smoke-${i}`, "smoke") }, new Date(NOW.getTime() + 3000 + i));
+    await store.insertSnapshot({ job: "cve", runId: "cve-1", ok: false, startedAt: NOW, finishedAt: NOW, data: doc("cve-1", "cve", { ok: false, error: "osv: 503", requestId: "cmreq0009" }) }, new Date(NOW.getTime() + 2000));
+    for (let i = 0; i < 4; i++) await store.insertSnapshot({ job: "smoke", runId: `smoke-${i}`, ok: true, startedAt: NOW, finishedAt: NOW, data: doc(`smoke-${i}`, "smoke") }, new Date(NOW.getTime() + 3000 + i));
     expect(await store.pruneSnapshots("smoke", 2)).toBe(2);
     expect((await prisma.lifecycleSnapshot.findMany({ where: { job: "smoke" }, orderBy: { createdAt: "asc" } })).map((s) => s.runId)).toEqual(["smoke-2", "smoke-3"]);
     expect(await store.pruneSnapshots("smoke", 2)).toBe(0);
@@ -163,11 +169,13 @@ describe.skipIf(!url)("prismaLifecycleStore on Postgres", () => {
     expect(await prisma.lifecycleRequest.count()).toBe(1);
 
     // a different kind, and a smoke for another scope or bundle, are not "identical"
-    const smoke = { scope: "preview" as const, bundleKey: KEY, targets: [{ name: "s", baseUrl: "https://plo-2611-s.prv.twizz.com" }] };
+    const smoke = { scope: "preview" as const, bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] };
     expect((await enqueueLifecycleRequest(prisma, { kind: "cve", params: {}, requestedBy: "nick" })).created).toBe(true);
     expect((await enqueueLifecycleRequest(prisma, { kind: "smoke", params: smoke, requestedBy: "nick" })).created).toBe(true);
     expect((await enqueueLifecycleRequest(prisma, { kind: "smoke", params: smoke, requestedBy: "igor" })).created).toBe(false);
-    expect((await enqueueLifecycleRequest(prisma, { kind: "smoke", params: { ...smoke, scope: "stg" }, requestedBy: "nick" })).created).toBe(true);
+    expect((await enqueueLifecycleRequest(prisma, { kind: "smoke", params: { scope: "stg", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "https://sentinel-stg.prv.twizz.com" }] }, requestedBy: "nick" })).created).toBe(true);
+    // a target of the other scope's form is never queued (the queue validates what it stores)
+    await expect(enqueueLifecycleRequest(prisma, { kind: "smoke", params: { ...smoke, scope: "stg" }, requestedBy: "nick" })).rejects.toThrow();
 
     // once the first is finished, the same kind may be queued again
     const store = prismaLifecycleStore(prisma);
@@ -176,6 +184,24 @@ describe.skipIf(!url)("prismaLifecycleStore on Postgres", () => {
     expect((await enqueueLifecycleRequest(prisma, { kind: "plan", params: {}, requestedBy: "nick" })).created).toBe(true);
     await expect(enqueueLifecycleRequest(prisma, { kind: "plan", params: { stage: "prod" } as never, requestedBy: "nick" })).rejects.toThrow();
     expect((await readRequests(prisma)).length).toBe(5);
+  });
+
+  it("a claim and its audit row are one transaction: when the audit row cannot be written the request is pending again", async () => {
+    await pending(1);
+    const store = prismaLifecycleStore(prisma);
+    await expect(
+      store.transaction(async (tx) => {
+        expect((await tx.claimOldestPending(NOW))?.id).toBe("cmreq0000");
+        throw new Error("audit table unavailable");
+      }),
+    ).rejects.toThrow("audit table unavailable");
+    expect((await prisma.lifecycleRequest.findUniqueOrThrow({ where: { id: "cmreq0000" } })).status).toBe("pending");
+    // bindRun: once, and only while claimed
+    expect(await store.bindRun("cmreq0000", "r-1")).toBe(false);
+    await store.claimOldestPending(NOW);
+    expect(await store.bindRun("cmreq0000", "r-1")).toBe(true);
+    expect(await store.bindRun("cmreq0000", "r-2")).toBe(false);
+    expect((await store.getRequest("cmreq0000"))?.runId).toBe("r-1");
   });
 
   it("readSignoffs returns only completed sign-off rows", async () => {
@@ -188,5 +214,8 @@ describe.skipIf(!url)("prismaLifecycleStore on Postgres", () => {
       ],
     });
     expect((await readSignoffs(prisma)).map((s) => [s.actor, s.bundleKey])).toEqual([["nick", KEY]]);
+    // scoped to one bundle: the key is matched inside the gate's JSON `resource`
+    expect((await readSignoffs(prisma, KEY)).map((s) => [s.actor, s.bundleKey])).toEqual([["nick", KEY]]);
+    expect(await readSignoffs(prisma, "f".repeat(64))).toEqual([]);
   });
 });

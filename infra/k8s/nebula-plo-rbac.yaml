@@ -1,7 +1,11 @@
 # PLO in Nebula (docs/NEBULA.md §N9) on EKS-Twizz-NonProd, EKS-Moly-staging and EKS-Moly-Prod.
 # Bound to the Kubernetes group `nebula-plo`, which the EKS access entry of the IRSA role
-# twizz-nebula-plo maps to (infra/addons/index.ts). That entry also carries AmazonEKSViewPolicy
-# (read of ordinary workload objects, NO Secrets). This file adds only what the view policy lacks.
+# twizz-nebula-plo maps to (infra/addons/index.ts). That entry carries NO EKS access policy, so
+# THIS FILE (plus the RoleBindings the script adds) IS EVERYTHING THE ROLE CAN DO on a cluster.
+# AmazonEKSViewPolicy was deliberately not used: it is the built-in `view` role, i.e. pod logs,
+# ConfigMaps and every workload object of every namespace, on prod too, and PLO reads none of
+# those. What PLO's discovery actually calls (PLO src/domains/eks.ts, helm.ts): get nodes,
+# get namespaces, list secrets -l owner=helm.
 #
 # 1. nebula-plo-cluster-read (bound cluster-wide here): get/list namespaces and nodes. Names,
 #    labels, kubelet versions. No workload data.
@@ -9,16 +13,19 @@
 #    Helm keeps each release, INCLUDING ITS VALUES, in a Secret labelled owner=helm, and that is
 #    the only place the installed chart version can be read. RBAC cannot filter by label or by
 #    type, so wherever this role is bound the group can read EVERY Secret of that namespace, not
-#    only Helm's. scripts/nebula-plo-access.sh binds it with a RoleBinding per namespace that
-#    holds a Helm release today, and nowhere else. On NonProd those namespaces are argocd, auth,
-#    cert-manager, external-secrets and ingress-nginx (2026-11-25): the group can therefore read
-#    Argo CD's repository and cluster credentials and the oauth2-proxy secrets. On staging and
-#    prod it is whatever the script reports when it runs; read that list before accepting it.
+#    only Helm's. scripts/nebula-plo-access.sh binds it with a RoleBinding only in the namespaces
+#    an operator names (--helm-namespaces), and refuses the ones that hold platform credentials
+#    (argocd, auth, external-secrets, cert-manager, kube-system, nebula, sentinel) unless they
+#    are also listed in PLO_HELM_ALLOW_SENSITIVE. On NonProd the namespaces with Helm releases
+#    are argocd, auth, cert-manager, external-secrets and ingress-nginx (2026-11-25): opening
+#    argocd hands the group Argo CD's repository and cluster credentials, opening auth the
+#    oauth2-proxy cookie secret.
 #    `list` only: no get by name, no watch, and no write verb anywhere in this file.
-#    No pods/exec, no pods/log, no configmaps beyond the view policy.
-# Without a binding of (2) PLO's Helm tier reports a discovery error and every other tier works.
-# Applied by scripts/nebula-plo-access.sh. Remove = delete every object labelled
-# app.kubernetes.io/part-of=nebula-plo (ClusterRoles, ClusterRoleBinding, RoleBindings).
+#    No pods, no pods/log, no pods/exec, no configmaps, no workload objects.
+# Without a binding of (2) PLO's Helm tier reports a coverage gap and every other tier works.
+# Applied by scripts/nebula-plo-access.sh, which also verifies the grants AND the denials.
+# Remove = delete every object labelled app.kubernetes.io/part-of=nebula-plo (ClusterRoles,
+# ClusterRoleBinding, RoleBindings).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
@@ -39,8 +46,8 @@ subjects:
   - { apiGroup: rbac.authorization.k8s.io, kind: Group, name: nebula-plo }
 ---
 # No binding here on purpose: see (2) above. The script creates
-#   RoleBinding nebula-plo-helm-releases  in each Helm-release namespace, or, only when run with
-#   --cluster-wide, ClusterRoleBinding nebula-plo-helm-releases (every Secret of the cluster).
+#   RoleBinding nebula-plo-helm-releases  in each namespace an operator named, or, only when run
+#   with --cluster-wide, ClusterRoleBinding nebula-plo-helm-releases (every Secret of the cluster).
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:

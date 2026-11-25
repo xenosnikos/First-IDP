@@ -1041,7 +1041,9 @@ Nebula or in-cluster PLO change a cluster.*
    talks to the Nebula database.
 2. The dashboard validates it (Zod, `@twizz-idp/shared` `lifecycle.ts`, schemaVersion 1),
    strips unknown keys, stores the parsed output in `LifecycleSnapshot` and writes an AuditLog
-   row (`lifecycle.ingest`, actor `plo`). Same `runId` replaces; the newest 60 per job are kept.
+   row (`lifecycle.ingest`, actor `plo`). A snapshot is written ONCE: the same `runId` with the
+   same content is an idempotent retry (200 `{id, duplicate: true}`, nothing changes), with
+   different content a 409 — a stored snapshot is never replaced. The newest 60 per job are kept.
 3. `/lifecycle` renders the latest snapshots: Schedule · Tiers · Advisories · Preview · History.
 4. On-demand runs are **requests**: an operator confirms through the gate, a `LifecycleRequest`
    row is inserted, and the `plo-dispatch` CronJob claims it within about 5 minutes
@@ -1049,8 +1051,9 @@ Nebula or in-cluster PLO change a cluster.*
    publishes a snapshot and calls `…/requests/:id/complete`. The dashboard writes nothing to a
    kube API for this.
 5. The monthly **bundle** (one branch `plo/bundle/<yyyy-mm>` per repository, every upgrade PR
-   merged into it) goes through a state machine keyed by `bundleKey` (sha256 over the bundled
-   `owner/name@sha` set): `no-bundle → bundle-ready → preview-requested → preview-up →
+   merged into it) goes through a state machine keyed by `bundleKey` (sha256 over the sorted
+   `owner/name@sha` lines of every bundle with a head — Nebula RECOMPUTES it, see "Who is
+   trusted for what"): `no-bundle → bundle-ready → preview-requested → preview-up →
    smoke-preview-pass|fail → stg-requested → stg-deployed → smoke-stg-pass|fail →
    awaiting-signoff → signed-off`. Five gated operator writes move it (below). A new bundle
    starts again at `bundle-ready`; no evidence carries over.
@@ -1071,11 +1074,47 @@ is silently NOT covered — the pane shows what was found, never "this component
 
 **Trust boundaries.**
 - **Ingest routes** (`/api/lifecycle/ingest`, `/requests/claim`, `/requests/:id/complete`):
-  bearer `LIFECYCLE_INGEST_TOKEN` (SM `preview/nebula` via `nebula-env`), compared with
+  bearer `LIFECYCLE_INGEST_TOKEN` (Kubernetes Secret `plo-env` ← SM `nebula/plo`, the one copy
+  PLO itself presents; never under `preview/*`, which every preview pod's role can read), compared with
   `timingSafeEqual` over sha256 digests. Unset or shorter than 32 chars → every call is 503
   (fail closed). Not session routes: deliberately NOT in the middleware matcher (a test pins
   that no matcher entry is a prefix of `/api/lifecycle/*`). Bodies over 4 MB are refused before
   parsing; a rejected snapshot answers with Zod issue paths only, never values.
+- **Who is trusted for what (review 2026-11-25).** Treat whoever holds the ingest token as
+  possibly compromised; this is exactly what its word is worth:
+  - *plan / cve snapshots*: display only. They move no gate.
+  - *source snapshots*: WHICH bundle exists. `bundleKey` is recomputed from `bundles`
+    (`lifecycleBundleKey`, PLO's `computeBundleKey` byte for byte): ingest rejects a source
+    snapshot whose key is not that hash (400 `bundleKey: not_the_hash_of_bundles`), and the
+    reader drops one that is stored anyway and says so. Every gated write — create, smoke,
+    deploy, sign-off — then re-reads every bundle branch head from GitHub and refuses when one
+    moved or is gone. So a snapshot can only ever point a gate at commits that really are the
+    heads of those branches; it cannot keep a tested key and re-point it at another commit.
+  - *smoke snapshots*: the smoke VERDICT. **This is the one piece of gate evidence that is the
+    holder's own word — Nebula cannot verify that the checks ran.** It is bound as far as a
+    self-reported result can be: accepted only as the answer to a smoke request Nebula itself
+    created (an operator, through the gate), only while that request is `claimed`, only for
+    the request's own scope and bundle key, and only ONCE — ingest binds the request to the
+    snapshot's `runId`, a second result is a 409, and `complete` cannot name another run. The
+    verdict reads exactly that run, requires it to have been RECEIVED (server clock) after the
+    claim and not after the completion, and requires every check to be a check of one of the
+    request's own targets. A later snapshot can therefore never change a recorded verdict.
+  - *`included` pull requests*: the sign-off asks GitHub for each one and comments only on an
+    open pull request of that repository whose head commit is contained in the bundle head.
+  - Not from the token holder at all: the request rows, the named-env manifests and their
+    build records (gitops), image existence (ECR), what staging and the previews RUN (Argo),
+    the sign-off (AuditLog).
+- **`LIFECYCLE_DISPATCH_TOKEN` — the dispatcher's own credential.** With one shared token every
+  PLO pod (and anything that can read the token) could answer a smoke request. With this second
+  secret (≥ 32 chars, different from the ingest token) the two are separate credentials: the
+  request queue (`claim`, `complete`) and smoke snapshots need the dispatch token; `source`
+  snapshots need the ingest token; plan/cve snapshots take either. A misconfigured second
+  token is a 503, never a fall back. It is wired end to end: `scripts/nebula-set-plo-secrets.sh`
+  writes both tokens into SM `nebula/plo` (`NEBULA_INGEST_TOKEN`, `NEBULA_DISPATCH_TOKEN`);
+  twizz-gitops syncs the second into its own Secret `plo-dispatch-env`, which only the
+  `plo-dispatch` pod (as its `NEBULA_INGEST_TOKEN`) and the dashboard mount. The code still
+  runs without it (one shared credential) and the Preview pane then says so under "Holding it
+  back" — that is the state of a dashboard that started before `plo-dispatch-env` synced.
 - Externally these paths sit behind the browser SSO gate AND the bearer. **In-cluster, on the
   Service, the bearer is the only credential and there is no rate limit**: any pod in the
   NonProd cluster may try tokens. The token is 32 random bytes.
@@ -1083,11 +1122,15 @@ is silently NOT covered — the pane shows what was found, never "this component
   `plo-source` (no IAM role, no kube token) as an init container holding only `GH_TOKEN`; a
   second container holds only the ingest token, runs no repo code, re-validates the files and
   POSTs. The ingest token is never in the environment of a container that runs repo code.
-- **Helm discovery exposure.** SA `plo` → IRSA role `twizz-nebula-plo` (read-only) with
-  `AmazonEKSViewPolicy` on the three clusters plus `list secrets` in the namespaces that hold
-  Helm releases (`infra/k8s/nebula-plo-rbac.yaml`). Helm stores a release with its values in
+- **Helm discovery exposure.** SA `plo` → IRSA role `twizz-nebula-plo` (read-only). On each of
+  the three clusters its access entry maps to the group `nebula-plo` and carries NO EKS access
+  policy (`AmazonEKSViewPolicy` would add pod logs and ConfigMaps of every namespace); the group
+  may get/list namespaces and nodes, plus `list secrets` in the namespaces an operator NAMES
+  when running `scripts/nebula-plo-access.sh --helm-namespaces …` (`infra/k8s/nebula-plo-rbac.yaml`;
+  a plain run opens none). Helm stores a release with its values in
   a Secret and RBAC cannot filter by label, so that role can read every Secret of those
-  namespaces (on NonProd that includes `argocd`, `auth`, `external-secrets`). PLO keeps Helm
+  namespaces (on NonProd the candidates include `argocd`, `auth`, `external-secrets` — the script asks
+  for an explicit override before opening those). PLO keeps Helm
   values out of every snapshot and Nebula stores only the parsed schema, but the role can read
   them. Without that RBAC the Helm tier reports a discovery error and the rest still works.
 - **`global_deny`**: no gate field of the five tools ever carries "prod" or "staging"; the
@@ -1103,9 +1146,51 @@ only a run kind, a scope or a bundle key.
 |---|---|---|
 | `lifecycleRequestRun {kind}` | `lifecycle_request_run` | queue a `plan` or `cve` run (refused while one is pending/claimed) |
 | `lifecycleCreatePreview {bundleKey}` | `lifecycle_create_preview` | one named env `plo-<yymm>-<service>` per bundled registry service, pinned to the bundle head, 72 h, through `createEnvFromRepo`; all or nothing against the env cap |
-| `lifecycleRequestSmoke {scope, bundleKey}` | `lifecycle_request_smoke` | queue a smoke run; targets are built server-side (preview envs, or the fixed staging hosts) |
+| `lifecycleRequestSmoke {scope, bundleKey}` | `lifecycle_request_smoke` | queue a smoke run; targets are built server-side: for `preview` each env's Service inside the cluster, for `stg` the fixed staging hosts |
 | `lifecycleDeployStg {bundleKey}` | `lifecycle_deploy_stg` | open the staging promotion PR(s) with each preview env's image, through `promoteRelease`; needs a passed preview smoke |
 | `lifecycleSignoff {bundleKey}` | `lifecycle_signoff` | the human gate: AuditLog `nebula.lifecycle_signoff` + one comment per bundled PR |
+
+**What the gates mean by their words — each fails closed** (review 2026-11-25):
+- *the bundle's preview env* is ONE env: the one named `plo-<yymm>-<service>`, built from that
+  repository, that bundle branch and that head sha, for that service, and created by a Nebula
+  operator. Any other env — another `plo-*` name on the same commit, the right name from
+  another commit or branch, the right name owned by a non-operator — is never adopted; it is
+  listed under "Holding it back" and the flow stops. The `plo-` prefix is RESERVED: only
+  `lifecycle_create_preview` creates such an env (`createEnvFromRepo` / `createNamedEnv` and
+  their tRPC procedures refuse the name for everyone, operators included; policy.yaml denies
+  it for `create_named_env`).
+- *up* / *deployed* = gitops names the bundle image (`nb-<envName>-<sha12>`, exactly), Argo is
+  Synced + Healthy, **and Argo's `status.summary.images` reports the pods on that image and no
+  other tag of that repository**. Synced + Healthy alone is not it: between a promotion merge
+  (or a rebuild) and Argo's next poll (~3 min) it still describes the previous image. An
+  Application that reports no images is "not deployed".
+- *a smoke target* has ONE form per scope, the same on both sides (shared `LifecycleSmokeParams`,
+  PLO `smoke.allowedHosts`): `preview` → `http://<service>.env-<envName>.svc.cluster.local[:<port>]`,
+  the env's own Service on the port its manifest records (that branch's `twizz.yaml`); `stg` →
+  `https://<short>-stg.prv.twizz.com`. A preview smoke does NOT go through the public host
+  `https://<envName>.prv.twizz.com`: every preview Ingress is behind the ingress-nginx Google
+  sign-in gate, which answers an unauthenticated GET with 302 whatever the app does (gitops
+  review #3). `plo-dispatch` runs in the same cluster and calls the Service directly. A target
+  of one scope is never accepted for the other, and a preview target must be the Service of
+  the target's own registry service.
+- *the smoke passed* = the verdict above, AND it covered every expected service at the origin
+  where the bundle runs (for a preview: that env's Service, on that env's port) with at least
+  one passing check, AND the request was created after
+  the env was built AND after Argo finished rolling out what runs now
+  (`status.operationState.finishedAt`, phase Succeeded). An unknown rollout time is not
+  evidence: run the smoke again.
+- *sign-off* needs the preview smoke of EVERY bundled service — also when the bundle has a
+  staging route. The staging smoke only calls the release-train services and can never stand
+  in for the others.
+- *a bundle* comes from a SUCCESSFUL source run. A failed run's partial bundle is shown and
+  cannot be previewed, deployed or signed off.
+- *the image that goes to staging* is the one the bundle's own preview env runs, built with
+  the dockerfile, context and kind the repository's `twizz.yaml` declares at the bundle head.
+- **Frontends and staging.** A preview image whose build args carry a preview-domain address
+  that is not one of the fixed staging hosts is NOT promoted (`lifecycle_deploy_stg` refuses
+  the whole call and says which arg). `lifecycle_create_preview` builds a bundled frontend
+  against its bundled backend's 72 h preview env, so today **a bundle that contains
+  `twizz-admin` cannot be taken to staging from `/lifecycle`** — see **Not done**.
 
 **The tab** (`/lifecycle`, sidebar `Lc`). Header: six tiles (outdated, critical/high, known
 exploited, bundle state, last plan, last CVE scan — each a button to its pane) and ONE "next"
@@ -1138,7 +1223,8 @@ outdated.
 **Where it runs.** twizz-gitops `apps/nebula/plo.yaml`: CronJobs `plo-cve` (`30 5 * * *`),
 `plo-plan` (`0 6 * * 1`), `plo-source` (`0 7 2 * *`), `plo-dispatch` (`*/5 * * * *`), all UTC,
 all shipped `suspend: true` with the image placeholder `plo-REPLACE_WITH_SHA`. ExternalSecret
-`plo-env` (SM `preview/plo`: `NEBULA_INGEST_TOKEN`). Image `twizz-idp:plo-<sha>` in ECR,
+`plo-env` (SM `nebula/plo`: `NEBULA_INGEST_TOKEN`, the publishers') and `plo-dispatch-env`
+(SM `nebula/plo`: `NEBULA_DISPATCH_TOKEN`, only `plo-dispatch`). Image `twizz-idp:plo-<sha>` in ECR,
 built by PLO's own `build-image.yml`; `scripts/nebula-plo-access.sh` adds the ECR keep-rule
 for `plo-*`. The schedule's source of truth is PLO `config/inventory.yaml` `schedule:`. The
 staging infrastructure sweep and the prod promotion stay in PLO's GitHub Actions workflow;
@@ -1168,20 +1254,39 @@ staging infrastructure sweep and the prod promotion stay in PLO's GitHub Actions
   (`inferRouterOutputs`) and from the action functions (type-only imports).
 - MCP: read tools `lifecycle_overview` and `lifecycle_advisories`. No lifecycle write is
   exposed over MCP.
-- Env: `LIFECYCLE_INGEST_TOKEN` (required for ingest). `NEBULA_STAGING_API_URL` is now also
+- Env: `LIFECYCLE_INGEST_TOKEN` (required for ingest; from Secret `plo-env`);
+  `LIFECYCLE_DISPATCH_TOKEN` (the dispatcher's own credential, from Secret `plo-dispatch-env`; see
+  **Trust boundaries**). `NEBULA_STAGING_API_URL` is now also
   the build-time API a bundled frontend preview attaches to when its backend is not in the
   same bundle.
-- Tests (2026-11-25): shared 17, actions 216, dashboard 390 passed + 8 skipped (the opt-in
-  real-Postgres store test, `LIFECYCLE_TEST_DATABASE_URL`). The UI's pure helpers:
-  `lib/nebula/__tests__/lifecycle.test.ts` (47).
+- Tests (2026-11-25, after the external review): shared 30, actions 234, reaper 17, dashboard
+  438 passed + 9 skipped (the opt-in real-Postgres store test, `LIFECYCLE_TEST_DATABASE_URL`;
+  run separately against a throwaway local `postgres:17-alpine` with the three migrations
+  applied: 9 passed, including the claim/audit rollback and the jsonb-reordered idempotent
+  retry). The gate-bypass claims of the review are pinned end to end in
+  `lifecycle-actions.test.ts` ("gate bypass claims", "a compromised ingest-token holder").
 
 **Gotchas.**
 - "Latest" is by time RECEIVED, staleness by the run's own `finishedAt`. A failed newer run
   does not replace the data shown; the pane says so.
 - A smoke verdict belongs to the LATEST request for (scope, bundle): re-running suspends an
   older pass until the new run reports.
-- "Up" and "deployed" need Argo `PASS`. Argo unreachable fails closed and is listed under
-  "Holding it back".
+- "Up" and "deployed" need Argo `PASS` AND Argo reporting the pods on the expected image (see
+  above). Argo unreachable fails closed and is listed under "Holding it back". For the few
+  minutes after a promotion merge the page says "gitops is on the bundle image but Argo does
+  not report the pods on it yet" — that is the rollout, not a fault.
+- Anything that re-syncs a preview env or staging after its smoke (a rebuild, new env vars, a
+  later promotion) makes that smoke stale: the page asks for it again before the next gate.
+- A named-env create (`create_named_env`, `create_env_from_repo`, `lifecycle_create_preview`)
+  runs under one Postgres advisory lock, so two creates cannot both count the same free slot
+  and exceed `NEBULA_MAX_NAMED_ENVS`.
+- When a preview batch is rolled back and a secret cannot be deleted, the error names the
+  secret: delete it by hand or the next create fails on it.
+- The builder's `service` input is the ECR repository (`envEcrRepo`: the registry's `ecrRepo`,
+  e.g. `molybackend` for moly-backend), the same one the watcher checks and the chart pulls.
+- Every link built from a snapshot is `https` on an allowlisted host (GitHub, osv.dev,
+  nodejs.org, nvd.nist.gov, cve.org, cisa.gov), enforced by the schema at ingest and again by
+  `<Ext>` at render; a pull request URL must be exactly that pull request's GitHub URL.
 - The gated deploy and sign-off are stricter than the buttons: they also require the smoke to
   have covered every expected service with at least one passing check. A service with no
   smoke checks in the PLO inventory therefore blocks both, with the button enabled; the gate's
@@ -1202,6 +1307,24 @@ staging infrastructure sweep and the prod promotion stay in PLO's GitHub Actions
   to be 64-hex and `startedAt`/`finishedAt` to be ISO datetimes, and the contract fixtures
   (see **Code**) pin that. No real PLO pod has posted to a real dashboard: do step 7 below
   (one manual run per job) before trusting anything.
+- **The smoke verdict is self-reported (narrowed, not closed).** Everything above binds a smoke
+  result to Nebula's own request, but the pass/fail itself is whatever the holder of the
+  DISPATCH token posts. With `LIFECYCLE_DISPATCH_TOKEN` rolled out that is the `plo-dispatch`
+  pod (PLO image only, no repository code) and whoever can read Secret `plo-dispatch-env` or SM
+  `nebula/plo`. Closing it fully would mean Nebula running the GET-only checks itself.
+- **NEEDS OWNER — `admin-stg.prv.twizz.com` is behind the SSO gate.** A staging smoke of
+  `twizz-admin` is answered 302 and fails. Exempt a health path of `staging-edge-admin` (gitops)
+  or accept that a bundle with twizz-admin cannot pass its staging smoke. (It cannot be promoted
+  from a bundle preview today anyway — next item.)
+- **NEEDS OWNER — a bundled `twizz-admin` cannot reach staging from `/lifecycle`.** Its
+  preview image bakes the API address at build time. Decide: build the bundled frontend
+  against its fixed staging API (the preview then talks to staging's backend), or make the
+  frontend read the API address at runtime. Until then the deploy is refused, by design.
+- **NEEDS OWNER — verify `twizz-gha-ecr-push` may push to `molybackend`, `twizz-frontend`
+  and `twizz-business`** (the builder now pushes where the chart pulls; before, such an env
+  was promoted onto an image its pods could not pull).
+- Existing `plo-*` envs created by hand before the prefix was reserved are not adopted unless
+  an operator owns them and they match the bundle exactly; tear any other down.
 - **A bundle that includes `twizz-admin` or `frontend` cannot be deployed to staging or signed
   off today.** PLO's inventory has smoke checks for `moly-backend` and `twizz-sentinel` only,
   and the gate needs at least one passing check per expected service. Add `smoke:` entries for
@@ -1229,32 +1352,41 @@ staging infrastructure sweep and the prod promotion stay in PLO's GitHub Actions
 **Rollout / turn-on order.** Human steps are marked **[human]**; every one is idempotent.
 1. **[human]** Review and merge the twizz-idp PR (`feat/lifecycle-tab`); `build-images.yml`
    builds `dashboard-<sha>` and `migrate-<sha>`.
-2. **[human]** `AWS_PROFILE=twizz bash scripts/nebula-set-plo-secrets.sh` — creates SM
-   `preview/plo` (`NEBULA_INGEST_TOKEN`) and merges the same value into `preview/nebula` as
-   `LIFECYCLE_INGEST_TOKEN`. Do this BEFORE merging the gitops file, or ExternalSecret
-   `plo-env` stays in SecretSyncError.
-3. **[human]** twizz-gitops: pin dashboard AND migrate to the new sha (migration
-   `0003_lifecycle` must run), sync, then force-sync ExternalSecret `nebula-env` and
-   `rollout restart deploy/dashboard`. Check: `/lifecycle` loads and shows "Nothing has
-   reported yet"; an unauthenticated `POST /api/lifecycle/ingest` from a pod answers 401, not
-   503.
-4. **[human]** `AWS_PROFILE=twizz pulumi up` in `infra/addons` — IRSA role `twizz-nebula-plo`
-   and its EKS access entries on EKS-Twizz-NonProd, EKS-Moly-staging and EKS-Moly-Prod. (Never
-   the root `infra/` program.)
-5. **[human]** `AWS_PROFILE=twizz bash scripts/nebula-plo-access.sh` (EKS admin; the SOCKS
-   tunnel up for prod). READ the namespace list it prints: that is the Secret exposure you are
-   accepting. It also adds the ECR keep-rule for `plo-*`.
+2. **[human]** `AWS_PROFILE=twizz pulumi up` in `infra/addons` — IRSA role `twizz-nebula-plo`
+   and its EKS access entries (group `nebula-plo`, no access policy) on EKS-Twizz-NonProd,
+   EKS-Moly-staging and EKS-Moly-Prod; External Secrets' read access to exactly SM `nebula/plo`
+   and `nebula/plo-source-github`; and the Deny that keeps the preview pods' role away from the
+   platform's own secrets (review the Deny list first). Never the root `infra/` program.
+3. **[human]** `AWS_PROFILE=twizz bash scripts/nebula-set-plo-secrets.sh` — creates SM
+   `nebula/plo` with `NEBULA_INGEST_TOKEN` (publishers) and `NEBULA_DISPATCH_TOKEN`
+   (dispatcher). Nothing is written under `preview/*`; the script stops if an old copy is there.
+4. **[human]** `AWS_PROFILE=twizz bash scripts/nebula-plo-access.sh` (EKS admin; the SOCKS
+   tunnel up for prod). A plain run opens NO Secrets: it lists the namespaces that hold Helm
+   releases and you name the ones to open with `--helm-namespaces <cluster>=<ns,…>` — that is
+   the Secret exposure you are accepting. It also adds the ECR keep-rule for `plo-*`.
+5. **[human]** twizz-gitops: pin dashboard AND migrate to the new sha (migration
+   `0003_lifecycle` must run) and wait for the Argo app to be Synced + Healthy. Merge the PLO
+   workload PR (`plo.yaml`, placeholder tag, suspended; `dashboard.yaml` reading the two
+   tokens). Then, with `K = kubectl --kubeconfig ~/.kube/twizz-nonprod.yaml -n nebula`:
+   `K wait --for=condition=Ready externalsecret/plo-env externalsecret/plo-dispatch-env --timeout=10m`
+   and only then `K rollout restart deploy/dashboard` (it reads both tokens at start). Check:
+   `/lifecycle` loads and shows "Nothing has reported yet", WITHOUT the shared-token notice; an
+   unauthenticated `POST /api/lifecycle/ingest` from a pod answers 401, not 503.
 6. **[human]** Create `twizz-app/platform-lifecycle-orchestrator` (private), push PLO as
    TwizzyNicky; its `build-image.yml` pushes `twizz-idp:plo-<sha>` (the OIDC role
-   `twizz-gha-ecr-push` must trust that repository). Merge the twizz-gitops PR
-   (`feat/plo-workload`) with every `plo-REPLACE_WITH_SHA` replaced. Everything is still
-   suspended.
+   `twizz-gha-ecr-push` must trust that repository). A SECOND twizz-gitops PR then replaces
+   `REPLACE_WITH_SHA` with that commit sha on all five image lines of `plo.yaml` (the file was
+   merged with the placeholder in step 5). Everything is still suspended.
 7. **[human]** One manual run per job, then read the pod log and `/lifecycle`:
-   `kubectl -n nebula create job --from=cronjob/plo-cve plo-cve-manual-1`, then the same for
-   `plo-plan`. A 400 from ingest here means the two snapshot schemas disagree — fix that first.
+   `K create job --from=cronjob/plo-cve plo-cve-manual-1`, then the same for `plo-plan`; then
+   "Run now" for plan on `/lifecycle` and `K create job --from=cronjob/plo-dispatch plo-dispatch-manual-1`.
+   A 400 from ingest here means the two snapshot schemas disagree — fix that first; a 403 means a
+   pod presents the other job's token.
 8. **[human]** Un-suspend in git, one CronJob per PR: `plo-cve`, `plo-plan`, `plo-dispatch`,
    and `plo-source` LAST (it opens real PRs and force-pushes `plo/bundle/<yyyy-mm>` on the
-   application repos; settle the decisions listed in the gitops file header first).
+   application repos). `plo-source` cannot start before its dedicated GitHub token exists
+   (`scripts/nebula-set-plo-source-token.sh`, then the ExternalSecret `plo-source-github`; the
+   gitops file header says exactly which token) — never point it at the platform PAT.
 9. **[human]** First bundle: walk it once on `/lifecycle` → Preview with an operator —
    create the preview, smoke, deploy to staging, merge the promotion on /releases, staging
    smoke, sign off — and compare each gate summary with what actually happened.

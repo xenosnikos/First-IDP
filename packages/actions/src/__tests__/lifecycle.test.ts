@@ -8,6 +8,7 @@ import {
   createLifecyclePreview,
   deployLifecycleStg,
   deployPromoteField,
+  lifecycleBundleKey,
   lifecycleSetHash,
   planDeployStg,
   planPreview,
@@ -27,7 +28,9 @@ import {
   type LifecycleSmokeEvidence,
   type LifecycleState,
 } from "../lifecycle";
-import { manifestToYaml, nebulaTag, parseManifest, type ImageInfo, type NamedEnvManifest } from "../named-envs";
+import { createEnvFromRepo } from "../env-from-repo";
+import { createNamedEnv, isReservedEnvName, manifestToYaml, nebulaTag, parseManifest, type ImageInfo, type NamedEnvManifest } from "../named-envs";
+import { parseTwizzYaml, type TwizzConfig } from "../twizz-yaml";
 import { evaluatePolicy as evaluate, loadPolicyFile, type Policy } from "../policy";
 import { releaseTarget } from "../registry";
 import { FakeBuilds, FakeEcr, FakeGitops, FakeLifecycleQueue, FakeLifecycleRepos, FakePromotions, FakeSecrets } from "./fakes";
@@ -54,6 +57,8 @@ const ENV_A = "plo-2611-twizz-admin";
 const TAG_S = nebulaTag(ENV_S, SHA_S);
 const TAG_A = nebulaTag(ENV_A, SHA_A);
 const origin = (env: string) => `https://${env}.prv.twizz.com`;
+/** where the preview smoke calls a bundle env: its Service inside the cluster (the manifests below use 8080; the admin frontend 3000) */
+const svc = (env: string, service = env.replace(/^plo-\d{4}-/, ""), port = service === "twizz-admin" ? 3000 : 8080) => `http://${service}.env-${env}.svc.cluster.local:${port}`;
 const STG_S = "https://sentinel-stg.prv.twizz.com";
 const STG_A = "https://admin-stg.prv.twizz.com";
 
@@ -62,6 +67,15 @@ const LEGACY_YAML = ["version: 2", "kind: backend", "port: 3000", "healthPath: /
 const FRONTEND_YAML = (attach = true) =>
   ["version: 2", "kind: frontend", "port: 3000", "healthPath: /", "build:", "  args:", '    NEXT_PUBLIC_API_URL: "${NEBULA_API_URL}"', "frontend:", "  framework: next", "  apiEnvVar: NEXT_PUBLIC_API_URL", "  serve: next-standalone", ...(attach ? ["attach:", "  backendService: twizz-sentinel"] : []), ""].join("\n");
 const VALUES = (svc: string) => `nameOverride: ${svc}\n\nimage:\n  repository: 848281935985.dkr.ecr.eu-west-1.amazonaws.com/${svc}\n  tag: main-0000000000000000000000000000000000000000 # promoted by Nebula\n`;
+
+/** when Argo finished rolling an env / staging out: after its build (10:10), before the smoke requests (11:00) */
+const ROLLED_OUT = "2026-11-25T10:15:00.000Z";
+
+const parseTwizzYamlOk = (text: string): TwizzConfig => {
+  const r = parseTwizzYaml(text);
+  if (!r.ok) throw new Error("fixture twizz.yaml is invalid");
+  return r.config;
+};
 
 const yes = { allowed: true } as const;
 const no = (reason: string) => ({ allowed: false as const, reason });
@@ -79,7 +93,7 @@ function bundle(github: string, sha: string | null, service: string | null, over
     note: service ? null : "not a Nebula registry service: no preview route in Nebula",
     envName: service ? `plo-2611-${service}` : null,
     env: null,
-    staging: promotable ? { deployed: false, promotion: null } : null,
+    staging: promotable ? { deployed: false, rolledOutAt: null, promotion: null } : null,
     ...over,
   };
 }
@@ -169,12 +183,12 @@ function deployed(w: World, name: string, repo: string, sha: string, service: st
     frontendOrigins: [],
     source: { repo, ref: BRANCH, sha },
     build: { status: "PASS", expectedTag: nebulaTag(name, sha), startedAt: "2026-11-25T10:00:00.000Z", finishedAt: "2026-11-25T10:10:00.000Z" },
-    config: { port: 8080, healthPath: "/health", rev: 1, envVarNames: [] },
+    config: { port: 8080, healthPath: "/health", rev: 1, envVarNames: [], dockerfile: "Dockerfile", context: "." },
     ...over,
   };
   w.gitops.files.set(`${where === "pending" ? "named-envs/pending" : "named-envs"}/${name}.yaml`, manifestToYaml(m));
   const b = w.state.bundles.find((x) => x.github === repo);
-  if (b) b.env = { name, up: where === "deployable" };
+  if (b) b.env = { name, up: where === "deployable", rolledOutAt: where === "deployable" ? ROLLED_OUT : null, port: m.config?.port ?? null };
 }
 
 /** both previews up and smoked: the state a deploy to staging starts from */
@@ -183,8 +197,10 @@ function smokedPreview(bundles?: LifecycleBundleState[]) {
   const targets: Array<{ name: string; baseUrl: string }> = [];
   for (const b of w.state.bundles) {
     if (!b.previewable) continue;
-    deployed(w, b.envName!, b.github, b.headSha!, b.service!);
-    targets.push({ name: b.service!, baseUrl: origin(b.envName!) });
+    // a bundled frontend built against its fixed staging API (the only kind of frontend image that may go to staging)
+    const frontend = b.service === "twizz-admin" ? { kind: "frontend" as const, config: { port: 3000, healthPath: "/", rev: 1, envVarNames: [], dockerfile: "Dockerfile", context: ".", buildArgs: { NEXT_PUBLIC_API_URL: STG_S } } } : {};
+    deployed(w, b.envName!, b.github, b.headSha!, b.service!, frontend);
+    targets.push({ name: b.service!, baseUrl: svc(b.envName!) });
   }
   w.state.smoke.preview = passed("preview", targets);
   return w;
@@ -308,7 +324,9 @@ describe("lifecycle_create_preview", () => {
     expect(w.gitops.atomic).toHaveLength(2);
     expect([...w.secrets.store.keys()].filter((k) => k.includes("/plo-")).sort()).toEqual([`preview/moly-backend/${ENV_B}`, `preview/twizz-sentinel/${ENV_S}`]);
     expect(w.builds.dispatched.map((d) => [d.envName, d.repo, d.ref, d.sha, d.service])).toEqual([
-      [ENV_B, "Moly-backend", BRANCH, SHA_B, "moly-backend"],
+      // (external review 2026-11-25, idp #16) was "moly-backend": the builder's `service` is the ECR repository it
+      // pushes to, and the chart pulls moly-backend from `molybackend` — the image has to land there
+      [ENV_B, "Moly-backend", BRANCH, SHA_B, "molybackend"],
       [ENV_S, "twizz-sentinel", BRANCH, SHA_S, "twizz-sentinel"],
     ]);
     // the action re-read the state inside itself: once to plan here, once in the action
@@ -319,7 +337,7 @@ describe("lifecycle_create_preview", () => {
     const w = world();
     await create(w);
     const before = wrote(w);
-    for (const b of w.state.bundles) b.env = { name: b.envName!, up: false };
+    for (const b of w.state.bundles) b.env = { name: b.envName!, up: false, rolledOutAt: ROLLED_OUT, port: 8080 };
     await expect(planPreview(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/every bundled service already has a preview env for this bundle/));
     await expect(createLifecyclePreview(w.deps, { bundleKey: KEY, setHash: "x".repeat(64), envs: `${ENV_B} ${ENV_S}`, actor: "nick" })).rejects.toEqual(refusal(/already has a preview env/));
     expect(wrote(w)).toEqual(before);
@@ -511,8 +529,44 @@ describe("lifecycle_request_smoke", () => {
     const w = up();
     const r = await request(w, "preview");
     expect(r).toMatchObject({ requestId: "req-1", scope: "preview", bundleKey: KEY, status: "pending" });
-    expect(r.targets).toEqual([{ name: "moly-backend", baseUrl: origin(ENV_B) }, { name: "twizz-sentinel", baseUrl: origin(ENV_S) }]);
+    expect(r.targets).toEqual([{ name: "moly-backend", baseUrl: svc(ENV_B) }, { name: "twizz-sentinel", baseUrl: svc(ENV_S) }]);
     expect(w.queue.rows[0]).toMatchObject({ kind: "smoke", requestedBy: "nick", params: { scope: "preview", bundleKey: KEY, targets: r.targets } });
+  });
+
+  // gitops review #3: every preview Ingress is behind the ingress-nginx Google sign-in gate, so an
+  // unauthenticated GET to https://<env>.prv.twizz.com is a 302 whatever the app does. The preview
+  // smoke therefore calls the env's Service inside the cluster — the one form PLO's allowlist admits
+  // for a preview besides the public host.
+  it("preview: the target is the env's in-cluster Service on the port its manifest records, never the SSO-gated public host", async () => {
+    const w = up();
+    w.state.bundles[0].env = { ...w.state.bundles[0].env!, port: 8090 };
+    w.state.bundles[1].env = { ...w.state.bundles[1].env!, port: 80 };
+    const plan = await planSmoke(w.deps, { scope: "preview", bundleKey: KEY });
+    expect(plan.targets).toEqual([
+      // port 80 is not written: PLO takes a target only when the string IS the URL's origin, and an origin drops :80
+      { name: "moly-backend", baseUrl: "http://moly-backend.env-plo-2611-moly-backend.svc.cluster.local" },
+      { name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" },
+    ]);
+    for (const t of plan.targets) expect(t.baseUrl).not.toMatch(/prv\.twizz\.com/);
+    // an env whose manifest records no port has no address to call: refused, never guessed
+    w.state.bundles[0].env = { ...w.state.bundles[0].env!, port: null };
+    await expect(planSmoke(w.deps, { scope: "preview", bundleKey: KEY })).rejects.toEqual(refusal(/twizz-sentinel: preview env plo-2611-twizz-sentinel records no usable service port/));
+    w.state.bundles[0].env = { ...w.state.bundles[0].env!, port: 70000 };
+    await expect(planSmoke(w.deps, { scope: "preview", bundleKey: KEY })).rejects.toEqual(refusal(/records no usable service port/));
+    expect(w.queue.rows).toEqual([]);
+  });
+
+  it("a preview pass counts only at the env's own Service AND on the port that Service has", async () => {
+    const w = smokedPreview();
+    // the same Service name in the same namespace, another port (the env's redis, a debug port): not this app
+    w.state.smoke.preview = passed("preview", [{ name: "moly-backend", baseUrl: svc(ENV_B) }, { name: "twizz-sentinel", baseUrl: svc(ENV_S, "twizz-sentinel", 6379) }]);
+    await expect(planDeployStg(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/checked twizz-sentinel at http:\/\/twizz-sentinel\.env-plo-2611-twizz-sentinel\.svc\.cluster\.local:6379, but plo-2611-twizz-sentinel serves at http:\/\/twizz-sentinel\.env-plo-2611-twizz-sentinel\.svc\.cluster\.local:8080/));
+    // another Service of the right namespace, and the public (SSO-gated) host, are not where the bundle runs either
+    w.state.smoke.preview = passed("preview", [{ name: "moly-backend", baseUrl: svc(ENV_B) }, { name: "twizz-sentinel", baseUrl: svc(ENV_S, "redis") }]);
+    await expect(planDeployStg(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/which is not where this bundle runs/));
+    w.state.smoke.preview = passed("preview", [{ name: "moly-backend", baseUrl: svc(ENV_B) }, { name: "twizz-sentinel", baseUrl: origin(ENV_S) }]);
+    await expect(planDeployStg(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/which is not where this bundle runs/));
+    expect(w.promotions.prs).toEqual([]);
   });
 
   it("stg: targets are the fixed staging hosts of the release-train services only", async () => {
@@ -527,7 +581,7 @@ describe("lifecycle_request_smoke", () => {
     w.state.actions.smokePreview = no("a preview smoke run is already in flight");
     await expect(request(w, "preview")).rejects.toEqual(refusal(/already in flight/));
     w.state.actions.smokePreview = yes;
-    w.state.bundles[1].env = { name: ENV_B, up: false };
+    w.state.bundles[1].env = { name: ENV_B, up: false, rolledOutAt: ROLLED_OUT, port: 8080 };
     await expect(request(w, "preview")).rejects.toEqual(refusal(/moly-backend: its preview env is not up/));
     w.state.bundles[1].env = null;
     await expect(request(w, "preview")).rejects.toEqual(refusal(/its preview env is not up/));
@@ -541,8 +595,8 @@ describe("lifecycle_request_smoke", () => {
     const w = up();
     await expect(planSmoke(w.deps, { scope: "production" as never, bundleKey: KEY })).rejects.toEqual(refusal(/scope must be preview or stg/));
     await expect(planSmoke(w.deps, { scope: "preview", bundleKey: OTHER_KEY })).rejects.toEqual(refusal(/the bundle changed/));
-    w.state.bundles[0].env = { name: "sentinel-mine", up: true };
-    await expect(planSmoke(w.deps, { scope: "preview", bundleKey: KEY })).rejects.toEqual(refusal(/is not a bundle preview env/));
+    w.state.bundles[0].env = { name: "sentinel-mine", up: true, rolledOutAt: ROLLED_OUT, port: 8080 };
+    await expect(planSmoke(w.deps, { scope: "preview", bundleKey: KEY })).rejects.toEqual(refusal(/is not this bundle's preview env/));
     const none = world([bundle(BACKEND, SHA_B, "moly-backend")]);
     await expect(planSmoke(none.deps, { scope: "stg", bundleKey: KEY })).rejects.toEqual(refusal(/no bundled service has a staging route/));
     const empty = world([bundle("twizz-app/lolygram-discover", SHA_A, null)]);
@@ -562,8 +616,8 @@ describe("lifecycle_request_smoke", () => {
 });
 
 describe("smokeGap (what 'the smoke passed' means for a write)", () => {
-  const want = [{ service: "twizz-sentinel", origins: [origin(ENV_S)] }];
-  const ok = passed("preview", [{ name: "twizz-sentinel", baseUrl: origin(ENV_S) }]);
+  const want = [{ service: "twizz-sentinel", origins: [svc(ENV_S)] }];
+  const ok = passed("preview", [{ name: "twizz-sentinel", baseUrl: svc(ENV_S) }]);
   it("holds for a pass that covered every service where it runs", () => {
     expect(smokeGap(ok, "preview", want)).toBeNull();
   });
@@ -572,15 +626,15 @@ describe("smokeGap (what 'the smoke passed' means for a write)", () => {
     expect(smokeGap({ ...ok, verdict: "running", detail: "smoke checks running" }, "preview", want)).toMatch(/has not passed/);
     expect(smokeGap({ ...ok, verdict: "fail", detail: "1 of 2 checks failed" }, "stg", want)).toMatch(/latest staging smoke for this bundle has not passed \(1 of 2 checks failed\)/);
     expect(smokeGap({ ...ok, request: null }, "preview", want)).toMatch(/has not passed/);
-    expect(smokeGap({ ...ok, results: [...ok.results, { name: "twizz-sentinel/x", url: `${origin(ENV_S)}/x`, ok: false }] }, "preview", want)).toMatch(/failing checks/);
-    expect(smokeGap(ok, "preview", [...want, { service: "moly-backend", origins: [origin(ENV_B)] }])).toMatch(/did not cover moly-backend/);
-    expect(smokeGap(ok, "preview", [{ service: "twizz-sentinel", origins: [STG_S] }])).toMatch(/checked twizz-sentinel at https:\/\/plo-2611-twizz-sentinel\.prv\.twizz\.com, which is not where this bundle runs/);
+    expect(smokeGap({ ...ok, results: [...ok.results, { name: "twizz-sentinel/x", url: `${svc(ENV_S)}/x`, ok: false }] }, "preview", want)).toMatch(/failing checks/);
+    expect(smokeGap(ok, "preview", [...want, { service: "moly-backend", origins: [svc(ENV_B)] }])).toMatch(/did not cover moly-backend/);
+    expect(smokeGap(ok, "preview", [{ service: "twizz-sentinel", origins: [STG_S] }])).toMatch(/checked twizz-sentinel at http:\/\/twizz-sentinel\.env-plo-2611-twizz-sentinel\.svc\.cluster\.local:8080, which is not where this bundle runs/);
     // a service whose inventory has no checks was verified by nobody
     expect(smokeGap({ ...ok, results: [] }, "preview", want)).toMatch(/verified nothing for twizz-sentinel/);
-    expect(smokeGap({ ...ok, results: [{ name: "moly-backend/health", url: `${origin(ENV_S)}/health`, ok: true }] }, "preview", want)).toMatch(/verified nothing for twizz-sentinel/);
+    expect(smokeGap({ ...ok, results: [{ name: "moly-backend/health", url: `${svc(ENV_S)}/health`, ok: true }] }, "preview", want)).toMatch(/verified nothing for twizz-sentinel/);
     expect(smokeGap({ ...ok, results: [{ name: "twizz-sentinel/health", url: "https://elsewhere.prv.twizz.com/health", ok: true }] }, "preview", want)).toMatch(/verified nothing for twizz-sentinel/);
     // a look-alike host is not the origin
-    expect(smokeGap({ ...ok, results: [{ name: "twizz-sentinel/health", url: `${origin(ENV_S)}.evil.com/health`, ok: true }] }, "preview", want)).toMatch(/verified nothing/);
+    expect(smokeGap({ ...ok, results: [{ name: "twizz-sentinel/health", url: `${svc(ENV_S)}.evil.com/health`, ok: true }] }, "preview", want)).toMatch(/verified nothing/);
   });
 });
 
@@ -624,10 +678,10 @@ describe("lifecycle_deploy_stg", () => {
   it("refuses a pass that did not cover every bundled service where it runs", async () => {
     const w = smokedPreview();
     const full = w.state.smoke.preview;
-    w.state.smoke.preview = passed("preview", [{ name: "twizz-sentinel", baseUrl: origin(ENV_S) }]);
+    w.state.smoke.preview = passed("preview", [{ name: "twizz-sentinel", baseUrl: svc(ENV_S) }]);
     await expect(deploy(w)).rejects.toEqual(refusal(/did not cover moly-backend/));
-    w.state.smoke.preview = passed("preview", [{ name: "twizz-sentinel", baseUrl: "https://plo-2610-twizz-sentinel.prv.twizz.com" }, { name: "moly-backend", baseUrl: origin(ENV_B) }]);
-    await expect(deploy(w)).rejects.toEqual(refusal(/checked twizz-sentinel at https:\/\/plo-2610-twizz-sentinel\.prv\.twizz\.com, which is not where this bundle runs/));
+    w.state.smoke.preview = passed("preview", [{ name: "twizz-sentinel", baseUrl: svc("plo-2610-twizz-sentinel", "twizz-sentinel") }, { name: "moly-backend", baseUrl: svc(ENV_B) }]);
+    await expect(deploy(w)).rejects.toEqual(refusal(/checked twizz-sentinel at http:\/\/twizz-sentinel\.env-plo-2610-twizz-sentinel\.svc\.cluster\.local:8080, which is not where this bundle runs/));
     w.state.smoke.preview = { ...full, results: full.results.filter((r) => !r.name.startsWith("twizz-sentinel/")) };
     await expect(deploy(w)).rejects.toEqual(refusal(/verified nothing for twizz-sentinel/));
     expect(w.promotions.prs).toEqual([]);
@@ -665,7 +719,7 @@ describe("lifecycle_deploy_stg", () => {
     const rebuilding = smokedPreview();
     rebuilding.gitops.files.delete(`named-envs/${ENV_S}.yaml`);
     deployed(rebuilding, ENV_S, SENTINEL, SHA_S, "twizz-sentinel", { imageTag: undefined, build: { status: "RUNNING", expectedTag: TAG_S, startedAt: "2026-11-25T11:30:00.000Z" } }, "pending");
-    rebuilding.state.bundles[0].env = { name: ENV_S, up: false };
+    rebuilding.state.bundles[0].env = { name: ENV_S, up: false, rolledOutAt: ROLLED_OUT, port: 8080 };
     await expect(deploy(rebuilding)).rejects.toEqual(refusal(/is being \(re\)built/));
 
     const other = smokedPreview();
@@ -707,11 +761,11 @@ describe("lifecycle_deploy_stg", () => {
     await expect(deploy(none)).rejects.toEqual(refusal(/no bundled service is on the release train: no staging route in Nebula \(deploys via the repo's own pipeline on merge\)/));
 
     const open = smokedPreview();
-    open.state.bundles[0].staging = { deployed: false, promotion: { number: 77, url: "https://github.com/TwizzyNicky/twizz-gitops/pull/77", imageTag: TAG_S } };
+    open.state.bundles[0].staging = { deployed: false, rolledOutAt: ROLLED_OUT, promotion: { number: 77, url: "https://github.com/TwizzyNicky/twizz-gitops/pull/77", imageTag: TAG_S } };
     await expect(deploy(open)).rejects.toEqual(refusal(/every promotable service is already promoted or deployed/));
 
     const live = smokedPreview();
-    live.state.bundles[0].staging = { deployed: true, promotion: null };
+    live.state.bundles[0].staging = { deployed: true, rolledOutAt: ROLLED_OUT, promotion: null };
     await expect(deploy(live)).rejects.toEqual(refusal(/already promoted or deployed/));
 
     // gitops already on the image, Argo not confirmed yet: nothing to open either
@@ -723,7 +777,7 @@ describe("lifecycle_deploy_stg", () => {
 
   it("promotes only what still needs it and lists the rest", async () => {
     const w = smokedPreview([bundle(SENTINEL, SHA_S, "twizz-sentinel"), bundle(ADMIN, SHA_A, "twizz-admin")]);
-    w.state.bundles[0].staging = { deployed: false, promotion: { number: 77, url: "https://github.com/TwizzyNicky/twizz-gitops/pull/77", imageTag: TAG_S } };
+    w.state.bundles[0].staging = { deployed: false, rolledOutAt: ROLLED_OUT, promotion: { number: 77, url: "https://github.com/TwizzyNicky/twizz-gitops/pull/77", imageTag: TAG_S } };
     const plan = await planDeployStg(w.deps, { bundleKey: KEY });
     expect(plan.promote.map((p) => [p.service, p.imageTag])).toEqual([["twizz-admin", TAG_A]]);
     expect(plan.already).toEqual([{ service: "twizz-sentinel", reason: "promotion PR #77 is open — merge it on /releases", prNumber: 77, prUrl: "https://github.com/TwizzyNicky/twizz-gitops/pull/77" }]);
@@ -766,7 +820,7 @@ describe("lifecycle_signoff", () => {
   /** staging runs the bundle and its smoke passed */
   const ready = () => {
     const w = smokedPreview();
-    w.state.bundles[0].staging = { deployed: true, promotion: null };
+    w.state.bundles[0].staging = { deployed: true, rolledOutAt: ROLLED_OUT, promotion: null };
     w.state.smoke.stg = passed("stg", [{ name: "twizz-sentinel", baseUrl: STG_S }]);
     return w;
   };
@@ -785,12 +839,13 @@ describe("lifecycle_signoff", () => {
     const body = w.repos.comments.find((c) => c.repo === SENTINEL && c.pr === 9)!.body;
     expect(body).toContain(`Signed off in Nebula by igor for bundle ${KEY.slice(0, 12)}; preview + smoke evidence:`);
     expect(body).toContain("- This repository: `plo/bundle/2026-11` at `a1a1a1a1a1a1`");
-    expect(body).toContain(`- Preview smoke: PASS, 2 checks, run \`smoke-preview-1\`, finished 2026-11-25T11:05:00.000Z — ${origin(ENV_B)}, ${origin(ENV_S)}`);
+    expect(body).toContain(`- Preview smoke: PASS, 2 checks, run \`smoke-preview-1\`, finished 2026-11-25T11:05:00.000Z — ${svc(ENV_B)}, ${svc(ENV_S)}`);
     expect(body).toContain(`- Staging smoke: PASS, 1 check, run \`smoke-stg-1\`, finished 2026-11-25T11:05:00.000Z — ${STG_S}`);
     expect(body).toContain("Nebula did not merge anything");
     expect(body).toContain(signoffMarker(KEY));
     // the only things it reached on GitHub: branch heads and comments
-    expect([...new Set(w.repos.calls)].sort()).toEqual(["comment", "hasComment", "headOf"]);
+    // (and, read-only, each included pull request: is it open and is its head in the bundle head)
+    expect([...new Set(w.repos.calls)].sort()).toEqual(["comment", "hasComment", "headOf", "isAncestor", "pullRequest"]);
     expect(w.promotions.merged).toEqual([]);
     expect(w.promotions.prs).toEqual([]);
     expect(w.gitops.commits).toEqual([]);
@@ -814,21 +869,21 @@ describe("lifecycle_signoff", () => {
       await expect(sign(w)).rejects.toEqual(refusal(/the latest staging smoke for this bundle has not passed/));
     }
     // a preview-origin pass is not a staging pass
-    w.state.smoke.stg = passed("stg", [{ name: "twizz-sentinel", baseUrl: origin(ENV_S) }]);
-    await expect(sign(w)).rejects.toEqual(refusal(/checked twizz-sentinel at https:\/\/plo-2611-twizz-sentinel\.prv\.twizz\.com, which is not where this bundle runs/));
+    w.state.smoke.stg = passed("stg", [{ name: "twizz-sentinel", baseUrl: svc(ENV_S) }]);
+    await expect(sign(w)).rejects.toEqual(refusal(/checked twizz-sentinel at http:\/\/twizz-sentinel\.env-plo-2611-twizz-sentinel\.svc\.cluster\.local:8080, which is not where this bundle runs/));
     w.state.smoke.stg = passed("stg", [{ name: "twizz-admin", baseUrl: STG_A }]);
     await expect(sign(w)).rejects.toEqual(refusal(/did not cover twizz-sentinel/));
     w.state.smoke.stg = { ...pass, results: [] };
     await expect(sign(w)).rejects.toEqual(refusal(/verified nothing for twizz-sentinel/));
     w.state.smoke.stg = pass;
-    w.state.bundles[0].staging = { deployed: false, promotion: null };
+    w.state.bundles[0].staging = { deployed: false, rolledOutAt: ROLLED_OUT, promotion: null };
     await expect(sign(w)).rejects.toEqual(refusal(/twizz-sentinel: staging is not running this bundle/));
     expect(w.repos.comments).toEqual([]);
   });
 
   it("with a staging route, a passed preview smoke alone is not enough", async () => {
     const w = smokedPreview();
-    w.state.bundles[0].staging = { deployed: true, promotion: null };
+    w.state.bundles[0].staging = { deployed: true, rolledOutAt: ROLLED_OUT, promotion: null };
     await expect(sign(w)).rejects.toEqual(refusal(/latest staging smoke for this bundle has not passed/));
     expect(w.repos.comments).toEqual([]);
   });
@@ -838,7 +893,7 @@ describe("lifecycle_signoff", () => {
     const pass = w.state.smoke.preview;
     w.state.smoke.preview = noSmoke;
     await expect(sign(w)).rejects.toEqual(refusal(/the latest preview smoke for this bundle has not passed/));
-    w.state.smoke.preview = passed("preview", [{ name: "moly-backend", baseUrl: "https://plo-2610-moly-backend.prv.twizz.com" }]);
+    w.state.smoke.preview = passed("preview", [{ name: "moly-backend", baseUrl: svc("plo-2610-moly-backend", "moly-backend") }]);
     await expect(sign(w)).rejects.toEqual(refusal(/which is not where this bundle runs/));
     w.state.smoke.preview = pass;
     deployed(w, ENV_B, BACKEND, SHA_B, "moly-backend", { build: { status: "PASS", expectedTag: nebulaTag(ENV_B, SHA_B), startedAt: "2026-11-25T11:20:00.000Z", finishedAt: "2026-11-25T11:30:00.000Z" } });
@@ -930,5 +985,281 @@ describe("lifecycle_signoff", () => {
     expect(body).toContain("- Record: https://nebula.example/lifecycle");
     // a bare login, never an @mention
     expect(body).not.toContain("@nick");
+  });
+});
+
+// ══ external review 2026-11-25 — regression tests, at the action (the function the gate runs) ══════════
+
+describe("external review: the bundle's preview env is ONE env, by name, and its name cannot be taken (idp #1)", () => {
+  it("smoke: an env that is not the bundle's own is never a target, whatever else matches", async () => {
+    const w = world();
+    for (const b of w.state.bundles) deployed(w, b.envName!, b.github, b.headSha!, b.service!);
+    w.state.bundles[0].env = { name: "plo-0000-hijack", up: true, rolledOutAt: ROLLED_OUT, port: 8080 };
+    await expect(planSmoke(w.deps, { scope: "preview", bundleKey: KEY })).rejects.toEqual(refusal(/"plo-0000-hijack" is not this bundle's preview env \(plo-2611-twizz-sentinel\)/));
+    expect(w.queue.rows).toEqual([]);
+  });
+
+  it("deploy: a smoke that passed at another env's origin does not count, and another env's image is never promoted", async () => {
+    // the state a loose match used to produce: env = the squatter, smoke passed at the squatter's origin
+    const w = world();
+    deployed(w, "plo-0000-hijack", SENTINEL, SHA_S, "twizz-sentinel", { owner: "mallory" });
+    deployed(w, ENV_B, BACKEND, SHA_B, "moly-backend");
+    w.state.bundles[0].env = { name: "plo-0000-hijack", up: true, rolledOutAt: ROLLED_OUT, port: 8080 };
+    w.state.smoke.preview = passed("preview", [{ name: "moly-backend", baseUrl: svc(ENV_B) }, { name: "twizz-sentinel", baseUrl: svc("plo-0000-hijack", "twizz-sentinel") }]);
+    await expect(planDeployStg(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/"plo-0000-hijack" is not this bundle's preview env/));
+    // even with the env field honest, a pass at the other origin is a pass somewhere else
+    w.state.bundles[0].env = null;
+    deployed(w, ENV_S, SENTINEL, SHA_S, "twizz-sentinel");
+    await expect(planDeployStg(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/checked twizz-sentinel at http:\/\/twizz-sentinel\.env-plo-0000-hijack\.svc\.cluster\.local:8080, which is not where this bundle runs/));
+    expect(w.promotions.prs).toEqual([]);
+  });
+
+  it("deploy: the env must have been built the way the repository declares at that commit (dockerfile, context, kind)", async () => {
+    for (const over of [{ config: { port: 8080, healthPath: "/health", rev: 1, envVarNames: [], dockerfile: "evil/Dockerfile", context: "." } }, { config: { port: 8080, healthPath: "/health", rev: 1, envVarNames: [], dockerfile: "Dockerfile", context: "evil" } }, { kind: "worker" as const }]) {
+      const w = smokedPreview();
+      deployed(w, ENV_S, SENTINEL, SHA_S, "twizz-sentinel", over);
+      await expect(planDeployStg(w.deps, { bundleKey: KEY }), JSON.stringify(over)).rejects.toEqual(refusal(/plo-2611-twizz-sentinel was not built the way twizz-app\/twizz-sentinel@a1a1a1a declares in twizz\.yaml/));
+      expect(w.promotions.prs).toEqual([]);
+    }
+    // a manifest with no build record at all has no port either: the smoke cannot even be tied to its Service
+    const bare = smokedPreview();
+    deployed(bare, ENV_S, SENTINEL, SHA_S, "twizz-sentinel", { config: undefined });
+    await expect(planDeployStg(bare.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/plo-2611-twizz-sentinel serves at an unrecorded port/));
+    expect(bare.promotions.prs).toEqual([]);
+    const gone = smokedPreview();
+    gone.repos.files.delete(`${SENTINEL}@${SHA_S}:twizz.yaml`);
+    await expect(planDeployStg(gone.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/has no valid twizz\.yaml/));
+  });
+
+  it("the plo- prefix is reserved in the actions themselves: only createLifecyclePreview may create such an env", async () => {
+    const w = world();
+    const input = { name: "plo-0000-hijack", repo: SENTINEL, ref: BRANCH, sha: SHA_S, kind: "backend" as const, db: "none" as const, ttlHours: 72, config: parseTwizzYamlOk(LEGACY_YAML), envVars: {}, actor: "mallory" };
+    await expect(createEnvFromRepo(w.deps, input)).rejects.toThrow(/reserved for Lifecycle bundle previews/);
+    await expect(createEnvFromRepo(w.deps, { ...input, name: ENV_S })).rejects.toThrow(/reserved/);
+    await expect(createEnvFromRepo(w.deps, { ...input, name: ENV_S, reserved: "something-else" })).rejects.toThrow(/reserved/);
+    await expect(createNamedEnv(w.deps, { name: "plo-2611-moly-backend", service: "moly-backend", imageTag: "build-11111111-2222-3333-4444-555555555555", db: "isolated", ttlHours: 72, actor: "nick" })).rejects.toThrow(/reserved/);
+    expect(isReservedEnvName("plo-x")).toBe(true);
+    expect(isReservedEnvName("PLO-x")).toBe(true);
+    expect(isReservedEnvName("my-plo-env")).toBe(false);
+    expect(wrote(w)).toEqual(NOTHING);
+    // the lifecycle action itself still can
+    const plan = await planPreview(w.deps, { bundleKey: KEY });
+    await createLifecyclePreview(w.deps, { bundleKey: KEY, setHash: plan.setHash, envs: previewEnvsField(plan), actor: "nick" });
+    expect(w.builds.dispatched.map((d) => d.envName)).toEqual([ENV_B, ENV_S]);
+    // and the policy refuses a hand-made one for the release-image path too
+    expect(evaluate(policy, "create_named_env", { name: "plo-2611-moly-backend", service: "moly-backend", imageTag: "build-11111111-2222-3333-4444-555555555555" }).allowed).toBe(false);
+  });
+});
+
+describe("external review: every gate re-reads the bundle heads from GitHub (idp #2, gitops #1)", () => {
+  it("smoke and deploy refuse when a bundle branch moved or is gone — not only create and sign-off", async () => {
+    const up = world();
+    for (const b of up.state.bundles) deployed(up, b.envName!, b.github, b.headSha!, b.service!);
+    up.repos.heads.set(`${BACKEND}#${BRANCH}`, "9".repeat(40));
+    await expect(planSmoke(up.deps, { scope: "preview", bundleKey: KEY })).rejects.toEqual(refusal(/Moly-backend: plo\/bundle\/2026-11 moved since the snapshot \(b2b2b2b -> 9999999\)/));
+    expect(up.queue.rows).toEqual([]);
+
+    const moved = smokedPreview();
+    moved.repos.heads.set(`${SENTINEL}#${BRANCH}`, "9".repeat(40));
+    await expect(planDeployStg(moved.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/twizz-sentinel: plo\/bundle\/2026-11 moved since the snapshot/));
+    const gone = smokedPreview();
+    gone.repos.heads.delete(`${BACKEND}#${BRANCH}`);
+    await expect(planDeployStg(gone.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/Moly-backend: branch plo\/bundle\/2026-11 no longer exists/));
+    for (const w of [moved, gone]) expect(w.promotions.prs).toEqual([]);
+
+    // a bundled repository Nebula cannot preview is still part of the key: its head is checked as well
+    const extra = smokedPreview([bundle(SENTINEL, SHA_S, "twizz-sentinel"), bundle("twizz-app/lolygram-discover", SHA_A, null)]);
+    extra.repos.heads.set(`twizz-app/lolygram-discover#${BRANCH}`, "8".repeat(40));
+    await expect(planDeployStg(extra.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/lolygram-discover: plo\/bundle\/2026-11 moved since the snapshot/));
+  });
+
+  it("lifecycleBundleKey is PLO's computeBundleKey: sorted `github@headSha` lines, case kept, null heads left out", () => {
+    const lines = [`${SENTINEL}@${SHA_S}`, `${BACKEND}@${SHA_B}`].sort();
+    const expected = createHash("sha256").update(lines.join("\n")).digest("hex");
+    expect(lifecycleBundleKey([{ github: SENTINEL, headSha: SHA_S }, { github: BACKEND, headSha: SHA_B }, { github: ADMIN, headSha: null }])).toBe(expected);
+    expect(lifecycleBundleKey([{ github: BACKEND, headSha: SHA_B }, { github: SENTINEL, headSha: SHA_S }])).toBe(expected);
+    expect(lifecycleBundleKey([{ github: SENTINEL.toUpperCase(), headSha: SHA_S }, { github: BACKEND, headSha: SHA_B }])).not.toBe(expected);
+    expect(lifecycleBundleKey([{ github: SENTINEL, headSha: SHA_A }, { github: BACKEND, headSha: SHA_B }])).not.toBe(expected);
+    expect(lifecycleBundleKey([{ github: SENTINEL, headSha: null }])).toBeNull();
+  });
+});
+
+describe("external review: staging means ROLLED OUT, and the preview smoke is never skipped (idp #3, #4, gitops #6)", () => {
+  const ready = () => {
+    const w = smokedPreview();
+    w.state.bundles[0].staging = { deployed: true, rolledOutAt: ROLLED_OUT, promotion: null };
+    w.state.smoke.stg = passed("stg", [{ name: "twizz-sentinel", baseUrl: STG_S }]);
+    return w;
+  };
+
+  it("sign-off: a staging smoke requested before staging finished rolling out is refused; so is an unknown rollout time", async () => {
+    expect((await planSignoff(ready().deps, { bundleKey: KEY })).scope).toBe("stg");
+    const late = ready();
+    late.state.bundles[0].staging = { deployed: true, rolledOutAt: "2026-11-25T11:02:00.000Z", promotion: null }; // the smoke was requested at 11:00
+    await expect(planSignoff(late.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/twizz-sentinel staging rolled out at 2026-11-25T11:02:00\.000Z, after the staging smoke was requested \(2026-11-25T11:00:00\.000Z\) — run the staging smoke again/));
+    const unknown = ready();
+    unknown.state.bundles[0].staging = { deployed: true, rolledOutAt: null, promotion: null };
+    await expect(planSignoff(unknown.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/Argo does not say when twizz-sentinel staging rolled out/));
+    const same = ready();
+    same.state.bundles[0].staging = { deployed: true, rolledOutAt: "2026-11-25T11:00:00.000Z", promotion: null }; // not strictly before: refused
+    await expect(planSignoff(same.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/after the staging smoke was requested/));
+    for (const w of [late, unknown, same]) expect(w.repos.comments).toEqual([]);
+  });
+
+  it("deploy and sign-off: a preview smoke requested before the preview env finished rolling out is refused", async () => {
+    const w = smokedPreview();
+    w.state.bundles[0].env = { name: ENV_S, up: true, rolledOutAt: "2026-11-25T11:03:00.000Z", port: 8080 };
+    await expect(planDeployStg(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/plo-2611-twizz-sentinel rolled out at 2026-11-25T11:03:00\.000Z, after the preview smoke was requested/));
+    w.state.bundles[0].env = { name: ENV_S, up: true, rolledOutAt: null, port: 8080 };
+    await expect(planDeployStg(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/Argo does not say when plo-2611-twizz-sentinel rolled out/));
+    expect(w.promotions.prs).toEqual([]);
+  });
+
+  it("sign-off with a staging route STILL needs the preview smoke of every bundled service", async () => {
+    // staging is green for twizz-sentinel; Moly-backend is not on the release train and its preview smoke…
+    const failed = ready();
+    failed.state.smoke.preview = { ...noSmoke, verdict: "fail", detail: "1 of 2 checks failed", request: { id: "req-preview-2", createdAt: "2026-11-25T11:30:00.000Z" } };
+    await expect(planSignoff(failed.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/the latest preview smoke for this bundle has not passed \(1 of 2 checks failed\)/));
+    const never = ready();
+    never.state.smoke.preview = noSmoke;
+    await expect(planSignoff(never.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/the latest preview smoke for this bundle has not passed \(not requested yet\)/));
+    // …passed, but did not cover it
+    const partial = ready();
+    partial.state.smoke.preview = passed("preview", [{ name: "twizz-sentinel", baseUrl: svc(ENV_S) }]);
+    await expect(planSignoff(partial.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/the passing preview smoke did not cover moly-backend/));
+    // …or the env was rebuilt after it
+    const rebuilt = ready();
+    deployed(rebuilt, ENV_B, BACKEND, SHA_B, "moly-backend", { build: { status: "PASS", expectedTag: nebulaTag(ENV_B, SHA_B), startedAt: "2026-11-25T11:20:00.000Z", finishedAt: "2026-11-25T11:30:00.000Z" } });
+    await expect(planSignoff(rebuilt.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/plo-2611-moly-backend was \(re\)built at .* after the preview smoke was requested/));
+    for (const w of [failed, never, partial, rebuilt]) expect(w.repos.comments).toEqual([]);
+  });
+});
+
+describe("external review: the sign-off comment goes only to pull requests GitHub confirms are in the bundle (idp #2)", () => {
+  const signable = () => {
+    const w = smokedPreview([bundle(BACKEND, SHA_B, "moly-backend")]);
+    w.state.bundles[0].included = [7, 9, 11, 13, 15].map((n) => ({ repo: BACKEND, number: n, url: "u" }));
+    w.repos.prs.set(`${BACKEND}#9`, null); // an issue, or nothing
+    w.repos.prs.set(`${BACKEND}#11`, { state: "closed", merged: false, headSha: "d".repeat(40) });
+    w.repos.prs.set(`${BACKEND}#13`, { state: "closed", merged: true, headSha: "e".repeat(40) });
+    w.repos.prs.set(`${BACKEND}#15`, { state: "open", merged: false, headSha: "f".repeat(40) });
+    w.repos.notInBundle.add(`${BACKEND}#15`);
+    return w;
+  };
+
+  it("an issue number, a closed or merged pull request, or one whose head is not in the bundle head gets no comment", async () => {
+    const w = signable();
+    const plan = await planSignoff(w.deps, { bundleKey: KEY });
+    expect(plan.prs).toEqual([{ repo: BACKEND, number: 7, url: `https://github.com/${BACKEND}/pull/7` }]);
+    expect(plan.skippedPrs).toEqual([
+      { repo: BACKEND, number: 9, reason: expect.stringMatching(/GitHub has no pull request with this number/) },
+      { repo: BACKEND, number: 11, reason: "closed without merging" },
+      { repo: BACKEND, number: 13, reason: "already merged" },
+      { repo: BACKEND, number: 15, reason: expect.stringMatching(/its head fffffff is not part of the bundle head b2b2b2b that was tested/) },
+    ]);
+    const r = await signoffLifecycle(w.deps, { bundleKey: KEY, setHash: plan.setHash, scope: plan.scope, evidenceHash: plan.evidenceHash, actor: "nick" });
+    expect(r.comments).toEqual([expect.objectContaining({ repo: BACKEND, number: 7, status: "posted" })]);
+    expect(w.repos.comments.map((c) => c.pr)).toEqual([7]);
+  });
+
+  it("when GitHub cannot be asked, the sign-off is not recorded on a guess: the action fails", async () => {
+    const w = signable();
+    w.repos.failPullRequest = true;
+    await expect(planSignoff(w.deps, { bundleKey: KEY })).rejects.toThrow(/rate limit/);
+    expect(w.repos.comments).toEqual([]);
+  });
+});
+
+describe("external review: a preview image that carries a preview address is never promoted (idp #6)", () => {
+  const withAdmin = (apiUrl: string) => {
+    const w = smokedPreview([bundle(SENTINEL, SHA_S, "twizz-sentinel"), bundle(ADMIN, SHA_A, "twizz-admin")]);
+    deployed(w, ENV_A, ADMIN, SHA_A, "twizz-admin", { kind: "frontend", config: { port: 3000, healthPath: "/", rev: 1, envVarNames: [], dockerfile: "Dockerfile", context: ".", buildArgs: { NEXT_PUBLIC_API_URL: apiUrl } } });
+    return w;
+  };
+
+  it("refuses the admin frontend built against the bundled backend's 72 h preview env — which is what lifecycle_create_preview builds", async () => {
+    // what create produces for this bundle (pinned by "builds a frontend against the bundled backend it names")
+    const w = withAdmin(origin(ENV_S));
+    await expect(planDeployStg(w.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/twizz-admin: the preview image was built with NEXT_PUBLIC_API_URL=https:\/\/plo-2611-twizz-sentinel\.prv\.twizz\.com, a preview address that expires with its env/));
+    expect(w.promotions.prs).toEqual([]);
+    // its own preview address baked in is the same problem
+    await expect(planDeployStg(withAdmin(`${origin(ENV_A)}/api`).deps, { bundleKey: KEY })).rejects.toEqual(refusal(/a preview address that expires with its env/));
+    // any other named env, too
+    await expect(planDeployStg(withAdmin("https://someones-env.prv.twizz.com").deps, { bundleKey: KEY })).rejects.toEqual(refusal(/a preview address/));
+  });
+
+  it("promotes it when it was built against a fixed staging host or an address outside the preview domain", async () => {
+    for (const api of [STG_S, "https://api-stg.twizz.com"]) {
+      const plan = await planDeployStg(withAdmin(api).deps, { bundleKey: KEY });
+      expect(plan.promote.map((p) => p.service), api).toEqual(["twizz-admin", "twizz-sentinel"]);
+    }
+  });
+});
+
+describe("external review: rollback says what it could NOT undo (idp #11)", () => {
+  it("a secret that could not be deleted is named — never reported as 'removed'", async () => {
+    const w = world();
+    const dispatch = w.builds.dispatch.bind(w.builds);
+    let n = 0;
+    w.builds.dispatch = async (i) => {
+      if (++n === 2) throw new Error("workflow_dispatch failed (422)");
+      return dispatch(i);
+    };
+    const deleteNow = w.secrets.deleteNow.bind(w.secrets);
+    w.secrets.deleteNow = async (name) => {
+      if (name === `preview/moly-backend/${ENV_B}`) throw new Error("AccessDeniedException: secretsmanager:DeleteSecret");
+      return deleteNow(name);
+    };
+    const plan = await planPreview(w.deps, { bundleKey: KEY });
+    const run = createLifecyclePreview(w.deps, { bundleKey: KEY, setHash: plan.setHash, envs: previewEnvsField(plan), actor: "nick" });
+    await expect(run).rejects.toThrow(/plo-2611-moly-backend removed from gitops, but its secret preview\/moly-backend\/plo-2611-moly-backend could NOT be deleted \(.*AccessDeniedException.*\) — delete that secret before creating the preview again/);
+    await expect(run).rejects.toThrow(/plo-2611-twizz-sentinel removed\./);
+    await expect(run).rejects.not.toThrow(/plo-2611-moly-backend removed;/);
+    // the orphan is real: that is exactly why it must be said
+    expect(w.secrets.store.has(`preview/moly-backend/${ENV_B}`)).toBe(true);
+    expect([...w.gitops.files.keys()].filter((p) => p.includes("plo-"))).toEqual([]);
+  });
+});
+
+describe("external review: policy list fields are judged item by item (idp #12)", () => {
+  const H = "a".repeat(64);
+  const ok = (tool: string, f: Record<string, string>) => expect(evaluate(policy, tool, f), JSON.stringify(f)).toEqual({ allowed: true });
+  const denied = (tool: string, f: Record<string, string>) => expect(evaluate(policy, tool, f).allowed, JSON.stringify(f)).toBe(false);
+
+  it("a glob can no longer match ACROSS the items of a space-joined list", () => {
+    ok("lifecycle_create_preview", { bundleKey: KEY, setHash: H, envs: `${ENV_B} ${ENV_S}`, ttlHours: "72" });
+    denied("lifecycle_create_preview", { bundleKey: KEY, setHash: H, envs: `${ENV_S} arbitrary-env`, ttlHours: "72" });
+    denied("lifecycle_create_preview", { bundleKey: KEY, setHash: H, envs: `arbitrary-env ${ENV_S}`, ttlHours: "72" });
+    denied("lifecycle_create_preview", { bundleKey: KEY, setHash: H, envs: "", ttlHours: "72" });
+
+    ok("lifecycle_request_smoke", { scope: "preview", bundleKey: KEY, setHash: H, targets: `moly-backend=${svc(ENV_B)} twizz-sentinel=${svc(ENV_S)}` });
+    for (const targets of [
+      `a=http://169.254.169.254 z=${svc(ENV_S)}`,
+      "a=https://evil.com/.prv.twizz.com",
+      "a=https://evil.com?.prv.twizz.com",
+      "a=https://evil.com#.prv.twizz.com",
+      "a=https://u:p@x.prv.twizz.com",
+      "a=https://x.prv.twizz.com:8443",
+      `a=${svc(ENV_S)}/admin`,
+      `a=b=${svc(ENV_S)}`,
+      `${svc(ENV_S)}`,
+      "a=file:///etc/passwd",
+      `a=${svc(ENV_S)}  b=${svc(ENV_B)}`, // a double space is an empty item
+    ]) denied("lifecycle_request_smoke", { scope: "preview", bundleKey: KEY, setHash: H, targets });
+
+    ok("lifecycle_deploy_stg", { scope: "stg", bundleKey: KEY, setHash: H, promote: `twizz-admin:${TAG_A} twizz-sentinel:${TAG_S}` });
+    denied("lifecycle_deploy_stg", { scope: "stg", bundleKey: KEY, setHash: H, promote: `twizz-sentinel:latest twizz-admin:${TAG_A}` });
+    denied("lifecycle_deploy_stg", { scope: "stg", bundleKey: KEY, setHash: H, promote: `twizz-sentinel:main-${"0".repeat(40)} twizz-admin:${TAG_A}` });
+    denied("lifecycle_deploy_stg", { scope: "stg", bundleKey: KEY, setHash: H, promote: `a:b:${TAG_S}` });
+  });
+
+  it("`each` is opt-in per tool and field, and a `?` in a pattern is a literal, not a quantifier", () => {
+    const p: Policy = { write_tools: { t: { each: ["xs"], allow: { xs: ["a-*"], y: ["a-*"] }, deny: { xs: ["*bad*"] } }, q: { allow: { v: ["a?b"] } } } };
+    expect(evaluate(p, "t", { xs: "a-1 a-2", y: "a-1 anything" })).toEqual({ allowed: true }); // y is not a list field
+    expect(evaluate(p, "t", { xs: "a-1 b-2", y: "a-1" })).toMatchObject({ allowed: false, reason: expect.stringMatching(/xs="b-2" not in allowlist/) });
+    expect(evaluate(p, "t", { xs: "a-1 a-bad", y: "a-1" })).toMatchObject({ allowed: false, reason: expect.stringMatching(/xs="a-bad" is denied/) });
+    expect(evaluate(p, "q", { v: "a?b" })).toEqual({ allowed: true });
+    expect(evaluate(p, "q", { v: "ab" }).allowed).toBe(false);
+    expect(evaluate(p, "q", { v: "b" }).allowed).toBe(false);
   });
 });

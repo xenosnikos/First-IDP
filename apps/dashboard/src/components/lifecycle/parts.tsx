@@ -1,6 +1,6 @@
 import type { CSSProperties, ReactNode } from "react";
 import { Pill } from "@/components/nebula/pill";
-import { isProdEnv, type LifecycleTab } from "@/lib/nebula/lifecycle";
+import { isProdEnv, safeExternalHref, type LifecycleTab } from "@/lib/nebula/lifecycle";
 
 // Small building blocks shared by the /lifecycle panes. Same look as the
 // other Nebula surfaces: plates, hairlines, 10 px small-caps labels, inline
@@ -29,10 +29,16 @@ export function Section({ title, right, children, style }: { title: string; righ
   );
 }
 
-/** A link that leaves Nebula: Ion-soft, no underline, ↗. */
-export function Ext({ href, children, title }: { href: string; children: ReactNode; title?: string }) {
+/** A link that leaves Nebula: Ion-soft, no underline, ↗. The target is checked
+ * HERE as well as at ingest (`safeExternalHref`: https, an allowlisted host):
+ * anything else is shown as plain text with the reason, never as a link — so
+ * a `javascript:` URL cannot break the render and a look-alike host cannot be
+ * clicked. */
+export function Ext({ href, children, title }: { href: string | null | undefined; children: ReactNode; title?: string }) {
+  const safe = safeExternalHref(href);
+  if (!safe) return <span title="no link: the address is not an https URL on a host Nebula links to" style={{ whiteSpace: "nowrap" }}>{children}</span>;
   return (
-    <a href={href} target="_blank" rel="noreferrer" title={title} style={linkStyle}>
+    <a href={safe} target="_blank" rel="noopener noreferrer" title={title} style={linkStyle}>
       {children} ↗
     </a>
   );

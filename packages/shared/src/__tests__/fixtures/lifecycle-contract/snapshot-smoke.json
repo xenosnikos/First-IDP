@@ -62,7 +62,7 @@
     "results": [
       {
         "name": "moly-backend/health",
-        "url": "https://plo-2612-moly-backend.prv.twizz.com/health",
+        "url": "http://moly-backend.env-plo-2612-moly-backend.svc.cluster.local:8080/health",
         "ok": true,
         "status": 200,
         "ms": 84,
@@ -70,7 +70,7 @@
       },
       {
         "name": "twizz-sentinel/health",
-        "url": "https://plo-2612-sentinel.prv.twizz.com/health",
+        "url": "http://twizz-sentinel.env-plo-2612-twizz-sentinel.svc.cluster.local:8090/health",
         "ok": false,
         "status": 503,
         "ms": 212,

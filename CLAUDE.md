@@ -99,7 +99,8 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
   `User`, writes an `AuditLog` row per attempt. In-cluster sign-in uses the GitHub App
   `twizz-nebula` (client `Iv23liulodACgG6rqlKr`); `NEBULA_OPERATORS` gates writes.
 - Middleware matcher covers `/projects`, `/environments`, `/pipelines`, `/clusters`, `/releases`, `/capacity`, `/monitor`, `/lifecycle`.
-- `/api/lifecycle/*` (PLO ingest, §N9) is NOT a session route and must stay out of the matcher: bearer `LIFECYCLE_INGEST_TOKEN` (SM `preview/nebula`), 503 when unset or shorter than 32 chars.
+- `/api/lifecycle/*` (PLO ingest, §N9) is NOT a session route and must stay out of the matcher: bearer `LIFECYCLE_INGEST_TOKEN` (Secret `plo-env` ← SM `nebula/plo`, never `preview/*`; `LIFECYCLE_DISPATCH_TOKEN` from Secret `plo-dispatch-env` is the dispatcher's own credential for claim/complete/smoke results), 503 when unset or shorter than 32 chars. A snapshot is written once (same runId + same content = 200, different content = 409); a source snapshot's `bundleKey` must be the hash of its bundles; a smoke snapshot is accepted only as the one answer to a claimed smoke request. Optional `LIFECYCLE_DISPATCH_TOKEN` separates the dispatcher's credential (queue + smoke results) from the publisher's.
+- Env names starting `plo-` are reserved for Lifecycle bundle previews: only `lifecycle_create_preview` creates them. Every lifecycle gate fails closed (docs/NEBULA.md §N9 "What the gates mean by their words").
 - Every write anywhere (dashboard or MCP) must create an `AuditLog` row. Observer runs
   (an LLM call is cost-bearing) write one too: `nebula.observer.<kind>`.
 - User management (Nebula sign-in allowlist, operators, VPN, SSO gates): see the

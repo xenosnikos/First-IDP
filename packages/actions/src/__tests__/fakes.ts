@@ -189,6 +189,32 @@ export class FakeLifecycleRepos implements LifecycleRepos {
     this.calls.push("hasComment");
     return this.comments.some((c) => c.repo === repo && c.pr === pr && c.body.includes(marker));
   }
+  /** `${repo}#${pr}` → what GitHub says about it; absent = an open pull request (null = not a pull request) */
+  prs = new Map<string, { state: "open" | "closed"; merged: boolean; headSha: string } | null>();
+  /** `${repo}#${pr}` whose head is NOT contained in the bundle head */
+  notInBundle = new Set<string>();
+  /** make the pull-request lookup itself fail */
+  failPullRequest = false;
+  async pullRequest(repo: string, number: number) {
+    this.calls.push("pullRequest");
+    if (this.failPullRequest) throw new Error("GitHub API rate limit exceeded");
+    const known = this.prs.get(`${repo}#${number}`);
+    if (known !== undefined) return known;
+    return { state: "open" as const, merged: false, headSha: `${number.toString(16).padStart(2, "0")}`.repeat(20).slice(0, 40) };
+  }
+  async isAncestor(repo: string, ancestor: string, _descendant: string) {
+    this.calls.push("isAncestor");
+    for (const key of this.notInBundle) {
+      const [r, n] = key.split("#");
+      const pr = await this.prHead(r, Number(n));
+      if (r === repo && pr === ancestor) return false;
+    }
+    return true;
+  }
+  private async prHead(repo: string, number: number) {
+    const known = this.prs.get(`${repo}#${number}`);
+    return known ? known.headSha : `${number.toString(16).padStart(2, "0")}`.repeat(20).slice(0, 40);
+  }
   async comment(repo: string, pr: number, body: string) {
     this.calls.push("comment");
     if (this.failComment.has(`${repo}#${pr}`)) throw new Error("Resource not accessible by integration (403)");

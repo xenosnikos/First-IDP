@@ -17,23 +17,31 @@
 // The reused actions keep their own checks, and the policy.yaml entry of the
 // tool each one normally runs under is evaluated here as well.
 import { createHash } from "node:crypto";
-import { LIFECYCLE_BUNDLE_KEY_RE, type LifecycleSmokeParams, type LifecycleSmokeScope } from "@twizz-idp/shared";
+import {
+  LIFECYCLE_BUNDLE_KEY_RE,
+  LIFECYCLE_SMOKE_ORIGIN_RE as SHARED_SMOKE_ORIGIN_RE,
+  lifecycleParsePreviewSmokeOrigin,
+  lifecyclePreviewSmokeOrigin,
+  lifecycleSmokeTargetOk,
+  type LifecycleSmokeParams,
+  type LifecycleSmokeScope,
+} from "@twizz-idp/shared";
 import { SHA_RE, createEnvFromRepo, isValidBranch, isValidRepo, type EnvFromRepoDeps } from "./env-from-repo";
-import { DEFAULT_MAX_NAMED_ENVS, countEnvs, envHost, envSecretName, findEnv, isValidName, nebulaTag, resolveService, teardownNamedEnv, type DbMode, type EnvKind, type NamedEnvManifest, type SecretStore } from "./named-envs";
+import { DEFAULT_MAX_NAMED_ENVS, LIFECYCLE_ENV_PREFIX, countEnvs, envHost, envSecretName, findEnv, isValidName, nebulaTag, resolveService, teardownNamedEnv, type DbMode, type EnvKind, type NamedEnvManifest, type SecretStore } from "./named-envs";
 import { evaluatePolicy, type Policy } from "./policy";
 import { isPromotableTag, promoteRelease, readTargetState, type PromoteDeps } from "./promote";
-import { releaseTarget } from "./registry";
+import { REGISTRY, releaseTarget } from "./registry";
 import { parseTwizzYaml, type TwizzConfig } from "./twizz-yaml";
 
 // ── constants ─────────────────────────────────────────────────────────────
 
 /** Preview envs of a bundle live three days, then the reaper takes them. */
 export const LIFECYCLE_PREVIEW_TTL_HOURS = 72;
-/** Named envs created for a bundle: `plo-<yymm>-<service>`. */
-export const LIFECYCLE_ENV_PREFIX = "plo-";
-/** The only origins a smoke request may name: a preview-domain host over
- * https. PLO enforces its own allowlist on top (`smoke.allowedHosts`). */
-export const LIFECYCLE_SMOKE_ORIGIN_RE = /^https:\/\/[a-z0-9-]+\.prv\.twizz\.com$/;
+/** The only origins a smoke request may name (either scope's form; the shared
+ * schema binds each request to the form of ITS scope): the in-cluster Service
+ * of the bundle's own preview env, or a fixed staging host over https. PLO
+ * enforces its own allowlist on top (`smoke.allowedHosts`). */
+export const LIFECYCLE_SMOKE_ORIGIN_RE = SHARED_SMOKE_ORIGIN_RE;
 /** The gate field value for staging. Never the word itself next to "prod". */
 export const LIFECYCLE_STG = "stg";
 export const LIFECYCLE_NEBULA_URL = "https://nebula.prv.twizz.com";
@@ -79,10 +87,12 @@ export type LifecycleBundleState = {
   note: string | null;
   /** the name its preview env gets */
   envName: string | null;
-  /** the live named env built from exactly this head, if any */
-  env: { name: string; up: boolean } | null;
-  /** release-train services only */
-  staging: { deployed: boolean; promotion: { number: number; url: string; imageTag: string } | null } | null;
+  /** THE preview env of this bundle (named `envName`, built by an operator from exactly this head), if it exists.
+   * `rolledOutAt`: when Argo finished the sync that put it where it is now (null: unknown).
+   * `port`: the Service port its manifest records (twizz.yaml `port` at that commit); null: not recorded. */
+  env: { name: string; up: boolean; rolledOutAt: string | null; port: number | null } | null;
+  /** release-train services only. `deployed`: gitops is on the bundle image AND Argo reports the pods on it. */
+  staging: { deployed: boolean; rolledOutAt: string | null; promotion: { number: number; url: string; imageTag: string } | null } | null;
 };
 
 /** The latest smoke request for (scope, bundleKey) and what came back for it. */
@@ -98,6 +108,9 @@ export type LifecycleSmokeEvidence = {
 };
 
 export type LifecycleState = {
+  /** The bundle key — which the PROVIDER of this state must have recomputed from the bundles
+   * (`lifecycleBundleKey`), never copied from a snapshot on trust. The dashboard's reader drops a
+   * source snapshot whose key is not the hash of its own bundles before any state is built from it. */
   bundleKey: string | null;
   bundles: readonly LifecycleBundleState[];
   smoke: { preview: LifecycleSmokeEvidence; stg: LifecycleSmokeEvidence };
@@ -116,6 +129,10 @@ export interface LifecycleRepos {
   readFile(repo: string, sha: string, path: string): Promise<string | null>;
   /** does the pull request already carry a comment containing `marker` */
   hasComment(repo: string, pr: number, marker: string): Promise<boolean>;
+  /** a pull request as GitHub has it now; null when that number is not a pull request of the repository (an issue, or nothing) */
+  pullRequest(repo: string, number: number): Promise<{ state: "open" | "closed"; merged: boolean; headSha: string } | null>;
+  /** is `ancestor` contained in the history of `descendant` (true also when they are the same commit) */
+  isAncestor(repo: string, ancestor: string, descendant: string): Promise<boolean>;
   comment(repo: string, pr: number, body: string): Promise<{ url: string }>;
 }
 
@@ -152,6 +169,20 @@ export function lifecycleSetHash(pairs: ReadonlyArray<{ repo: string; sha: strin
   return createHash("sha256").update(lines.join("\n"), "utf8").digest("hex");
 }
 
+/** The bundle key, computed: sha256 hex over the sorted lines
+ * `${github}@${headSha}` (joined with "\n") of every bundle that has a head
+ * commit; null when none has. Byte-for-byte PLO's `computeBundleKey`. Nebula
+ * never takes a snapshot's own `bundleKey` on trust: ingest rejects a source
+ * snapshot whose key is not this, and the reader drops one that slipped by. */
+export function lifecycleBundleKey(bundles: ReadonlyArray<{ github: string; headSha: string | null }>): string | null {
+  const lines = bundles
+    .filter((b) => !!b.headSha)
+    .map((b) => `${b.github}@${b.headSha}`)
+    .sort();
+  if (lines.length === 0) return null;
+  return createHash("sha256").update(lines.join("\n"), "utf8").digest("hex");
+}
+
 const key12 = (bundleKey: string) => bundleKey.slice(0, 12);
 const sameRepo = (a: string, b: string) => a.toLowerCase() === b.toLowerCase();
 
@@ -174,6 +205,20 @@ async function stateFor(deps: Pick<LifecycleDeps, "state">, bundleKey: string): 
   if (!state.bundleKey) refuse("there is no bundle: no source run has reported one");
   if (state.bundleKey !== bundleKey) refuse(`the bundle changed: Nebula now has bundle ${key12(state.bundleKey!)}, not ${key12(bundleKey)} — reload and review it again`);
   return state;
+}
+
+type Commit = { github: string; branch: string; headSha: string };
+
+/** Every bundled commit, re-read from GitHub NOW: each bundle branch must
+ * still exist and still be at the commit the snapshot recorded. Because the
+ * bundle key is the hash of exactly these (repository, commit) pairs, this is
+ * what ties the key to reality at the moment of a write — a snapshot can name
+ * whatever it likes, but a gate only acts on heads GitHub confirms. */
+async function assertBundleIsLive(repos: LifecycleRepos, state: LifecycleState): Promise<Commit[]> {
+  const commits = state.bundles.filter((b): b is LifecycleBundleState & { headSha: string } => !!b.headSha).map((b) => ({ github: b.github, branch: b.branch, headSha: b.headSha }));
+  for (const c of commits) if (!isValidRepo(c.github) || !isValidBranch(c.branch) || !SHA_RE.test(c.headSha)) refuse(`${c.github}: the bundle names a repository, branch or commit Nebula cannot verify`);
+  await assertHeads(repos, commits);
+  return commits;
 }
 
 function must(allow: LifecycleAllow): void {
@@ -284,7 +329,7 @@ export async function planPreview(deps: Pick<LifecycleDeps, "state" | "repos" | 
     if (!isValidRepo(b.github)) refuse(`${b.github} is not a twizz-app repository — Nebula builds previews only from the org`);
     if (!isValidBranch(b.branch) || !SHA_RE.test(b.headSha)) refuse(`${b.github}: the bundle branch or head sha is malformed`);
   }
-  await assertHeads(deps.repos, all);
+  await assertBundleIsLive(deps.repos, state);
 
   const fallbackApi = twizzOrigin(deps.stagingApiUrl);
   const create: PreviewPlanItem[] = [];
@@ -372,6 +417,8 @@ export async function createLifecyclePreview(deps: LifecycleDeps, input: { bundl
   for (const item of plan.create) {
     try {
       const r = await createEnvFromRepo(envDeps, {
+        // the one caller that may create a `plo-*` env
+        reserved: LIFECYCLE_ENV_PREFIX,
         name: item.envName,
         repo: item.repo,
         ref: item.branch,
@@ -392,8 +439,14 @@ export async function createLifecyclePreview(deps: LifecycleDeps, input: { bundl
         const secret = envSecretName(c.service, c.envName);
         if (!rec.created.includes(secret)) continue;
         try {
-          if (await findEnv(deps, c.envName)) await teardownNamedEnv(deps, { name: c.envName, actor: input.actor });
-          else await deps.secrets.deleteNow(secret);
+          if (await findEnv(deps, c.envName)) {
+            // teardown reports a secret it could not delete instead of throwing: read it, never assume
+            const t = await teardownNamedEnv(deps, { name: c.envName, actor: input.actor });
+            if (!t.secretDeleted) {
+              undo.push(`${c.envName} removed from gitops, but its secret ${secret} could NOT be deleted (${(t.secretError ?? "unknown error").slice(0, 200)}) — delete that secret before creating the preview again, or the create will fail on it`);
+              continue;
+            }
+          } else await deps.secrets.deleteNow(secret);
           undo.push(`${c.envName} removed`);
         } catch (u) {
           undo.push(`${c.envName} could NOT be removed (${errText(u)}) — tear it down on /environments`);
@@ -422,19 +475,29 @@ export const smokeTargetsField = (targets: ReadonlyArray<{ name: string; baseUrl
 
 /** Targets come from two places only: the named envs of this bundle (preview)
  * or the fixed staging hosts of the release-train registry entries (stg).
- * A target's `name` is the registry service — PLO looks its checks up by it. */
-export async function planSmoke(deps: Pick<LifecycleDeps, "state">, input: { scope: LifecycleSmokeScope; bundleKey: string }): Promise<SmokePlan> {
+ * A target's `name` is the registry service — PLO looks its checks up by it.
+ *
+ * A preview target is the env's Service INSIDE the cluster
+ * (`http://<service>.env-<envName>.svc.cluster.local:<port>`), not its public
+ * host: every preview Ingress is behind the ingress-nginx Google sign-in gate,
+ * which answers an unauthenticated GET with a 302 whatever the app does. */
+export async function planSmoke(deps: Pick<LifecycleDeps, "state" | "repos">, input: { scope: LifecycleSmokeScope; bundleKey: string }): Promise<SmokePlan> {
   if (input.scope !== "preview" && input.scope !== LIFECYCLE_STG) refuse("scope must be preview or stg");
   const state = await stateFor(deps, input.bundleKey);
   must(input.scope === "preview" ? state.actions.smokePreview : state.actions.smokeStg);
+  // a smoke is evidence about commits: they must be the heads GitHub has right now
+  await assertBundleIsLive(deps.repos, state);
   const all = previewableOf(state);
   const targets: SmokePlan["targets"] = [];
   if (input.scope === "preview") {
     for (const b of all) {
       if (!b.env || !b.env.up) refuse(`${b.service}: its preview env is not up`);
       const name = b.env!.name;
-      if (!isValidName(name) || !name.startsWith(LIFECYCLE_ENV_PREFIX)) refuse(`${b.service}: "${name}" is not a bundle preview env`);
-      targets.push({ name: b.service, baseUrl: envOrigin(name) });
+      // the target is the bundle's OWN env, by its deterministic name — never another env on the same commit
+      if (name !== b.envName || !isValidName(name) || !name.startsWith(LIFECYCLE_ENV_PREFIX)) refuse(`${b.service}: "${name}" is not this bundle's preview env (${b.envName})`);
+      const origin = b.env!.port === null ? null : lifecyclePreviewSmokeOrigin(b.service, name, b.env!.port);
+      if (!origin) refuse(`${b.service}: preview env ${name} records no usable service port, so its in-cluster address cannot be built — tear it down and create the preview again`);
+      targets.push({ name: b.service, baseUrl: origin! });
     }
   } else {
     for (const b of all.filter((x) => x.promotable)) {
@@ -445,13 +508,13 @@ export async function planSmoke(deps: Pick<LifecycleDeps, "state">, input: { sco
     }
   }
   if (targets.length === 0) refuse(input.scope === "preview" ? "no bundled repository maps to a Nebula service" : "no bundled service has a staging route in Nebula");
-  for (const t of targets) if (!LIFECYCLE_SMOKE_ORIGIN_RE.test(t.baseUrl)) refuse(`${t.name}: ${t.baseUrl} is not a preview-domain origin`);
+  for (const t of targets) if (!lifecycleSmokeTargetOk(input.scope, t.name, t.baseUrl)) refuse(`${t.name}: ${t.baseUrl} is not a ${input.scope === "preview" ? "preview-env Service" : "staging"} origin`);
   if (new Set(targets.map((t) => t.name)).size !== targets.length) refuse("two bundled repositories map to the same service");
   targets.sort((a, b) => a.name.localeCompare(b.name));
   return { bundleKey: input.bundleKey, setHash: previewSetHash(state), scope: input.scope, targets };
 }
 
-export async function requestLifecycleSmoke(deps: Pick<LifecycleDeps, "state" | "queue">, input: { scope: LifecycleSmokeScope; bundleKey: string; setHash: string; targets: string; actor: string }) {
+export async function requestLifecycleSmoke(deps: Pick<LifecycleDeps, "state" | "queue" | "repos">, input: { scope: LifecycleSmokeScope; bundleKey: string; setHash: string; targets: string; actor: string }) {
   const plan = await planSmoke(deps, input);
   if (plan.setHash !== input.setHash || smokeTargetsField(plan.targets) !== input.targets) refuse("the bundle or its smoke targets changed since you reviewed this — reload and review it again");
   const r = await deps.queue.enqueue({ kind: "smoke", params: { scope: plan.scope, bundleKey: plan.bundleKey, targets: plan.targets } }, input.actor);
@@ -466,14 +529,14 @@ export async function requestLifecycleSmoke(deps: Pick<LifecycleDeps, "state" | 
  * origins, and every one of them must have at least one passing check (a
  * service with no checks configured was verified by nobody). Returns the
  * reason it does not hold, or null. */
-export function smokeGap(ev: LifecycleSmokeEvidence, scope: LifecycleSmokeScope, expected: ReadonlyArray<{ service: string; origins: readonly string[] }>): string | null {
+export function smokeGap(ev: LifecycleSmokeEvidence, scope: LifecycleSmokeScope, expected: ReadonlyArray<{ service: string; origins: readonly string[]; originOk?: (origin: string) => boolean }>): string | null {
   const label = scope === "preview" ? "preview" : "staging";
   if (ev.verdict !== "pass" || !ev.request) return `the latest ${label} smoke for this bundle has not passed (${ev.detail})`;
   if (ev.results.some((r) => !r.ok)) return `the latest ${label} smoke for this bundle has failing checks`;
   for (const e of expected) {
     const target = ev.targets.find((t) => t.name === e.service);
     if (!target) return `the passing ${label} smoke did not cover ${e.service} — run the ${label} smoke again`;
-    if (!e.origins.includes(target.baseUrl)) return `the passing ${label} smoke checked ${e.service} at ${target.baseUrl}, which is not where this bundle runs — run the ${label} smoke again`;
+    if (!(e.originOk ? e.originOk(target.baseUrl) : e.origins.includes(target.baseUrl))) return `the passing ${label} smoke checked ${e.service} at ${target.baseUrl}, which is not where this bundle runs — run the ${label} smoke again`;
     const passed = ev.results.filter((r) => r.ok && r.name.startsWith(`${e.service}/`) && r.url.startsWith(`${target.baseUrl}/`));
     if (passed.length === 0) return `the ${label} smoke verified nothing for ${e.service} (no smoke checks are configured for it in the PLO inventory)`;
   }
@@ -496,7 +559,20 @@ type PreviewEvidence = { manifests: Map<string, NamedEnvManifest> };
 async function assertPreviewSmoke(deps: Pick<LifecycleDeps, "gitops">, state: LifecycleState, mustExist: ReadonlySet<string>): Promise<PreviewEvidence> {
   const all = previewableOf(state);
   const ev = state.smoke.preview;
-  const gap = smokeGap(ev, "preview", all.map((b) => ({ service: b.service, origins: [...new Set([envOrigin(b.envName), ...(b.env ? [envOrigin(b.env.name)] : [])])] })));
+  for (const b of all) if (b.env && b.env.name !== b.envName) refuse(`${b.service}: "${b.env.name}" is not this bundle's preview env (${b.envName})`);
+  // one place per service, and only one: the Service of the bundle's own env (its port is checked against the manifest below)
+  const gap = smokeGap(
+    ev,
+    "preview",
+    all.map((b) => ({
+      service: b.service,
+      origins: [],
+      originOk: (origin: string) => {
+        const at = lifecycleParsePreviewSmokeOrigin(origin);
+        return !!at && at.service === b.service && at.envName === b.envName;
+      },
+    })),
+  );
   if (gap) refuse(gap);
   const requestedAt = Date.parse(ev.request!.createdAt);
   if (!Number.isFinite(requestedAt)) refuse("the preview smoke request has no creation time");
@@ -518,10 +594,20 @@ async function assertPreviewSmoke(deps: Pick<LifecycleDeps, "gitops">, state: Li
     const builtAt = envBuiltAt(m);
     if (builtAt === null) refuse(`${b.env.name} has no build record, so the smoke cannot be tied to it — create the preview again`);
     if (!(requestedAt > builtAt!)) refuse(`${b.env.name} was (re)built at ${new Date(builtAt!).toISOString()}, after the preview smoke was requested (${ev.request!.createdAt}) — run the preview smoke again`);
+    // …and after Argo finished rolling that build out: until then the env still served the image before it
+    const rolledOutAt = b.env.rolledOutAt ? Date.parse(b.env.rolledOutAt) : NaN;
+    if (!Number.isFinite(rolledOutAt)) refuse(`Argo does not say when ${b.env.name} rolled out, so the preview smoke cannot be tied to what runs now — run the preview smoke again`);
+    if (!(requestedAt > rolledOutAt)) refuse(`${b.env.name} rolled out at ${b.env.rolledOutAt}, after the preview smoke was requested (${ev.request!.createdAt}) — run the preview smoke again`);
+    // …on the port the env's Service really has: a pass against another port of that namespace is not this app
+    const smoked = ev.targets.find((t) => t.name === b.service)?.baseUrl;
+    const serves = m.config ? lifecyclePreviewSmokeOrigin(b.service, m.name, m.config.port) : null;
+    if (!serves || smoked !== serves) refuse(`the preview smoke checked ${b.service} at ${smoked ?? "nothing"}, but ${b.env.name} serves at ${serves ?? "an unrecorded port"} — run the preview smoke again`);
     manifests.set(b.service, m);
   }
   return { manifests };
 }
+
+const PROMOTABLE_HOSTS = () => REGISTRY.flatMap((s) => (s.releaseTrain?.staging ? [s.releaseTrain.staging.host.toLowerCase()] : []));
 
 // ── 4. lifecycle_deploy_stg ───────────────────────────────────────────────
 
@@ -539,9 +625,25 @@ export type DeployPlan = {
 /** The gate field naming exactly which image goes to which staging service. */
 export const deployPromoteField = (plan: Pick<DeployPlan, "promote">) => plan.promote.map((p) => `${p.service}:${p.imageTag}`).sort().join(" ");
 
-export async function planDeployStg(deps: Pick<LifecycleDeps, "state" | "gitops" | "images" | "promotions" | "policy">, input: { bundleKey: string }): Promise<DeployPlan> {
+/** A build arg of a preview image that names a preview address: baked into the
+ * image, it would follow the image to staging and die with the env (72 h). */
+const PREVIEW_ORIGIN_RE = /https?:\/\/[a-z0-9-]+\.prv\.twizz\.com/gi;
+
+function bakedPreviewAddress(m: NamedEnvManifest, stagingHosts: ReadonlySet<string>): { arg: string; origin: string } | null {
+  for (const [arg, value] of Object.entries(m.config?.buildArgs ?? {})) {
+    for (const hit of String(value).match(PREVIEW_ORIGIN_RE) ?? []) {
+      // the fixed staging hosts live on the same domain and are exactly what a staging image should name
+      if (!stagingHosts.has(hit.toLowerCase().replace(/^https?:\/\//, ""))) return { arg, origin: hit };
+    }
+  }
+  return null;
+}
+
+export async function planDeployStg(deps: Pick<LifecycleDeps, "state" | "repos" | "gitops" | "images" | "promotions" | "policy">, input: { bundleKey: string }): Promise<DeployPlan> {
   const state = await stateFor(deps, input.bundleKey);
   must(state.actions.deployStg);
+  // what goes to staging is built from commits: they must still be the heads GitHub has
+  await assertBundleIsLive(deps.repos, state);
   const all = previewableOf(state);
   const train = all.filter((b) => b.promotable);
   if (train.length === 0) refuse(`no bundled service is on the release train: ${LIFECYCLE_NO_STAGING_ROUTE}`);
@@ -550,6 +652,7 @@ export async function planDeployStg(deps: Pick<LifecycleDeps, "state" | "gitops"
 
   const promote: DeployPlan["promote"] = [];
   const already: DeployPlan["already"] = [];
+  const stagingHosts = new Set(PROMOTABLE_HOSTS());
   for (const b of train) {
     if (b.staging?.deployed) {
       already.push({ service: b.service, reason: "staging already runs this bundle" });
@@ -563,8 +666,18 @@ export async function planDeployStg(deps: Pick<LifecycleDeps, "state" | "gitops"
     if (!t) refuse(`${b.service} has no staging target on the release train`);
     const m = manifests.get(b.service)!;
     const tag = m.imageTag!;
-    // the image staging gets is the one the preview env runs: built by the central builder from exactly this head
-    if (tag !== nebulaTag(m.name, b.headSha) || !m.name.startsWith(LIFECYCLE_ENV_PREFIX) || !isPromotableTag(tag)) refuse(`${m.name} runs ${tag}, which is not the bundle image of ${b.github}@${b.headSha.slice(0, 7)}`);
+    // the image staging gets is the one the bundle's OWN preview env runs: built by the central builder from exactly this head
+    if (m.name !== b.envName || m.service !== b.service) refuse(`${m.name} is not the preview env of ${b.service} for this bundle (${b.envName})`);
+    if (tag !== nebulaTag(b.envName, b.headSha) || !m.name.startsWith(LIFECYCLE_ENV_PREFIX) || !isPromotableTag(tag)) refuse(`${m.name} runs ${tag}, which is not the bundle image of ${b.github}@${b.headSha.slice(0, 7)}`);
+    // …with the build the repository itself declares at that commit (never a dockerfile or context somebody typed in)
+    const text = await deps.repos.readFile(b.github, b.headSha, CONFIG_FILE);
+    const parsed = text === null ? null : parseTwizzYaml(text);
+    if (!parsed || !parsed.ok) refuse(`${b.github}@${b.headSha.slice(0, 7)} has no valid ${CONFIG_FILE}, so the image of ${m.name} cannot be tied to the repository's own build`);
+    const cfg = (parsed as { config: TwizzConfig }).config;
+    if (!m.config || m.config.dockerfile !== cfg.dockerfile || m.config.context !== cfg.context || m.kind !== cfg.kind) refuse(`${m.name} was not built the way ${b.github}@${b.headSha.slice(0, 7)} declares in ${CONFIG_FILE} (dockerfile, context or kind differ) — tear it down and create the preview again`);
+    // …and that does not carry a preview address into staging
+    const baked = bakedPreviewAddress(m, stagingHosts);
+    if (baked) refuse(`${b.service}: the preview image was built with ${baked.arg}=${baked.origin}, a preview address that expires with its env — promoting it would point staging at it. Nebula cannot take ${b.service} to staging from a bundle preview until it is built against its staging API or reads the API address at runtime (docs/NEBULA.md §N9, "Frontends and staging")`);
     alsoAllowedAs(deps.policy, "promote_release", { service: b.service, target: "staging", imageTag: tag }, `promoting ${b.service}`);
     if (!(await deps.images.describeTag(t!.service.ecrRepo, tag))) refuse(`ECR ${t!.service.ecrRepo}:${tag} does not exist — only images that are already built can be promoted`);
     const now = await readTargetState(deps, b.service, "staging");
@@ -636,6 +749,17 @@ export type SignoffPlan = {
   };
 };
 
+/** Why a pull request the snapshot lists must NOT get the sign-off comment, or
+ * null when GitHub confirms it belongs to the bundle. */
+async function includedPrProblem(repos: LifecycleRepos, repo: string, number: number, bundleHead: string): Promise<string | null> {
+  const pr = await repos.pullRequest(repo, number);
+  if (!pr) return "GitHub has no pull request with this number in the repository (the snapshot named an issue or nothing)";
+  if (pr.state !== "open") return pr.merged ? "already merged" : "closed without merging";
+  if (!SHA_RE.test(pr.headSha)) return "its head commit could not be read";
+  if (!(await repos.isAncestor(repo, pr.headSha, bundleHead))) return `its head ${pr.headSha.slice(0, 7)} is not part of the bundle head ${bundleHead.slice(0, 7)} that was tested (it moved, or was never bundled)`;
+  return null;
+}
+
 export const signoffMarker = (bundleKey: string) => `<!-- nebula-lifecycle-signoff:${bundleKey} -->`;
 
 export async function planSignoff(deps: Pick<LifecycleDeps, "state" | "repos" | "gitops">, input: { bundleKey: string }): Promise<SignoffPlan> {
@@ -646,6 +770,13 @@ export async function planSignoff(deps: Pick<LifecycleDeps, "state" | "repos" | 
   if (all.length === 0) refuse("no bundled repository maps to a Nebula service, so there is nothing to sign off here");
   const train = all.filter((b) => b.promotable);
   const scope: LifecycleSmokeScope = train.length > 0 ? LIFECYCLE_STG : "preview";
+
+  // what is signed off is a set of commits: every bundle branch must still be there, at that commit
+  const commits = await assertBundleIsLive(deps.repos, state);
+
+  // EVERY bundled service must have passed its preview smoke, whatever else is true: the staging
+  // smoke only calls the release-train services, so it can never vouch for the others
+  await assertPreviewSmoke(deps, state, new Set());
 
   if (scope === LIFECYCLE_STG) {
     for (const b of train) if (!b.staging?.deployed) refuse(`${b.service}: staging is not running this bundle`);
@@ -659,14 +790,15 @@ export async function planSignoff(deps: Pick<LifecycleDeps, "state" | "repos" | 
       }),
     );
     if (gap) refuse(gap);
-  } else {
-    await assertPreviewSmoke(deps, state, new Set());
+    // the staging smoke must have been requested AFTER staging finished rolling the bundle out:
+    // a pass from before that is a pass of the image staging ran before
+    const requestedAt = Date.parse(state.smoke.stg.request?.createdAt ?? "");
+    for (const b of train) {
+      const rolledOutAt = b.staging?.rolledOutAt ? Date.parse(b.staging.rolledOutAt) : NaN;
+      if (!Number.isFinite(rolledOutAt) || !Number.isFinite(requestedAt)) refuse(`Argo does not say when ${b.service} staging rolled out, so the staging smoke cannot be tied to what runs now — run the staging smoke again`);
+      if (!(requestedAt > rolledOutAt)) refuse(`${b.service} staging rolled out at ${b.staging!.rolledOutAt}, after the staging smoke was requested (${state.smoke.stg.request!.createdAt}) — run the staging smoke again`);
+    }
   }
-
-  // what is signed off is a set of commits: every bundle branch must still be there
-  const commits = state.bundles.filter((b): b is LifecycleBundleState & { headSha: string } => !!b.headSha).map((b) => ({ github: b.github, branch: b.branch, headSha: b.headSha }));
-  for (const c of commits) if (!isValidRepo(c.github) || !isValidBranch(c.branch) || !SHA_RE.test(c.headSha)) refuse(`${c.github}: the bundle names a repository, branch or commit Nebula cannot verify`);
-  await assertHeads(deps.repos, commits);
 
   const prs: LifecyclePr[] = [];
   const skippedPrs: SignoffPlan["skippedPrs"] = [];
@@ -679,7 +811,14 @@ export async function planSignoff(deps: Pick<LifecycleDeps, "state" | "repos" | 
       seen.add(id);
       if (!Number.isInteger(pr.number) || pr.number <= 0 || !sameRepo(pr.repo, b.github)) skippedPrs.push({ repo: pr.repo, number: pr.number, reason: "not a pull request of the bundled repository" });
       else if (prs.length >= MAX_SIGNOFF_PRS) skippedPrs.push({ repo: pr.repo, number: pr.number, reason: `more than ${MAX_SIGNOFF_PRS} pull requests in one bundle` });
-      else prs.push({ repo: b.github, number: pr.number, url: `https://github.com/${b.github}/pull/${pr.number}` });
+      else {
+        // `included` is the snapshot's word. GitHub's: this number is an open pull request of this
+        // repository whose head commit is IN the bundle head that was tested. Anything else gets no
+        // comment (a failed lookup is an error, not a skip: an unverifiable sign-off is refused).
+        const why = await includedPrProblem(deps.repos, b.github, pr.number, b.headSha);
+        if (why) skippedPrs.push({ repo: b.github, number: pr.number, reason: why });
+        else prs.push({ repo: b.github, number: pr.number, url: `https://github.com/${b.github}/pull/${pr.number}` });
+      }
     }
   }
   // code-unit order on the lower-cased slug: the list feeds evidenceHash, so it must not depend on a locale

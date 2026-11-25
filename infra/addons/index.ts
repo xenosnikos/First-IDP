@@ -133,8 +133,15 @@ export const archiveBucket = archive.bucket;
 // what runs on the three clusters and what is newer. REPORT ONLY: no Update*, no Create*, no
 // Delete*, no iam, no secretsmanager, no S3. The job that runs application repo code
 // (plo-source, SA `plo-source`) has NO role at all and is not trusted here.
-// On each cluster the role gets AmazonEKSViewPolicy (no Secrets) and the group `nebula-plo`, which
-// has no rights until scripts/nebula-plo-access.sh applies infra/k8s/nebula-plo-rbac.yaml.
+// All three jobs share the role because all three run the same discovery (PLO
+// docker/entrypoint.sh builds the kubeconfig for plan, cve and dispatch alike): separate roles
+// would carry identical statements.
+// On each cluster the access entry maps the role to the group `nebula-plo` and to NOTHING
+// else. Deliberately NO access policy: AmazonEKSViewPolicy is the built-in `view` role (pod
+// logs, ConfigMaps and every workload object of every namespace, prod included) and PLO reads
+// none of that. The group has no rights until scripts/nebula-plo-access.sh applies
+// infra/k8s/nebula-plo-rbac.yaml (namespaces + nodes; `list secrets` only where an operator
+// opens it), and that script fails if it finds any access policy on the entry.
 export const PLO_CLUSTERS = ["EKS-Twizz-NonProd", "EKS-Moly-staging", "EKS-Moly-Prod"] as const;
 export const PLO_K8S_GROUP = "nebula-plo";
 
@@ -195,23 +202,65 @@ new aws.iam.RolePolicy("nebula-plo-read", {
 });
 
 for (const cluster of PLO_CLUSTERS) {
-  const entry = new aws.eks.AccessEntry(`nebula-plo-${cluster.toLowerCase()}`, {
+  new aws.eks.AccessEntry(`nebula-plo-${cluster.toLowerCase()}`, {
     clusterName: cluster,
     principalArn: ploRole.arn,
     type: "STANDARD",
     kubernetesGroups: [PLO_K8S_GROUP],
     tags,
   });
-  new aws.eks.AccessPolicyAssociation(
-    `nebula-plo-view-${cluster.toLowerCase()}`,
-    {
-      clusterName: cluster,
-      principalArn: ploRole.arn,
-      policyArn: "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy",
-      accessScope: { type: "cluster" },
-    },
-    { dependsOn: [entry] },
-  );
+  // No aws.eks.AccessPolicyAssociation here, on purpose (see above).
 }
 
 export const ploRoleArn = ploRole.arn;
+
+// ── 6. Where PLO's secrets live, and who may NOT read the platform's own (§N9) ──────────────
+// Checked against live IAM on 2026-11-25: the role of every preview pod
+// (twizz-nonprod-preview-pods; any ServiceAccount in pr-*, env-*, shared, dev) may
+// GetSecretValue on ALL of preview/*, and so may External Secrets (twizz-eso), which reads
+// nothing else. Preview pods run application code, including the env-plo-* previews of the
+// upgrades PLO proposes, so no secret that gates those upgrades may sit under preview/*.
+//   nebula/plo                 the two lifecycle ingest tokens: the publishers' and the dispatcher's
+//                              (scripts/nebula-set-plo-secrets.sh; synced into two Kubernetes Secrets)
+//   nebula/plo-source-github   plo-source's dedicated GitHub token (scripts/nebula-set-plo-source-token.sh)
+// Both roles below were created by the lost root stack (infra/src/iam.ts) and are referenced by
+// name; these are extra inline policies, the originals are untouched.
+export const PLO_SECRETS = ["nebula/plo", "nebula/plo-source-github"] as const;
+// Secrets Manager appends "-" and six random characters to the name in the ARN.
+const secretArn = (name: string) => `arn:aws:secretsmanager:${region}:${acct}:secret:${name}-??????`;
+
+// 6a. External Secrets may read exactly the two secrets, not a new prefix.
+new aws.iam.RolePolicy("eso-nebula-plo-read", {
+  role: "twizz-eso",
+  name: "twizz-eso-nebula-plo",
+  policy: JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [{ Sid: "PloSecretsRead", Effect: "Allow", Action: ["secretsmanager:GetSecretValue", "secretsmanager:DescribeSecret"], Resource: PLO_SECRETS.map(secretArn) }],
+  }),
+});
+
+// 6b. Preview pods are DENIED the platform's control-plane secrets that do sit under preview/*
+// (an explicit Deny wins over the Allow on preview/* of the original policy), and everything
+// under nebula/* whatever is added there later. Without this a preview pod can read the
+// dashboard's whole configuration (its database URL and session secrets: it could write
+// lifecycle snapshots straight into Postgres and skip the ingest token), the platform GitHub
+// PAT and the SSO client and cookie secrets. CloudTrail over the 14 days before 2026-11-25 shows
+// only twizz-eso reading these five, so no preview workload loses anything it uses.
+// Application secrets (preview/moly-backend, preview/twizz-sentinel, preview/<service>/<env>,
+// ...) stay readable: that is what the role is for.
+export const PREVIEW_PODS_DENIED_SECRETS = ["preview/nebula", "preview/github", "preview/github-app", "preview/google-sso", "preview/admin-gate"] as const;
+new aws.iam.RolePolicy("preview-pods-deny-platform-secrets", {
+  role: "twizz-nonprod-preview-pods",
+  name: "twizz-preview-pods-deny-platform-secrets",
+  policy: JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Sid: "NoPlatformSecrets",
+        Effect: "Deny",
+        Action: "secretsmanager:*",
+        Resource: [...PREVIEW_PODS_DENIED_SECRETS.map(secretArn), `arn:aws:secretsmanager:${region}:${acct}:secret:nebula/*`],
+      },
+    ],
+  }),
+});

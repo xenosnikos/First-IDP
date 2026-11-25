@@ -54,15 +54,63 @@ const isoInstant = str.datetime({ offset: true });
 const tier = z.enum(LIFECYCLE_TIERS);
 const bundleKey = str.regex(LIFECYCLE_BUNDLE_KEY_RE, "bundleKey must be a sha256 hex digest");
 
-export const LifecyclePrRef = z.object({
-  /** owner/name */
-  repo: str,
-  number: z.number().int().positive(),
-  url: str,
-  branch: str,
-  headSha: str,
-  title: str,
-});
+// ── links ─────────────────────────────────────────────────────────────────
+// A snapshot is written by whoever holds the ingest token, and three of its
+// fields end up in an `<a href>` on /lifecycle. So a URL is accepted only when
+// it is `https:` on a host the tab is meant to link to — here, at ingest, and
+// again where it is rendered (`lifecycleSafeLink`). Anything else is rejected,
+// never repaired.
+
+/** where an advisory may link */
+export const LIFECYCLE_ADVISORY_HOSTS = ["osv.dev", "nodejs.org", "github.com", "nvd.nist.gov", "www.cve.org", "www.cisa.gov"] as const;
+/** where a pull request or an escalation issue may link */
+export const LIFECYCLE_GITHUB_HOSTS = ["github.com"] as const;
+/** every host a snapshot URL may be rendered as a link to */
+export const LIFECYCLE_LINK_HOSTS: readonly string[] = [...new Set<string>([...LIFECYCLE_ADVISORY_HOSTS, ...LIFECYCLE_GITHUB_HOSTS])];
+
+/** `raw` as a link target, or null: `https:` only, an allowlisted host exactly
+ * (no sub-domain, no port, no credentials), and nothing a browser would
+ * re-interpret (control characters, a backslash, whitespace). Returns the
+ * URL as the parser normalised it. */
+export function lifecycleSafeLink(raw: unknown, hosts: readonly string[] = LIFECYCLE_LINK_HOSTS): string | null {
+  if (typeof raw !== "string" || raw.length === 0 || raw.length > LIFECYCLE_LIMITS.stringChars) return null;
+  // eslint-disable-next-line no-control-regex
+  if (/[\u0000-\u0020\u007f\\]/.test(raw)) return null;
+  let u: URL;
+  try {
+    u = new URL(raw);
+  } catch {
+    return null;
+  }
+  if (u.protocol !== "https:" || u.username || u.password || u.port) return null;
+  if (!hosts.includes(u.hostname)) return null;
+  if (!raw.toLowerCase().startsWith(`https://${u.hostname}/`) && raw.toLowerCase() !== `https://${u.hostname}`) return null;
+  return u.href;
+}
+
+const linkTo = (hosts: readonly string[], what: string) => str.refine((v) => lifecycleSafeLink(v, hosts) !== null, { message: `${what} must be an https URL on ${hosts.join(", ")}` });
+
+/** `owner/name` on GitHub */
+export const LIFECYCLE_REPO_SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9._-]{1,100}$/;
+/** the one URL a pull request has */
+export const lifecyclePrUrl = (repo: string, number: number) => `https://github.com/${repo}/pull/${number}`;
+
+export const LifecyclePrRef = z
+  .object({
+    /** owner/name */
+    repo: str.regex(LIFECYCLE_REPO_SLUG_RE, "repo must be owner/name"),
+    number: z.number().int().positive(),
+    /** exactly `https://github.com/<repo>/pull/<number>` (owner/name compared case-insensitively) */
+    url: linkTo(LIFECYCLE_GITHUB_HOSTS, "a pull request url"),
+    branch: str,
+    headSha: str,
+    title: str,
+  })
+  .superRefine((p, ctx) => {
+    // one issue per problem: a bad number or a non-link url is already reported by its own field
+    if (!Number.isInteger(p.number) || p.number <= 0 || lifecycleSafeLink(p.url, LIFECYCLE_GITHUB_HOSTS) === null) return;
+    if (p.url.toLowerCase() !== lifecyclePrUrl(p.repo, p.number).toLowerCase()) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["url"], message: "url must be https://github.com/<repo>/pull/<number> of this very pull request" });
+  });
 export type LifecyclePrRef = z.infer<typeof LifecyclePrRef>;
 
 export const LifecycleScheduleEntry = z.object({
@@ -109,7 +157,8 @@ export const LifecycleChangeSet = z.object({
   rationale: z.array(str),
   componentIds: z.array(str),
   pr: LifecyclePrRef.optional(),
-  escalationUrl: str.optional(),
+  /** an issue or pull request on GitHub */
+  escalationUrl: linkTo(LIFECYCLE_GITHUB_HOSTS, "escalationUrl").optional(),
 });
 export type LifecycleChangeSet = z.infer<typeof LifecycleChangeSet>;
 
@@ -140,7 +189,8 @@ export const LifecycleAdvisory = z.object({
   /** 0..1 */
   epss: z.number().min(0).max(1).optional(),
   summary: str,
-  url: str,
+  /** https, on one of LIFECYCLE_ADVISORY_HOSTS */
+  url: linkTo(LIFECYCLE_ADVISORY_HOSTS, "an advisory url"),
   published: str.optional(),
   modified: str.optional(),
   affected: z.array(
@@ -219,15 +269,72 @@ export type LifecycleRequestKind = (typeof LIFECYCLE_REQUEST_KINDS)[number];
 export const LIFECYCLE_REQUEST_STATUSES = ["pending", "claimed", "done", "failed", "expired"] as const;
 export type LifecycleRequestStatus = (typeof LIFECYCLE_REQUEST_STATUSES)[number];
 
+// What a smoke target may be — ONE form per scope, the same two forms PLO's
+// own allowlist admits (`smoke.allowedHosts` in its config/inventory.yaml):
+//
+//   preview  the Service of the bundle's own named env, INSIDE the cluster:
+//            `http://<service>.env-plo-<…>.svc.cluster.local[:<port>]`.
+//            Not the public host `https://plo-<…>.prv.twizz.com`: every
+//            preview Ingress sits behind the ingress-nginx Google sign-in gate,
+//            so an unauthenticated GET there is answered 302 whatever the app
+//            does, and a smoke through it could never pass. plo-dispatch runs
+//            in the same cluster and reaches the Service directly.
+//   stg      the fixed staging host of the release train:
+//            `https://<short>-stg.prv.twizz.com` (never a `plo-*` host).
+//
+// No path, no credentials, no IP literal, no other scheme — `file:`,
+// `http://169.254.169.254` and friends never validate; a preview target is
+// never accepted as staging evidence nor the other way round.
+
+/** scope `stg`: the bare https origin of a release-train staging host. */
+export const LIFECYCLE_SMOKE_STG_ORIGIN_RE = /^https:\/\/(?!plo-)[a-z0-9](?:[a-z0-9-]{0,56}[a-z0-9])?-stg\.prv\.twizz\.com$/;
+/** scope `preview`: `http://<service>.env-<plo-env>.svc.cluster.local[:port]`. Port 80 is never
+ * written (PLO requires the string to be exactly the URL's origin, and an origin drops `:80`). */
+export const LIFECYCLE_SMOKE_PREVIEW_ORIGIN_RE = /^http:\/\/([a-z][a-z0-9-]{1,39})\.env-(plo-[a-z0-9-]{1,20})\.svc\.cluster\.local(?::(?!80$)([1-9][0-9]{1,4}))?$/;
+/** either form (display, logs); a request is checked against the form of ITS scope */
+export const LIFECYCLE_SMOKE_ORIGIN_RE = new RegExp(`${LIFECYCLE_SMOKE_STG_ORIGIN_RE.source}|${LIFECYCLE_SMOKE_PREVIEW_ORIGIN_RE.source}`);
+
+/** Where plo-dispatch reaches the Service of a bundle preview env: the chart names the Service
+ * after the registry service (`fullnameOverride`), in namespace `env-<envName>`, on the port of
+ * that branch's twizz.yaml. Null when any part is not what such an env can have. */
+export function lifecyclePreviewSmokeOrigin(service: string, envName: string, port: number): string | null {
+  if (!Number.isInteger(port) || port < 1 || port > 65535) return null;
+  const origin = `http://${service}.env-${envName}.svc.cluster.local${port === 80 ? "" : `:${port}`}`;
+  return LIFECYCLE_SMOKE_PREVIEW_ORIGIN_RE.test(origin) ? origin : null;
+}
+
+/** The (service, env) a preview smoke origin names, or null when it is not one. */
+export function lifecycleParsePreviewSmokeOrigin(origin: string): { service: string; envName: string; port: number } | null {
+  const m = LIFECYCLE_SMOKE_PREVIEW_ORIGIN_RE.exec(origin);
+  if (!m) return null;
+  const port = m[3] ? Number(m[3]) : 80;
+  return port >= 1 && port <= 65535 ? { service: m[1], envName: m[2], port } : null;
+}
+
+/** Is `baseUrl` a target a smoke request of `scope` may name for service `name`? */
+export function lifecycleSmokeTargetOk(scope: LifecycleSmokeScope, name: string, baseUrl: string): boolean {
+  if (scope === "stg") return LIFECYCLE_SMOKE_STG_ORIGIN_RE.test(baseUrl);
+  // preview: the Service is the target's own service — a request can never point `moly-backend` at another Service
+  return lifecycleParsePreviewSmokeOrigin(baseUrl)?.service === name;
+}
+
 /** A smoke request's targets. `baseUrl` is built by the dashboard, never by
  * the caller; PLO additionally enforces its own host allowlist. */
 export const LifecycleSmokeParams = z
   .object({
     scope: z.enum(LIFECYCLE_SMOKE_SCOPES),
     bundleKey,
-    targets: z.array(z.object({ name: str.min(1), baseUrl: str.url() }).strict()).min(1).max(LIFECYCLE_MAX_SMOKE_TARGETS),
+    targets: z
+      .array(z.object({ name: str.min(1).regex(/^[a-z][a-z0-9-]{1,39}$/, "a registry service name"), baseUrl: str.regex(LIFECYCLE_SMOKE_ORIGIN_RE, "baseUrl must be a smoke origin (the env's in-cluster Service for preview, https://<short>-stg.prv.twizz.com for stg)") }).strict())
+      .min(1)
+      .max(LIFECYCLE_MAX_SMOKE_TARGETS),
   })
-  .strict();
+  .strict()
+  .superRefine((p, ctx) => {
+    p.targets.forEach((t, i) => {
+      if (!lifecycleSmokeTargetOk(p.scope, t.name, t.baseUrl)) ctx.addIssue({ code: z.ZodIssueCode.custom, path: ["targets", i, "baseUrl"], message: `not a ${p.scope} smoke origin of this service` });
+    });
+  });
 export type LifecycleSmokeParams = z.infer<typeof LifecycleSmokeParams>;
 
 const NoParams = z.object({}).strict();

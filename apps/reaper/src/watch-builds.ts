@@ -7,7 +7,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { Octokit } from "@octokit/rest";
 import { ECRClient } from "@aws-sdk/client-ecr";
-import { EcrRegistry, GithubBuilds, GithubGitops, createAudit, listNamedEnvs, manifestPath, manifestToYaml, type BuildDispatcher, type FileChange, type GitopsRepo, type ImageRegistry, type NamedEnvManifest } from "@twizz-idp/actions";
+import { EcrRegistry, GithubBuilds, GithubGitops, createAudit, envEcrRepo, listNamedEnvs, manifestPath, manifestToYaml, type BuildDispatcher, type FileChange, type GitopsRepo, type ImageRegistry, type NamedEnvManifest } from "@twizz-idp/actions";
 import { decideBuild } from "./builds";
 
 const ACTOR = "reaper:build-watcher";
@@ -34,10 +34,13 @@ export async function watchBuilds(deps: WatchDeps) {
   for (const m of pending) {
     try {
       const b = m.build;
+      // the ECR repository the builder pushed to and the chart pulls from (envEcrRepo) — for
+      // moly-backend / frontend / business that is not the service name
+      const ecrRepo = envEcrRepo(m);
       let run = null;
       if (b?.runId != null) run = await deps.builds.getRun(b.runId).catch(() => null);
-      else if (b) run = await deps.builds.findRun({ displayTitle: deps.builds.displayTitle({ envName: m.name, service: m.service, sha: m.source?.sha ?? "" }), createdAfter: new Date(Date.parse(b.startedAt) - 60_000) });
-      const imageExists = b && run?.status === "completed" && run.conclusion === "success" ? !!(await deps.images.describeTag(m.service, b.expectedTag)) : false;
+      else if (b) run = await deps.builds.findRun({ displayTitle: deps.builds.displayTitle({ envName: m.name, service: ecrRepo, sha: m.source?.sha ?? "" }), createdAfter: new Date(Date.parse(b.startedAt) - 60_000) });
+      const imageExists = b && run?.status === "completed" && run.conclusion === "success" ? !!(await deps.images.describeTag(ecrRepo, b.expectedTag)) : false;
       const d = decideBuild(m, run, imageExists, now);
       const pendingPath = manifestPath(m.name, true);
       switch (d.action) {

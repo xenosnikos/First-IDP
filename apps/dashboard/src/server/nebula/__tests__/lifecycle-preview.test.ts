@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   LIFECYCLE_TOOLS,
   PREVIEW_STATES,
+  argoRunsImage,
+  bundleImageTag,
   SIGNOFF_AUDIT_ACTION,
   buildPreview,
   bundleTargets,
@@ -15,7 +17,7 @@ import {
   type PromotionInput,
   type StagingTargetInput,
 } from "../lifecycle-model";
-import { DAY, HOUR, KEY, NOW, OTHER_KEY, SHA_BACKEND, SHA_SENTINEL, ago, bundle, env, pr, request, smokeRequest, smokeSnap, snap } from "./lifecycle-fixtures";
+import { DAY, HOUR, KEY, NOW, OTHER_KEY, PREVIEW_SVC, SHA_BACKEND, SHA_SENTINEL, ago, bundle, env, pr, request, smokeRequest, smokeSnap, snap } from "./lifecycle-fixtures";
 
 const SENTINEL = "twizz-app/twizz-sentinel";
 const BACKEND = "twizz-app/Moly-backend";
@@ -31,8 +33,8 @@ const TAG_S = `nb-${ENV_S}-${SHA_SENTINEL.slice(0, 12)}`;
 const source = (bundles = [bundle(SENTINEL, SHA_SENTINEL), bundle(BACKEND, SHA_BACKEND)], key: string | null = KEY) => snap("source", ago(DAY), { runId: "source-1", bundles, ...(key ? { bundleKey: key } : {}) });
 const envsUp = () => [env(ENV_S, SENTINEL, SHA_SENTINEL), env(ENV_B, BACKEND, SHA_BACKEND)];
 const stagingOn = (tag: string | null, over: Partial<StagingTargetInput> = {}): StagingTargetInput[] => [
-  { service: "twizz-sentinel", host: "sentinel-stg.prv.twizz.com", currentTag: tag, argo: "PASS", error: null, ...over },
-  { service: "twizz-admin", host: "admin-stg.prv.twizz.com", currentTag: "main-" + "9".repeat(40), argo: "PASS", error: null },
+  { service: "twizz-sentinel", host: "sentinel-stg.prv.twizz.com", currentTag: tag, argo: "PASS", runsImage: true, rolledOutAt: ago(3 * HOUR).toISOString(), error: null, ...over },
+  { service: "twizz-admin", host: "admin-stg.prv.twizz.com", currentTag: "main-" + "9".repeat(40), argo: "PASS", runsImage: true, rolledOutAt: ago(3 * HOUR).toISOString(), error: null },
 ];
 const promotion = (tag = TAG_S): PromotionInput => ({ service: "twizz-sentinel", imageTag: tag, number: 77, url: "https://github.com/TwizzyNicky/twizz-gitops/pull/77", headSha: "d".repeat(40) });
 
@@ -135,7 +137,8 @@ describe("smokeVerdict", () => {
   });
 
   it("fails closed on anything short of a clean pass", () => {
-    const done = smokeRequest("preview", KEY, { status: "done" });
+    // completed properly: claimed 8 minutes ago, answered under run `smoke-done`, completed just now
+    const done = smokeRequest("preview", KEY, { status: "done", runId: "smoke-done", claimedAt: ago(8 * 60_000), finishedAt: ago(500) });
     // completed, but no snapshot for it
     expect(smokeVerdict("preview", KEY, [done], [])).toMatchObject({ verdict: "fail", detail: expect.stringMatching(/no smoke result was received/) });
     // a passing snapshot that belongs to ANOTHER request does not count
@@ -258,10 +261,47 @@ describe("the preview state machine", () => {
     expect(preview({ envs: [env(ENV_S, "Twizz-App/TWIZZ-sentinel", SHA_SENTINEL)] }).state).toBe("preview-requested");
   });
 
-  it("prefers a deployable env over a failed one for the same bundle", () => {
+  // (external review 2026-11-25, idp #1) This used to read "prefers a deployable env over a failed one
+  // for the same bundle" and expected ANOTHER plo-* env on the same commit to be adopted as the preview.
+  // That is the squatting hole: the bundle's preview is the env of its own deterministic name, only.
+  it("never adopts another plo-* env on the same commit: the bundle's preview is the env of its own name", () => {
     const v = preview({ envs: [env("plo-2611-twizz-sentinel", SENTINEL, SHA_SENTINEL, { build: "failed", imageTag: null }), env("plo-2611-twizz-sent2", SENTINEL, SHA_SENTINEL), env(ENV_B, BACKEND, SHA_BACKEND)] });
-    expect(v.state).toBe("preview-up");
-    expect(v.bundles[0].env?.name).toBe("plo-2611-twizz-sent2");
+    expect(v.state).toBe("preview-requested");
+    expect(v.bundles[0].env).toMatchObject({ name: "plo-2611-twizz-sentinel", build: "failed", up: false });
+    // an env sorting first, deployable and healthy, on exactly the bundle commit: still not the preview
+    const squat = preview({ envs: [env("plo-0000-hijack", SENTINEL, SHA_SENTINEL), env(ENV_B, BACKEND, SHA_BACKEND)] });
+    expect(squat.bundles[0].env).toBeNull();
+    expect(squat.state).toBe("preview-requested");
+    expect(allowed(squat)).toEqual(["createPreview"]);
+  });
+
+  it("the env of the bundle's name is adopted only when it IS the bundle's: repository, commit, branch, service, created by an operator", () => {
+    const up = env(ENV_B, BACKEND, SHA_BACKEND);
+    const cases: Array<[Partial<Parameters<typeof env>[3] & object>, RegExp]> = [
+      [{ trusted: false, owner: "mallory" }, /plo-2611-twizz-sentinel exists but is not this bundle's preview \(it was created by mallory, who is not a Nebula operator\)/],
+      [{ sourceRef: "feature/evil" }, /it is built from branch feature\/evil, not from plo\/bundle\/2026-11/],
+      [{ service: "moly-backend" }, /it runs service moly-backend, not twizz-sentinel/],
+      [{ sourceSha: "0".repeat(40) }, /it is built from 0000000, not from the bundle head a1a1a1a/],
+      [{ sourceRepo: "twizz-app/front-admin" }, /it is not built from this repository/],
+    ];
+    for (const [over, why] of cases) {
+      const v = preview({ envs: [env(ENV_S, SENTINEL, SHA_SENTINEL, over), up] });
+      expect(v.bundles[0].env, JSON.stringify(over)).toBeNull();
+      expect(v.blockers.join("\n"), JSON.stringify(over)).toMatch(why);
+      expect(v.actions.smokePreview.allowed, JSON.stringify(over)).toBe(false);
+      expect(v.actions.deployStg.allowed).toBe(false);
+    }
+  });
+
+  it("'up' means Argo reports the pods on the bundle image — Synced + Healthy about another image is not up (idp #3)", () => {
+    const stale = preview({ envs: [env(ENV_S, SENTINEL, SHA_SENTINEL, { runsImage: false }), env(ENV_B, BACKEND, SHA_BACKEND)] });
+    expect(stale.bundles[0].env).toMatchObject({ argo: "PASS", up: false });
+    expect(stale.state).toBe("preview-requested");
+    expect(stale.actions.smokePreview).toEqual({ allowed: false, reason: "the preview envs are not all up yet" });
+    expect(stale.blockers.join("\n")).toMatch(/Argo is Synced \+ Healthy but does not report the pods on nb-plo-2611-twizz-sentinel-a1a1a1a1a1a1 yet/);
+    // an env that carries another image tag than the bundle's is not up either
+    const other = preview({ envs: [env(ENV_S, SENTINEL, SHA_SENTINEL, { imageTag: "nb-plo-2611-twizz-sentinel-000000000000" }), env(ENV_B, BACKEND, SHA_BACKEND)] });
+    expect(other.bundles[0].env?.up).toBe(false);
   });
 
   it("a smoke run in flight keeps the state and blocks a second one", () => {
@@ -467,5 +507,146 @@ describe("the preview state machine", () => {
       expect(PREVIEW_STATES).toContain(v.state);
       expect(v.steps.map((s) => s.key)).toEqual(["bundle-ready", "preview-requested", "preview-up", "smoke-preview", "stg-requested", "stg-deployed", "smoke-stg", "awaiting-signoff", "signed-off"]);
     }
+  });
+});
+
+// ── external review 2026-11-25 — the gate-bypass claims, at the state machine ──
+describe("fail closed: what 'deployed', 'passed' and 'a bundle' mean (external review)", () => {
+  const ECR = "848281935985.dkr.ecr.eu-west-1.amazonaws.com";
+
+  it("argoRunsImage: true only when Argo reports that repository on exactly that tag and no other", () => {
+    expect(argoRunsImage([`${ECR}/twizz-sentinel:${TAG_S}`, "redis:7-alpine"], "twizz-sentinel", TAG_S)).toBe(true);
+    expect(argoRunsImage([`${ECR}/twizz-sentinel:main-${"0".repeat(40)}`], "twizz-sentinel", TAG_S)).toBe(false); // the previous image
+    expect(argoRunsImage([`${ECR}/twizz-sentinel:${TAG_S}`, `${ECR}/twizz-sentinel:main-${"0".repeat(40)}`], "twizz-sentinel", TAG_S)).toBe(false); // both: still rolling
+    expect(argoRunsImage([`${ECR}/twizz-sentinel-worker:${TAG_S}`], "twizz-sentinel", TAG_S)).toBe(false); // another repository
+    expect(argoRunsImage([`${ECR}/twizz-sentinel@sha256:${"a".repeat(64)}`], "twizz-sentinel", TAG_S)).toBe(false); // a digest proves no tag
+    expect(argoRunsImage([`${ECR}/twizz-sentinel`], "twizz-sentinel", TAG_S)).toBe(false);
+    expect(argoRunsImage([`localhost:5000/twizz-sentinel:${TAG_S}`], "twizz-sentinel", TAG_S)).toBe(true); // a registry port is not a tag
+    for (const none of [undefined, null, []]) expect(argoRunsImage(none, "twizz-sentinel", TAG_S)).toBe(false);
+    expect(argoRunsImage([`${ECR}/twizz-sentinel:${TAG_S}`], "twizz-sentinel", null)).toBe(false);
+    expect(bundleImageTag(ENV_S, SHA_SENTINEL)).toBe(TAG_S);
+  });
+
+  it("idp #3: staging is 'deployed' only when Argo reports the pods on the bundle image — not on Synced + Healthy alone", () => {
+    const pass = smoked("preview", [{ ok: true }]);
+    const base = { envs: envsUp(), requests: [pass.req], rows: [source(), pass.row] };
+    // gitops is on the bundle tag and Argo says Synced + Healthy — about the image it deployed BEFORE
+    const lag = preview({ ...base, staging: stagingOn(TAG_S, { runsImage: false }) });
+    expect(lag.bundles[0].staging).toMatchObject({ currentTag: TAG_S, argo: "PASS", deployed: false });
+    expect(lag.state).toBe("stg-requested");
+    expect(lag.actions.smokeStg).toEqual({ allowed: false, reason: "staging is not running this bundle yet" });
+    expect(lag.actions.signoff.allowed).toBe(false);
+    expect(lag.blockers.join("\n")).toMatch(/twizz-sentinel staging: gitops is on the bundle image but Argo does not report the pods on it yet/);
+    // rolled out: now it is
+    expect(preview({ ...base, staging: stagingOn(TAG_S) }).state).toBe("stg-deployed");
+    // some OTHER nb-plo image at the same commit is not this bundle's image
+    const otherTag = `nb-plo-0000-hijack-${SHA_SENTINEL.slice(0, 12)}`;
+    expect(preview({ ...base, staging: stagingOn(otherTag) }).bundles[0].staging?.deployed).toBe(false);
+    expect(preview({ ...base, staging: stagingOn("main-" + "1".repeat(40)), promotions: [promotion(otherTag)] }).bundles[0].staging?.promotion).toBeNull();
+  });
+
+  it("idp #3: a smoke pass requested before the last rollout is not evidence about what runs now", () => {
+    const pre = smoked("preview", [{ ok: true }], KEY, 30);
+    const stg = smoked("stg", [{ ok: true }], KEY, 10); // requested 15 minutes ago
+    const rows = [source(), pre.row, stg.row];
+    const requests = [pre.req, stg.req];
+    const fresh = preview({ envs: envsUp(), rows, requests, staging: stagingOn(TAG_S) });
+    expect(fresh.state).toBe("awaiting-signoff");
+    // staging finished rolling out 5 minutes ago — AFTER that staging smoke was requested
+    const late = preview({ envs: envsUp(), rows, requests, staging: stagingOn(TAG_S, { rolledOutAt: ago(5 * 60_000).toISOString() }) });
+    expect(late.smoke.stg.verdict).toBe("pass");
+    expect(late.state).toBe("stg-deployed");
+    expect(late.actions.signoff).toEqual({ allowed: false, reason: expect.stringMatching(/twizz-sentinel staging rolled out at .* after the staging smoke was requested — run the staging smoke again/) });
+    expect(late.actions.smokeStg.allowed).toBe(true);
+    // Argo does not say when it rolled out: unknown is not evidence
+    const unknown = preview({ envs: envsUp(), rows, requests, staging: stagingOn(TAG_S, { rolledOutAt: null }) });
+    expect(unknown.actions.signoff).toEqual({ allowed: false, reason: expect.stringMatching(/Argo does not say when twizz-sentinel staging rolled out/) });
+    // the same for a preview env that was re-synced after its smoke
+    const resynced = preview({ envs: [env(ENV_S, SENTINEL, SHA_SENTINEL, { rolledOutAt: ago(60_000).toISOString() }), env(ENV_B, BACKEND, SHA_BACKEND)], rows: [source(), pre.row], requests: [pre.req] });
+    expect(resynced.state).toBe("preview-up");
+    expect(resynced.actions.deployStg).toEqual({ allowed: false, reason: expect.stringMatching(/plo-2611-twizz-sentinel rolled out at .* after the preview smoke was requested/) });
+    expect(resynced.actions.smokePreview.allowed).toBe(true);
+  });
+
+  it("idp #4 / gitops #6: the sign-off needs the preview smoke of EVERY bundled service as well as the staging smoke", () => {
+    const stg = smoked("stg", [{ ok: true }], KEY, 10);
+    const staging = stagingOn(TAG_S);
+    // staging green, but the preview smoke (which covers Moly-backend, not on the release train) failed afterwards
+    const failed = smoked("preview", [{ ok: true }, { ok: false }], KEY, 5);
+    const v = preview({ envs: envsUp(), rows: [source(), stg.row, failed.row], requests: [stg.req, failed.req], staging });
+    expect(v.smoke).toMatchObject({ stg: { verdict: "pass" }, preview: { verdict: "fail" } });
+    expect(v.state).toBe("smoke-preview-fail");
+    expect(v.actions.signoff).toEqual({ allowed: false, reason: "the latest preview smoke for this bundle has not passed" });
+    expect(v.detail).toMatch(/the staging smoke passed, but the preview smoke for this bundle has not/);
+    // …or never ran at all (the image reached staging some other way)
+    const never = preview({ envs: envsUp(), rows: [source(), stg.row], requests: [stg.req], staging });
+    expect(never.actions.signoff).toEqual({ allowed: false, reason: "the latest preview smoke for this bundle has not passed" });
+    expect(never.state).not.toBe("awaiting-signoff");
+    // …or is still running
+    const running = preview({ envs: envsUp(), rows: [source(), stg.row], requests: [stg.req, smokeRequest("preview", KEY)], staging });
+    expect(running.actions.signoff.allowed).toBe(false);
+    // both green: the gate opens
+    const ok = smoked("preview", [{ ok: true }], KEY, 30);
+    expect(preview({ envs: envsUp(), rows: [source(), stg.row, ok.row], requests: [stg.req, ok.req], staging }).actions.signoff).toEqual({ allowed: true });
+  });
+
+  it("idp #8: a FAILED source run is never an actionable bundle", () => {
+    const failed = snap("source", ago(HOUR), { runId: "source-bad", ok: false, error: "bundle: git merge failed", bundles: [bundle(SENTINEL, SHA_SENTINEL)], bundleKey: KEY });
+    const v = preview({ rows: [failed], envs: envsUp() });
+    expect(v.state).toBe("no-bundle");
+    expect(v.sourceRun).toMatchObject({ runId: "source-bad", ok: false });
+    expect(allowed(v)).toEqual([]);
+    for (const a of Object.values(v.actions)) expect(reason(a)).toBe("there is no bundle: the last source run failed, so there is no bundle to act on");
+    expect(v.blockers.join("\n")).toMatch(/the source run source-bad FAILED \(bundle: git merge failed\) and no successful one is on record/);
+    // the partial bundle is still SHOWN (never hidden) — it just cannot be acted on
+    expect(v.bundles.map((b) => b.github)).toEqual([SENTINEL]);
+    // with an earlier successful run on record that one stays the bundle, and the newer failure is said
+    const both = preview({ rows: [source(), failed] });
+    expect(both.state).toBe("bundle-ready");
+    expect(both.sourceRun).toMatchObject({ runId: "source-1", ok: true });
+    expect(both.blockers.join("\n")).toMatch(/the newest source run source-bad failed \(bundle: git merge failed\); showing the bundle of the last successful run source-1/);
+  });
+});
+
+describe("smokeVerdict: a result counts only as the one answer to Nebula's own request (external review idp #2)", () => {
+  const req = () => smokeRequest("preview", KEY, { status: "done", createdAt: ago(20 * 60_000), claimedAt: ago(15 * 60_000), finishedAt: ago(10 * 60_000), runId: "real-run" });
+  const green = [{ ok: true }];
+
+  it("the result must be the run the request was bound to — a later snapshot naming the same request changes nothing", () => {
+    const r = req();
+    const real = smokeSnap(r, "preview", KEY, [{ ok: false }], ago(12 * 60_000));
+    expect(smokeVerdict("preview", KEY, [r], [real])).toMatchObject({ verdict: "fail", runId: "real-run", detail: "1 of 1 checks failed" });
+    // the flip: a NEWER all-green snapshot for the same requestId under another run id
+    const forged = smokeSnap(r, "preview", KEY, green, ago(60_000), { runId: "forged-run" });
+    expect(smokeVerdict("preview", KEY, [r], [forged, real])).toMatchObject({ verdict: "fail", runId: "real-run" });
+    // alone, it is not a result for the request at all
+    expect(smokeVerdict("preview", KEY, [r], [forged])).toMatchObject({ verdict: "fail", detail: expect.stringMatching(/no smoke result was received/) });
+    // a request completed without ever being answered is a failure, whatever snapshots name it
+    const unanswered = smokeRequest("preview", KEY, { status: "done", claimedAt: ago(15 * 60_000), finishedAt: ago(10 * 60_000), runId: null });
+    expect(smokeVerdict("preview", KEY, [unanswered], [smokeSnap(unanswered, "preview", KEY, green, ago(12 * 60_000))]).verdict).toBe("fail");
+  });
+
+  it("the result must have ARRIVED (server clock) after the request was claimed and not after it was completed", () => {
+    const r = req();
+    const at = (ms: number) => smokeVerdict("preview", KEY, [r], [smokeSnap(r, "preview", KEY, green, ago(ms))]);
+    expect(at(12 * 60_000).verdict).toBe("pass");
+    expect(at(16 * 60_000)).toMatchObject({ verdict: "fail", detail: "the result received predates the request it claims to answer" });
+    expect(at(9 * 60_000)).toMatchObject({ verdict: "fail", detail: "the result was received after the request had been completed" });
+    // the run's own (self-reported) times are irrelevant: only when Nebula received it counts
+    const backdated = smokeSnap(r, "preview", KEY, green, ago(12 * 60_000), { startedAt: ago(DAY).toISOString(), finishedAt: ago(DAY).toISOString() });
+    expect(smokeVerdict("preview", KEY, [r], [backdated]).verdict).toBe("pass");
+    const never = smokeRequest("preview", KEY, { status: "done", claimedAt: null, finishedAt: ago(10 * 60_000), runId: "x" });
+    expect(smokeVerdict("preview", KEY, [never], [smokeSnap(never, "preview", KEY, green, ago(12 * 60_000))]).verdict).toBe("fail");
+  });
+
+  it("green checks of something that is not a target of the request are not a pass", () => {
+    const r = req();
+    const elsewhere = smokeSnap(r, "preview", KEY, green, ago(12 * 60_000), { smoke: { scope: "preview", bundleKey: KEY, results: [{ name: "twizz-sentinel/health", url: "https://attacker-env.prv.twizz.com/health", ok: true, status: 200, ms: 1, detail: "" }] } });
+    expect(smokeVerdict("preview", KEY, [r], [elsewhere])).toMatchObject({ verdict: "fail", detail: "1 of 1 checks are not checks of the requested targets" });
+    const renamed = smokeSnap(r, "preview", KEY, green, ago(12 * 60_000), { smoke: { scope: "preview", bundleKey: KEY, results: [{ name: "something-else/health", url: `${PREVIEW_SVC}/health`, ok: true, status: 200, ms: 1, detail: "" }] } });
+    expect(smokeVerdict("preview", KEY, [r], [renamed]).verdict).toBe("fail");
+    // a look-alike origin: the request's origin as a PREFIX of another one (port 80901, not 8090)
+    const prefix = smokeSnap(r, "preview", KEY, green, ago(12 * 60_000), { smoke: { scope: "preview", bundleKey: KEY, results: [{ name: "twizz-sentinel/health", url: `${PREVIEW_SVC}1/health`, ok: true, status: 200, ms: 1, detail: "" }] } });
+    expect(smokeVerdict("preview", KEY, [r], [prefix]).verdict).toBe("fail");
   });
 });

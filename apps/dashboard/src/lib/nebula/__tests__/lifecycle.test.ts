@@ -1,3 +1,5 @@
+import * as React from "react";
+import { Ext } from "@/components/lifecycle/parts";
 import { describe, expect, it } from "vitest";
 import { STATUS_WORDS, toneOf } from "../status";
 import { buildAdvisories, buildOverview, buildPreview, selectSnapshots, type LifecycleServiceInput, type PreviewInput, type StagingTargetInput } from "@/server/nebula/lifecycle-model";
@@ -41,6 +43,7 @@ import {
   staleNote,
   stepWord,
   tierSummary,
+  safeExternalHref,
   tierWord,
   verdictWord,
   versionChange,
@@ -83,7 +86,7 @@ function overviewOf(rows = [planSnap(), cveSnap()], requests: PreviewInput["requ
 const allRows = (o: ReturnType<typeof overviewOf>): ComponentRow[] => o.tiers.flatMap((t) => t.components);
 
 const source = () => snap("source", ago(DAY), { runId: "source-1", bundles: [bundle(SENTINEL, SHA_SENTINEL), bundle(BACKEND, SHA_BACKEND)], bundleKey: KEY });
-const stagingOn = (tag: string | null): StagingTargetInput[] => [{ service: "twizz-sentinel", host: "sentinel-stg.prv.twizz.com", currentTag: tag, argo: "PASS", error: null }];
+const stagingOn = (tag: string | null): StagingTargetInput[] => [{ service: "twizz-sentinel", host: "sentinel-stg.prv.twizz.com", currentTag: tag, argo: "PASS", runsImage: true, rolledOutAt: ago(3 * 3_600_000).toISOString(), error: null }];
 function previewOf(over: Partial<PreviewInput> = {}): LifecyclePreview {
   return buildPreview({ rows: [source()], requests: [], services: SERVICES, envs: [], promotions: [], staging: stagingOn("main-" + "1".repeat(40)), signoffs: [], now: NOW, ...over });
 }
@@ -275,10 +278,22 @@ describe("tiers: filter, sort, summarise", () => {
     const word = (tier: string) => tierWord(o.tiers.find((t) => t.tier === tier)!);
     expect(word("base-images")).toBe("FAIL");
     expect(word("control-plane")).toBe("AWAITING HUMAN");
-    expect(word("npm-direct")).toBe("RUNNING");
+    // (external review 2026-11-25, idp #14) was RUNNING: the tier carries a known-exploited / high advisory,
+    // which outranks "an upgrade PR is open"
+    expect(word("npm-direct")).toBe("WATCH");
     expect(word("helm")).toBe("UNKNOWN");
     const fine = overviewOf([planSnap([component("a:npm:ok", { status: "current" })])]).tiers.find((t) => t.tier === "npm-direct")!;
     expect(tierWord(fine)).toBe("OK");
+    // every component "current", and yet: never green with an advisory in the tier
+    const counts = { ...fine.counts };
+    expect(tierWord({ total: 3, actionable: 0, counts, advisories: 0, kev: 0, highestSeverity: null })).toBe("OK");
+    expect(tierWord({ total: 3, actionable: 0, counts, advisories: 1, kev: 1, highestSeverity: "low" })).toBe("WATCH");
+    expect(tierWord({ total: 3, actionable: 0, counts, advisories: 1, kev: 0, highestSeverity: "critical" })).toBe("WATCH");
+    expect(tierWord({ total: 3, actionable: 0, counts, advisories: 2, kev: 0, highestSeverity: "moderate" })).toBe("WATCH");
+    expect(tierWord({ total: 3, actionable: 1, counts: { ...counts, "pr-open": 1 }, advisories: 0, kev: 0, highestSeverity: null })).toBe("RUNNING");
+    expect(tierWord({ total: 3, actionable: 1, counts: { ...counts, failed: 1 }, advisories: 5, kev: 2, highestSeverity: "critical" })).toBe("FAIL");
+    // advisories filed under a tier nothing was reported for are not "unknown"
+    expect(tierWord({ total: 0, actionable: 0, counts, advisories: 1, kev: 0, highestSeverity: "high" })).toBe("WATCH");
   });
 });
 
@@ -454,5 +469,57 @@ describe("nextAction: the one thing to do", () => {
   it("an in-flight plan request does not change the next action", () => {
     const withReq = overviewOf([planSnap(), cveSnap(), source()], [request("plan")]);
     expect(next(previewOf(), withReq).title).toBe(`Create the preview for bundle ${KEY.slice(0, 12)}`);
+  });
+});
+
+// ── external review 2026-11-25, idp #9: nothing from a snapshot becomes a link unless it is https on a host Nebula links to ──
+describe("outbound links", () => {
+  it("safeExternalHref: https on an allowlisted host or a preview-domain host, nothing else", () => {
+    for (const ok of [
+      "https://github.com/twizz-app/twizz-sentinel/pull/41",
+      "https://osv.dev/vulnerability/GHSA-rv95-896h-c2vc",
+      "https://nodejs.org/en/blog/release/v22.11.0",
+      "https://plo-2611-twizz-sentinel.prv.twizz.com",
+      "https://sentinel-stg.prv.twizz.com/health",
+    ]) expect(safeExternalHref(ok), ok).toBe(new URL(ok).href);
+    for (const bad of [
+      "javascript:alert(1)",
+      "JAVASCRIPT:alert(1)",
+      "java\nscript:alert(1)",
+      "data:text/html;base64,PHNjcmlwdD4=",
+      "vbscript:msgbox(1)",
+      "file:///etc/passwd",
+      "http://github.com/a/b/pull/1",
+      "https://evil.example/login",
+      "https://github.com.evil.example/",
+      "https://github.com@evil.example/",
+      "https://x.prv.twizz.com.evil.example/",
+      "https://x.prv.twizz.com:8443/",
+      "http://x.prv.twizz.com/",
+      "https://a.b.prv.twizz.com/",
+      "https://twizz.com/",
+      "//github.com/x",
+      "/lifecycle",
+      "",
+      null,
+      undefined,
+      42,
+    ]) expect(safeExternalHref(bad), String(bad)).toBeNull();
+  });
+
+  it("<Ext> renders an anchor only for a safe target; anything else is plain text — it never throws and never links", () => {
+    // vitest compiles the component's JSX with the classic runtime, which expects a global React
+    (globalThis as { React?: unknown }).React = React;
+    type El = { type: string; props: { href?: string; rel?: string; target?: string; children?: unknown } };
+    const render = (href: unknown) => Ext({ href: href as string, children: "#41" }) as unknown as El;
+    const link = render("https://github.com/twizz-app/twizz-sentinel/pull/41");
+    expect(link.type).toBe("a");
+    expect(link.props).toMatchObject({ href: "https://github.com/twizz-app/twizz-sentinel/pull/41", target: "_blank", rel: "noopener noreferrer" });
+    for (const bad of ["javascript:alert(document.cookie)", "https://evil.example/login", "data:text/html,x", "", null, undefined]) {
+      const out = render(bad);
+      expect(out.type, String(bad)).toBe("span");
+      expect(out.props.href, String(bad)).toBeUndefined();
+      expect(JSON.stringify(out.props.children), String(bad)).toBe('"#41"');
+    }
   });
 });
