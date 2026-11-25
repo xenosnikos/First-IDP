@@ -1,0 +1,407 @@
+{
+  "schemaVersion": 1,
+  "job": "source",
+  "runId": "20261202T070000-run-source",
+  "startedAt": "2026-12-02T07:00:00.000Z",
+  "finishedAt": "2026-12-02T07:44:02.000Z",
+  "ok": true,
+  "schedule": [
+    {
+      "job": "plan",
+      "cron": "0 6 * * 1",
+      "runner": "nebula",
+      "description": "Inventory every component and report what is outdated or end-of-life (read-only).",
+      "mutates": false
+    },
+    {
+      "job": "cve",
+      "cron": "30 5 * * *",
+      "runner": "nebula",
+      "description": "Check every component and locked npm package against published vulnerabilities (read-only).",
+      "mutates": false
+    },
+    {
+      "job": "source",
+      "cron": "0 7 2 * *",
+      "runner": "nebula",
+      "description": "Open upgrade pull requests on the application repositories and build the monthly bundle branch.",
+      "mutates": true
+    },
+    {
+      "job": "dispatch",
+      "cron": "*/5 * * * *",
+      "runner": "nebula",
+      "description": "Run the plan, CVE and smoke requests operators create in Nebula.",
+      "mutates": false
+    },
+    {
+      "job": "sweep-staging",
+      "cron": "0 7 2 * *",
+      "runner": "github-actions",
+      "description": "Apply low-risk infrastructure upgrades in staging, verify, and roll back on regression.",
+      "mutates": true
+    },
+    {
+      "job": "promote-prod",
+      "cron": "0 7 * * 2",
+      "runner": "github-actions",
+      "description": "Promote changes proven in staging to prod, after human approval of the plan.",
+      "mutates": true
+    }
+  ],
+  "discoveryErrors": [
+    {
+      "domain": "npm-dependency",
+      "error": "lolygram-discover: package-lock.json could not be read from origin/dev"
+    },
+    {
+      "domain": "bundle",
+      "error": "lolygram-discover: open pull requests could not be listed"
+    }
+  ],
+  "components": [
+    {
+      "id": "base-image:Moly-backend:Dockerfile node:20.11.0-alpine3.19",
+      "tier": "base-images",
+      "domain": "base-image",
+      "name": "Dockerfile node:20.11.0-alpine3.19",
+      "target": "Moly-backend",
+      "environments": [
+        "staging",
+        "prod"
+      ],
+      "current": "20.11.0-alpine3.19",
+      "desired": null,
+      "latest": "24.22.1-alpine3.22",
+      "bump": "unknown",
+      "status": "escalated",
+      "autonomy": "escalate",
+      "reasons": [
+        "no published node image for 24.22.1-alpine3.19"
+      ],
+      "eol": {
+        "eol": true,
+        "date": "2026-04-30"
+      },
+      "security": {
+        "advisories": 2,
+        "highestSeverity": "high"
+      },
+      "rollback": "supported",
+      "changeSetId": "source-Moly-backend-base-image"
+    },
+    {
+      "id": "npm-dependency:Moly-backend:express",
+      "tier": "npm-direct",
+      "domain": "npm-dependency",
+      "name": "express",
+      "target": "Moly-backend",
+      "environments": [
+        "staging",
+        "prod"
+      ],
+      "current": "4.19.2",
+      "desired": "4.21.2",
+      "latest": null,
+      "bump": "minor",
+      "status": "pr-open",
+      "autonomy": "pr",
+      "reasons": [],
+      "rollback": "supported",
+      "changeSetId": "source-Moly-backend-npm-dependency-express",
+      "pr": {
+        "repo": "twizz-app/Moly-backend",
+        "number": 318,
+        "url": "https://github.com/twizz-app/Moly-backend/pull/318",
+        "branch": "plo/20261202T070000-run-source/source-Moly-backend-npm-dependency-express",
+        "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "title": "chore(deps): express 4.19.2 -> 4.21.2"
+      }
+    },
+    {
+      "id": "npm-dependency:twizz-sentinel:zod",
+      "tier": "npm-direct",
+      "domain": "npm-dependency",
+      "name": "zod",
+      "target": "twizz-sentinel",
+      "environments": [
+        "staging",
+        "prod"
+      ],
+      "current": "3.23.8",
+      "desired": "3.23.9",
+      "latest": "4.1.5",
+      "bump": "patch",
+      "status": "pr-open",
+      "autonomy": "pr",
+      "reasons": [],
+      "rollback": "supported",
+      "changeSetId": "source-twizz-sentinel-npm-dependency-patch",
+      "pr": {
+        "repo": "twizz-app/twizz-sentinel",
+        "number": 41,
+        "url": "https://github.com/twizz-app/twizz-sentinel/pull/41",
+        "branch": "plo/20261202T070000-run-source/source-twizz-sentinel-npm-dependency-patch",
+        "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "title": "chore(deps): patch updates (zod) + lockfile security fixes"
+      }
+    },
+    {
+      "id": "npm-dependency:twizz-sentinel:__lockfile",
+      "tier": "npm-transitive",
+      "domain": "npm-dependency",
+      "name": "lockfile (transitive security fixes)",
+      "target": "twizz-sentinel",
+      "environments": [
+        "staging",
+        "prod"
+      ],
+      "current": "3 fixable advisories",
+      "desired": "npm audit fix",
+      "latest": null,
+      "bump": "patch",
+      "status": "pr-open",
+      "autonomy": "pr",
+      "reasons": [],
+      "rollback": "supported",
+      "changeSetId": "source-twizz-sentinel-npm-dependency-patch",
+      "pr": {
+        "repo": "twizz-app/twizz-sentinel",
+        "number": 41,
+        "url": "https://github.com/twizz-app/twizz-sentinel/pull/41",
+        "branch": "plo/20261202T070000-run-source/source-twizz-sentinel-npm-dependency-patch",
+        "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "title": "chore(deps): patch updates (zod) + lockfile security fixes"
+      }
+    }
+  ],
+  "changeSets": [
+    {
+      "id": "source-twizz-sentinel-npm-dependency-patch",
+      "stage": "source",
+      "target": "twizz-sentinel",
+      "domain": "npm-dependency",
+      "tier": "npm-direct",
+      "autonomy": "pr",
+      "status": "pr-opened",
+      "rationale": [
+        "zod: npm-dependency patch in source -> pr (policy)",
+        "lockfile: in-range security fixes ride along"
+      ],
+      "componentIds": [
+        "npm-dependency:twizz-sentinel:zod",
+        "npm-dependency:twizz-sentinel:__lockfile"
+      ],
+      "pr": {
+        "repo": "twizz-app/twizz-sentinel",
+        "number": 41,
+        "url": "https://github.com/twizz-app/twizz-sentinel/pull/41",
+        "branch": "plo/20261202T070000-run-source/source-twizz-sentinel-npm-dependency-patch",
+        "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "title": "chore(deps): patch updates (zod) + lockfile security fixes"
+      }
+    },
+    {
+      "id": "source-Moly-backend-npm-dependency-express",
+      "stage": "source",
+      "target": "Moly-backend",
+      "domain": "npm-dependency",
+      "tier": "npm-direct",
+      "autonomy": "pr",
+      "status": "pr-opened",
+      "rationale": [
+        "express: npm-dependency minor in source -> pr (policy)"
+      ],
+      "componentIds": [
+        "npm-dependency:Moly-backend:express"
+      ],
+      "pr": {
+        "repo": "twizz-app/Moly-backend",
+        "number": 318,
+        "url": "https://github.com/twizz-app/Moly-backend/pull/318",
+        "branch": "plo/20261202T070000-run-source/source-Moly-backend-npm-dependency-express",
+        "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "title": "chore(deps): express 4.19.2 -> 4.21.2"
+      }
+    },
+    {
+      "id": "source-Moly-backend-base-image",
+      "stage": "source",
+      "target": "Moly-backend",
+      "domain": "base-image",
+      "tier": "base-images",
+      "autonomy": "escalate",
+      "status": "escalated",
+      "rationale": [
+        "base image: end of life, no safe target -> escalate"
+      ],
+      "componentIds": [
+        "base-image:Moly-backend:Dockerfile node:20.11.0-alpine3.19"
+      ],
+      "escalationUrl": "https://github.com/twizz-app/platform-lifecycle-orchestrator/issues/320"
+    }
+  ],
+  "coverage": [
+    {
+      "environment": "staging",
+      "clusters": [
+        "EKS-Moly-staging"
+      ],
+      "tiers": [
+        {
+          "tier": "base-images",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "partial",
+          "components": 2,
+          "gaps": [
+            "lolygram-discover: package-lock.json could not be read from origin/dev"
+          ]
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "partial",
+          "components": 1,
+          "gaps": [
+            "lolygram-discover: package-lock.json could not be read from origin/dev"
+          ]
+        }
+      ]
+    },
+    {
+      "environment": "prod",
+      "clusters": [
+        "EKS-Moly-Prod"
+      ],
+      "tiers": [
+        {
+          "tier": "base-images",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "partial",
+          "components": 2,
+          "gaps": [
+            "lolygram-discover: package-lock.json could not be read from origin/dev"
+          ]
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "partial",
+          "components": 1,
+          "gaps": [
+            "lolygram-discover: package-lock.json could not be read from origin/dev"
+          ]
+        }
+      ]
+    },
+    {
+      "environment": "nonprod",
+      "clusters": [
+        "EKS-Twizz-NonProd"
+      ],
+      "tiers": [
+        {
+          "tier": "base-images",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        }
+      ]
+    }
+  ],
+  "bundles": [
+    {
+      "repo": "twizz-sentinel",
+      "github": "twizz-app/twizz-sentinel",
+      "baseBranch": "main",
+      "branch": "plo/bundle/2026-12",
+      "headSha": "dddddddddddddddddddddddddddddddddddddddd",
+      "included": [
+        {
+          "repo": "twizz-app/twizz-sentinel",
+          "number": 41,
+          "url": "https://github.com/twizz-app/twizz-sentinel/pull/41",
+          "branch": "plo/20261202T070000-run-source/source-twizz-sentinel-npm-dependency-patch",
+          "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "title": "chore(deps): patch updates (zod) + lockfile security fixes"
+        }
+      ],
+      "conflicts": [],
+      "environments": [
+        "staging",
+        "prod"
+      ]
+    },
+    {
+      "repo": "Moly-backend",
+      "github": "twizz-app/Moly-backend",
+      "baseBranch": "main",
+      "branch": "plo/bundle/2026-12",
+      "headSha": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+      "included": [
+        {
+          "repo": "twizz-app/Moly-backend",
+          "number": 318,
+          "url": "https://github.com/twizz-app/Moly-backend/pull/318",
+          "branch": "plo/20261202T070000-run-source/source-Moly-backend-npm-dependency-express",
+          "headSha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "title": "chore(deps): express 4.19.2 -> 4.21.2"
+        }
+      ],
+      "conflicts": [
+        {
+          "pr": {
+            "repo": "twizz-app/Moly-backend",
+            "number": 301,
+            "url": "https://github.com/twizz-app/Moly-backend/pull/301",
+            "branch": "plo/20261202T070000-run-source/source-Moly-backend-npm-dependency-mongoose",
+            "headSha": "cccccccccccccccccccccccccccccccccccccccc",
+            "title": "chore(deps): mongoose 8.7.0 -> 8.9.5"
+          },
+          "files": [
+            "package.json",
+            "package-lock.json"
+          ]
+        }
+      ],
+      "environments": [
+        "staging",
+        "prod"
+      ]
+    },
+    {
+      "repo": "frontend",
+      "github": "twizz-app/frontend",
+      "baseBranch": "main",
+      "branch": "plo/bundle/2026-12",
+      "headSha": null,
+      "included": [],
+      "conflicts": [],
+      "environments": [
+        "staging",
+        "prod"
+      ]
+    }
+  ],
+  "bundleKey": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5"
+}

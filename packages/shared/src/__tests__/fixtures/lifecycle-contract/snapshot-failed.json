@@ -1,0 +1,54 @@
+{
+  "schemaVersion": 1,
+  "job": "cve",
+  "runId": "20261204T053000-cve",
+  "startedAt": "2026-12-04T05:30:09.000Z",
+  "finishedAt": "2026-12-04T05:30:09.000Z",
+  "ok": false,
+  "error": "cve failed: nothing was scanned; cve.json is missing: the job did not finish",
+  "schedule": [
+    {
+      "job": "plan",
+      "cron": "0 6 * * 1",
+      "runner": "nebula",
+      "description": "Inventory every component and report what is outdated or end-of-life (read-only).",
+      "mutates": false
+    },
+    {
+      "job": "cve",
+      "cron": "30 5 * * *",
+      "runner": "nebula",
+      "description": "Check every component and locked npm package against published vulnerabilities (read-only).",
+      "mutates": false
+    },
+    {
+      "job": "source",
+      "cron": "0 7 2 * *",
+      "runner": "nebula",
+      "description": "Open upgrade pull requests on the application repositories and build the monthly bundle branch.",
+      "mutates": true
+    },
+    {
+      "job": "dispatch",
+      "cron": "*/5 * * * *",
+      "runner": "nebula",
+      "description": "Run the plan, CVE and smoke requests operators create in Nebula.",
+      "mutates": false
+    },
+    {
+      "job": "sweep-staging",
+      "cron": "0 7 2 * *",
+      "runner": "github-actions",
+      "description": "Apply low-risk infrastructure upgrades in staging, verify, and roll back on regression.",
+      "mutates": true
+    },
+    {
+      "job": "promote-prod",
+      "cron": "0 7 * * 2",
+      "runner": "github-actions",
+      "description": "Promote changes proven in staging to prod, after human approval of the plan.",
+      "mutates": true
+    }
+  ],
+  "discoveryErrors": []
+}

@@ -20,7 +20,7 @@ import { z } from "zod";
 import { TRPCError } from "@trpc/server";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { NAME_RE, PROMOTABLE_NAMES, PROMOTABLE_TAG_RE, SERVICE_NAMES, IMAGE_TAG_RE, TTL_HOURS, isValidBranch, parseTwizzYaml, type GateResult } from "@twizz-idp/actions";
-import { ENV_KEY_RE, SECRET_SHAPE_RE } from "@twizz-idp/shared";
+import { ENV_KEY_RE, LIFECYCLE_SEVERITIES, LIFECYCLE_TIERS, SECRET_SHAPE_RE } from "@twizz-idp/shared";
 import { fetchLogs, getGroupSamples, listPods, logHistogram, nodeMetrics, type ObserverCtx, type ObserverDeps, type ObserverScope, type ObserverTool } from "@twizz-idp/observer";
 import type { appRouter } from "../routers/_app";
 import { SENTINEL_TIERS, isObjectId, type SentinelGet } from "./sentinel";
@@ -100,6 +100,8 @@ export const MCP_READ_TOOLS = [
   "capacity_cases",
   "capacity_verify",
   "event_watch",
+  "lifecycle_overview",
+  "lifecycle_advisories",
 ] as const;
 
 /** Any bound person (Nebula then applies owner-or-operator per env). */
@@ -299,6 +301,66 @@ export function registerNebulaTools(server: McpServer, d: NebulaMcpDeps): void {
 
   reg("monitor", "Production or staging monitor (traffic, CPU/memory, pods, node headroom, Atlas) with OK/WATCH/HOT verdicts. Read-only.", { tier: z.enum(["production", "staging"]), window: z.enum(["15m", "1h", "6h", "24h"]).optional() }, RO, async (a) =>
     json(await c.monitor.snapshot({ tier: a.tier, window: a.window ?? "1h" })),
+  );
+
+  // ── Lifecycle (docs/NEBULA.md §N9): what PLO last reported. READS only —
+  //    requesting runs, previews, smoke, staging and the sign-off stay in the UI ──
+  reg(
+    "lifecycle_overview",
+    "Platform lifecycle (PLO) overview: what is outdated or end-of-life across the stack, per tier (control plane, add-ons, nodes, Helm, base images, npm direct/transitive) with counts per status; the job schedule with next/last runs; stale-data flags; the state of the monthly upgrade bundle (preview → smoke → staging → sign-off); and `environments`: for EACH environment (nonprod, staging, prod — always all three — plus the live plo-* preview envs) an overall status word, whether the latest runs really observed it (observed / partial / stale / not-observed, with the reasons and when and by which job it was last observed), per-tier counts (current, behind, blocked, escalated, end-of-life, advisories), open advisories by severity with the KEV count (and `gaps`: what the CVE scan could not read of that environment, in which case no open advisory is NOT the same as none found), pending change sets with their PRs, and where the bundle stands for it. An environment that was not observed is UNKNOWN, never OK. Counts only by default; pass `tier` for that tier's component rows (name, target, environments, current → desired, status, advisories, PR). Read-only.",
+    { tier: z.enum(LIFECYCLE_TIERS).optional().describe("Also list this tier's components (actionable first)"), limit: z.number().int().min(1).max(200).optional().describe("Max component rows for `tier` (default 50)") },
+    RO,
+    async (a) => {
+      const r = (await c.lifecycle.overview({ components: a.tier !== undefined })) as { data?: { ok?: { tiers?: Array<{ tier: string; components: unknown[] }> } } };
+      const tiers = r.data?.ok?.tiers;
+      if (!a.tier || !Array.isArray(tiers)) return json(r);
+      const limit = a.limit ?? 50;
+      return json({
+        ...r,
+        data: {
+          ok: {
+            ...r.data!.ok,
+            tiers: tiers.map((t) => (t.tier === a.tier ? { ...t, components: t.components.slice(0, limit), componentsShown: Math.min(limit, t.components.length), componentsTotal: t.components.length } : { ...t, components: [] })),
+          },
+        },
+      });
+    },
+  );
+
+  reg(
+    "lifecycle_advisories",
+    "CVE lookup for the Twizz stack: the latest PLO CVE scan (OSV, Node.js security releases, CISA KEV, EPSS) — every advisory that affects a version actually running or locked (npm incl. transitive, base images, Kubernetes, Helm charts, add-ons), with severity, KEV flag, EPSS, the affected components, their environments and the fixed version, plus what is new since the previous scan. Sorted KEV first, then severity, then EPSS. Filter with `q` (a CVE/GHSA id or a package name), `minSeverity`, `kevOnly`, `newOnly`, `environment`. Totals are always for the whole scan. Read-only.",
+    {
+      q: z.string().min(2).max(100).optional().describe("Substring of an advisory id, alias (CVE-…/GHSA-…) or affected package/component name"),
+      minSeverity: z.enum(LIFECYCLE_SEVERITIES).optional().describe("Lowest severity to include (critical > high > moderate > low > unknown)"),
+      kevOnly: z.boolean().optional().describe("Only advisories in CISA Known Exploited Vulnerabilities"),
+      newOnly: z.boolean().optional().describe("Only advisories that were not in the previous scan"),
+      environment: z.string().max(60).optional().describe("Only advisories affecting this environment name, as PLO reports it"),
+      limit: z.number().int().min(1).max(100).optional().describe("Max advisories returned (default 25)"),
+    },
+    RO,
+    async (a) => {
+      type Row = { id: string; aliases: string[]; severity: string; kev: boolean; isNew: boolean; affected: Array<{ name: string; componentId: string; environments: string[] }> };
+      const r = (await c.lifecycle.advisories()) as { data?: { ok?: { advisories?: Row[] } } };
+      const all = r.data?.ok?.advisories;
+      if (!Array.isArray(all)) return json(r);
+      // critical … unknown, most severe first; a severity outside the list ranks below all of them
+      const rank = (s: string) => {
+        const i = (LIFECYCLE_SEVERITIES as readonly string[]).indexOf(s);
+        return i < 0 ? 0 : LIFECYCLE_SEVERITIES.length - i;
+      };
+      const q = a.q?.toLowerCase();
+      const matched = all.filter(
+        (x) =>
+          (!q || [x.id, ...x.aliases, ...x.affected.flatMap((f) => [f.name, f.componentId])].some((v) => v.toLowerCase().includes(q))) &&
+          (!a.minSeverity || rank(x.severity) >= rank(a.minSeverity)) &&
+          (!a.kevOnly || x.kev) &&
+          (!a.newOnly || x.isNew) &&
+          (!a.environment || x.affected.some((f) => f.environments.includes(a.environment!))),
+      );
+      const limit = a.limit ?? 25;
+      return json({ ...r, data: { ok: { ...r.data!.ok, advisories: matched.slice(0, limit), matched: matched.length, shown: Math.min(limit, matched.length) } } });
+    },
   );
 
   // ── CI (GitHub Actions) ──────────────────────────────────────────────

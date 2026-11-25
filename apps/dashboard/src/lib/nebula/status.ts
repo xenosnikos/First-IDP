@@ -32,6 +32,13 @@ export const STATUS_WORDS = [
   "OK",
   "WATCH",
   "HOT",
+  // N9: advisory severity. A severity IS its word (mapping "critical" onto
+  // another word would hide the fact), and KEV = known exploited (CISA).
+  "CRITICAL",
+  "HIGH",
+  "MODERATE",
+  "LOW",
+  "KEV",
 ] as const;
 
 export type StatusWord = (typeof STATUS_WORDS)[number];
@@ -63,11 +70,15 @@ export function toneOf(word: StatusWord): Tone {
     case "HOT":
     case "EXPIRED":
     case "DENIED":
+    case "CRITICAL":
+    case "HIGH":
+    case "KEV":
       return "fail";
     case "RUNNING":
     case "PENDING":
     case "EXPIRING":
     case "WATCH":
+    case "MODERATE":
       return "pending";
     case "AWAITING HUMAN":
       return "ember";
@@ -75,6 +86,7 @@ export function toneOf(word: StatusWord): Tone {
     case "PLANNED":
     case "UNKNOWN":
     case "READ-ONLY":
+    case "LOW":
       return "muted";
   }
 }
@@ -87,6 +99,12 @@ export type ArgoStatus = {
   health: string | null;
   /** true when the cluster could not be queried at all */
   unreachable?: boolean;
+  /** `status.summary.images`: the images the Application's live pods run. Synced + Healthy says
+   * nothing about WHICH image — between a gitops change and Argo's next poll it still describes
+   * the previous one — so anything that must know what runs reads this (lifecycle `argoRunsImage`). */
+  images?: string[];
+  /** `status.operationState.finishedAt` of the last sync that finished; null while one runs or when unknown */
+  operationFinishedAt?: string | null;
 };
 
 export type ArgoVerdict = { word: StatusWord; detail: string };

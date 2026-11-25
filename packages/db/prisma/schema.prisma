@@ -162,3 +162,43 @@ enum PipelineStatus {
   FAILED
   CANCELLED
 }
+
+// ──────────────────────────────────────────────
+// Lifecycle (docs/NEBULA.md §N9)
+// ──────────────────────────────────────────────
+
+// One row per PLO job run, POSTed by the in-cluster publisher to
+// /api/lifecycle/ingest and validated with @twizz-idp/shared
+// `LifecycleSnapshotDoc` before it is stored. `data` is the PARSED snapshot
+// (unknown keys stripped). Idempotent on `runId`; the ingest keeps the newest
+// 60 rows per job.
+model LifecycleSnapshot {
+  id         String   @id @default(cuid())
+  job        String // plan | source | cve | smoke
+  runId      String   @unique
+  ok         Boolean
+  startedAt  DateTime
+  finishedAt DateTime
+  createdAt  DateTime @default(now()) // when Nebula received it (reset when a runId is replaced)
+  data       Json
+
+  @@index([job, createdAt])
+}
+
+// An on-demand run an operator asked for through the Nebula gate. The
+// dashboard only writes this row; the `plo-dispatch` CronJob claims it
+// (POST /api/lifecycle/requests/claim), runs it and completes it.
+model LifecycleRequest {
+  id          String    @id @default(cuid())
+  kind        String // plan | cve | smoke
+  params      Json
+  requestedBy String // github login
+  status      String    @default("pending") // pending | claimed | done | failed | expired
+  createdAt   DateTime  @default(now())
+  claimedAt   DateTime?
+  finishedAt  DateTime?
+  runId       String?
+  error       String?
+
+  @@index([status, createdAt])
+}

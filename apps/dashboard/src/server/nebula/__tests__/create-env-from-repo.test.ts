@@ -117,7 +117,17 @@ vi.mock("../argo", () => ({ readArgoApplications: async () => ({ reachable: fals
 const { actionsRouter } = await import("../../routers/actions");
 
 const prismaRows: unknown[] = [];
-const prisma = { auditLog: { create: async ({ data }: { data: unknown }) => { prismaRows.push(data); return data; } } } as never;
+/** how many gitops commits existed each time the named-env lock was taken */
+const lockTaken: number[] = [];
+const prisma = {
+  auditLog: { create: async ({ data }: { data: unknown }) => { prismaRows.push(data); return data; } },
+  // the named-env lock (routers/actions.ts withNamedEnvLock): a transaction that only takes an advisory lock
+  $executeRaw: async (strings: TemplateStringsArray) => {
+    if (strings.join("?").includes("pg_advisory_xact_lock")) lockTaken.push(gitops.atomic.length);
+    return 1;
+  },
+  $transaction: async (fn: (tx: unknown) => Promise<unknown>) => fn(prisma),
+} as never;
 const callerFor = (login: string) => actionsRouter.createCaller({ session: { user: { name: login }, login, accessToken: "t" } as never, prisma });
 
 const twizzYaml = ["version: 2", "kind: backend", "port: 8090", "healthPath: /health", "secrets:", "  - ANTHROPIC_API_KEY", "needs:", "  mongo: true", ""].join("\n");
@@ -140,6 +150,7 @@ const base = {
 beforeEach(() => {
   audit.length = 0;
   prismaRows.length = 0;
+  lockTaken.length = 0;
   gitops.files.clear();
   gitops.atomic.length = 0;
   secrets.clear();
@@ -199,6 +210,9 @@ describe("actions.createEnvFromRepo (self-service, gated)", () => {
     expect(secrets.get("preview/twizz-sentinel/sentinel-feat-x")).toMatchObject({ ANTHROPIC_API_KEY: SECRET, LOG_LEVEL: "debug", PORT: "8090", MONGO_URI: "mongodb+srv://u:p@nonprod.mongodb.net/nebula_sentinel-feat-x?retryWrites=true" });
     // gitops: one atomic commit, pending manifest with the PR, no values
     expect(gitops.atomic).toEqual([["apps/twizz-sentinel/values.yaml", "apps/twizz-sentinel/envs/sentinel-feat-x.yaml", "named-envs/pending/sentinel-feat-x.yaml"]]);
+    // (external review 2026-11-25, idp #11) the cap check and the commit ran under the named-env lock:
+    // it was taken once, by the confirmed create only, BEFORE anything was committed to gitops
+    expect(lockTaken).toEqual([0]);
     const manifest = gitops.files.get("named-envs/pending/sentinel-feat-x.yaml")!;
     expect(manifest).toContain("ref: nebula/sentinel-feat-x");
     expect(manifest).toContain("prNumber: 1");

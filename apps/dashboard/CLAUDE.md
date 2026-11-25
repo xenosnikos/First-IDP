@@ -41,7 +41,21 @@ release-image drawer for operators; non-prod tier only), `/environments/topology
 introspection map, `/projects` (kind column + "Spin up"), `/clusters` (Observer), `/pipelines`,
 `/releases` the release train (`components/releases/release-train.tsx`), `/capacity` the capacity
 planner (`components/capacity/capacity-view.tsx`), `/monitor` the read-only prod/staging monitor
-(`components/monitor/monitor-view.tsx`, server `server/nebula/monitor.ts` + pure `monitor-model.ts`, §N6).
+(`components/monitor/monitor-view.tsx`, server `server/nebula/monitor.ts` + pure `monitor-model.ts`, §N6),
+`/lifecycle` what PLO reports: schedule, environments (how each one stands and whether it was
+really observed), tiers, advisories (CVE watch), the bundle preview and sign-off, history
+(`components/lifecycle/lifecycle-view.tsx` + one file per pane; pure UI helpers
+`lib/nebula/lifecycle.ts`; server `server/nebula/lifecycle.ts` + pure `lifecycle-model.ts` and
+`lifecycle-environments.ts`; the five writes are gated `actions.lifecycle*`, §N9). An environment
+is never shown OK unless PLO's `coverage` says it was read: keep that rule when touching the pane.
+
+`app/api/lifecycle/{ingest,requests/claim,requests/[id]/complete}` are PLO's machine routes (§N9):
+bearer `LIFECYCLE_INGEST_TOKEN`, POST only, never in the middleware matcher, never a session route.
+A state change and its AuditLog row are ONE transaction (`store.transaction`); a snapshot is never
+replaced; `bundleKey` is recomputed (`lifecycleBundleKey`); a smoke result is bound to its claimed
+request. `LIFECYCLE_DISPATCH_TOKEN` = the dispatcher's own credential; unset = nobody is the dispatcher
+(fail closed, `identifyIngestCaller`), never a shared token. Anything from a
+snapshot that becomes a link goes through `<Ext>` (`safeExternalHref`: https, allowlisted host).
 
 ## MCP endpoint (docs/NEBULA.md §N7)
 `src/app/api/mcp/route.ts` (stateless Streamable HTTP) → `server/mcp/auth.ts` + `identity.ts` (HARD gate:

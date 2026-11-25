@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { TwizzYamlV2 } from "@twizz-idp/shared";
 import { FakeBuilds, FakeEcr, FakeGitops, FakeSecrets } from "./fakes";
 import { createEnvFromRepo, genericEnvSecret, isValidBranch, isValidRepo, rebuildEnv, setEnvVars } from "../env-from-repo";
+import { envEcrRepo } from "../named-envs";
 import { findEnv, listNamedEnvs, parseManifest, teardownNamedEnv } from "../named-envs";
 import { envValuesYaml, serviceValuesYaml } from "../values";
 import { parseTwizzYaml, stringifyTwizzYaml } from "../twizz-yaml";
@@ -134,6 +135,19 @@ describe("rebuild / setEnvVars / teardown", () => {
     for (const content of d.gitops.files.values()) expect(content).not.toContain("sk-ant-secret-value-123");
   });
 
+  // final review 2026-11-25: editing env vars used to rewrite `config` from scratch and lose what the
+  // manifest records about the build. A later rebuild then used the default Dockerfile and no build args,
+  // and /lifecycle refused to promote the env ("not built the way the repository declares").
+  it("setEnvVars keeps the build the manifest records: dockerfile, context and build args", async () => {
+    const d = deps();
+    await createEnvFromRepo(d, { ...base, config: { ...base.config, dockerfile: "docker/Dockerfile.api", context: "services/api", build: { args: { API_BASE: "https://sentinel-stg.prv.twizz.com" } } } });
+    const before = (await findEnv(d, base.name))!.manifest.config!;
+    expect(before).toMatchObject({ dockerfile: "docker/Dockerfile.api", context: "services/api" });
+    await setEnvVars(d, { name: base.name, vars: { NEW_FLAG: "on" }, actor: "x" });
+    const after = (await findEnv(d, base.name))!.manifest.config!;
+    expect(after).toEqual({ ...before, rev: before.rev + 1, envVarNames: [...before.envVarNames, "NEW_FLAG"].sort() });
+  });
+
   it("teardown of a pending env removes manifest + env values in one commit and the secret", async () => {
     const d = deps();
     await createEnvFromRepo(d, base);
@@ -173,5 +187,37 @@ describe("helpers", () => {
     if (back.ok) expect(back.config).toEqual(backendCfg);
     expect(parseTwizzYaml("name: x\nkind: backend-k8s\n")).toMatchObject({ ok: true, legacy: true });
     expect(parseTwizzYaml("version: 2\nkind: [\n")).toMatchObject({ ok: false });
+  });
+});
+
+// external review 2026-11-25, idp #16: the builder's `service` input is the ECR repository it pushes to.
+// It used to be the service name, while Helm pulls from the registry's `ecrRepo` — two different
+// repositories for moly-backend (`molybackend`), frontend (`twizz-frontend`) and business (`twizz-business`).
+describe("the image is built into the repository the chart pulls from", () => {
+  const legacyCfg = TwizzYamlV2.parse({ version: 2, kind: "backend", port: 3000, healthPath: "/health" });
+
+  it("moly-backend: values name ECR molybackend, and so does the build dispatch", async () => {
+    const d = deps();
+    const r = await createEnvFromRepo(d, { name: "be-feat", repo: "twizz-app/Moly-backend", ref: "feature/x", sha: SHA, kind: "backend", db: "isolated", ttlHours: 72, config: legacyCfg, envVars: {}, actor: "nick" });
+    expect(d.builds.dispatched).toEqual([expect.objectContaining({ repo: "Moly-backend", service: "molybackend", envName: "be-feat" })]);
+    expect(r.displayTitle).toBe(d.builds.displayTitle({ envName: "be-feat", service: "molybackend", sha: SHA }));
+    // the service (Helm release, secret path, values directory) is still moly-backend
+    expect(r).toMatchObject({ service: "moly-backend", secret: "preview/moly-backend/be-feat" });
+    expect(envEcrRepo({ service: "moly-backend", source: { repo: "twizz-app/Moly-backend", ref: "x", sha: SHA } })).toBe("molybackend");
+    // a rebuild goes to the same repository
+    d.builds.dispatched.length = 0;
+    await rebuildEnv(d, { name: "be-feat", actor: "nick" });
+    expect(d.builds.dispatched).toEqual([expect.objectContaining({ service: "molybackend", envName: "be-feat" })]);
+  });
+
+  it("envEcrRepo: the registry's repository for a registry service, the service name for everything else", () => {
+    const src = (repo: string) => ({ repo, ref: "main", sha: SHA });
+    expect(envEcrRepo({ service: "frontend", source: src("twizz-app/frontend") })).toBe("twizz-frontend");
+    expect(envEcrRepo({ service: "business", source: src("twizz-app/front-business") })).toBe("twizz-business");
+    expect(envEcrRepo({ service: "twizz-admin", source: src("twizz-app/front-admin") })).toBe("twizz-admin");
+    expect(envEcrRepo({ service: "twizz-sentinel", source: src("twizz-app/twizz-sentinel") })).toBe("twizz-sentinel");
+    expect(envEcrRepo({ service: "some-new-repo", source: src("twizz-app/some-new-repo") })).toBe("some-new-repo");
+    // a release-image env (no source): by service name through the registry
+    expect(envEcrRepo({ service: "moly-backend", source: undefined })).toBe("molybackend");
   });
 });

@@ -55,10 +55,30 @@ import {
   PROD_ATLAS,
   planProdAtlas,
   setProdAtlasTier,
+  RESERVED_ENV_NAME_MESSAGE,
+  isReservedEnvName,
+  LIFECYCLE_NO_STAGING_ROUTE,
+  LIFECYCLE_PREVIEW_TTL_HOURS,
+  LIFECYCLE_RUN_KINDS,
+  LIFECYCLE_STG,
+  LifecycleRefusal,
+  createLifecyclePreview,
+  deployLifecycleStg,
+  deployPromoteField,
+  planDeployStg,
+  planPreview,
+  planRequestRun,
+  planSignoff,
+  planSmoke,
+  previewEnvsField,
+  requestLifecycleRun,
+  requestLifecycleSmoke,
+  signoffLifecycle,
+  smokeTargetsField,
   type GateResult,
   type NamedEnvManifest,
 } from "@twizz-idp/actions";
-import { AtlasSize, ENV_KEY_RE, EstimateLiveInput, SECRET_SHAPE_RE, TierSize } from "@twizz-idp/shared";
+import { AtlasSize, ENV_KEY_RE, EstimateLiveInput, LIFECYCLE_BUNDLE_KEY_RE, LIFECYCLE_SMOKE_SCOPES, SECRET_SHAPE_RE, TierSize } from "@twizz-idp/shared";
 import type { PrismaClient } from "@twizz-idp/db";
 import { router, protectedProcedure } from "../trpc";
 import { isOperator } from "@/lib/nebula/operators";
@@ -67,6 +87,8 @@ import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
 import { atlasPort, liveTemplateOpts, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, pinReviewedCapacity, capacitySourcesFrom, type CapacitySources, targetFor } from "../nebula/capacity";
 import { liveClusterPort } from "../nebula/live-cluster";
+import { invalidateLifecycleCache } from "../nebula/lifecycle";
+import { lifecycleDeps, lifecycleQueue } from "../nebula/lifecycle-actions";
 import { resolveSize } from "./capacity";
 
 // The Nebula write path (docs/NEBULA.md §4.2, §4.7, §N3.7). Every mutation here:
@@ -114,6 +136,49 @@ async function ownedEnv(ctx: { prisma: PrismaClient; login: string }, tool: stri
   return { manifest: found.manifest, pending: found.pending };
 }
 
+/** `plo-*` env names belong to the Lifecycle bundle preview (§N9): the gates
+ * treat the env of that name as the bundle's preview, its smoke target and
+ * the source of the image that goes to staging. So nobody — operator or not —
+ * creates one by hand; only `lifecycleCreatePreview` does. Refused before the
+ * gate, and audited like every other denial. */
+async function refuseReservedName(ctx: { prisma: PrismaClient; login: string }, tool: string, name: string): Promise<void> {
+  if (!isReservedEnvName(name)) return;
+  await auditDenial(ctx.prisma, ctx.login, tool, RESERVED_ENV_NAME_MESSAGE, name);
+  throw new TRPCError({ code: "BAD_REQUEST", message: RESERVED_ENV_NAME_MESSAGE });
+}
+
+/** Every Lifecycle read caches GitHub + Argo for ~20 s. A write that changes
+ * what those reads would say drops the cache when it ends (whatever the
+ * outcome), so the page that reloads right after shows the state AFTER the
+ * write — never a button for a step that was just taken. */
+async function thenRefreshLifecycle<T>(run: () => Promise<T>): Promise<T> {
+  try {
+    return await run();
+  } finally {
+    invalidateLifecycleCache();
+  }
+}
+
+// one fixed key (enqueueLifecycleRequest holds 7_239_041): serialises every path that CREATES a named env
+const NAMED_ENV_LOCK = 7_239_042;
+
+/** Creating a named env is "count the live envs, then commit one more". Two
+ * creates at once (a bundle preview and somebody's own env, or two replicas)
+ * would both read the same count and together pass NEBULA_MAX_NAMED_ENVS. So
+ * every creating action runs under one Postgres advisory lock, held for the
+ * whole create: the second one counts only after the first has committed. The
+ * lock lives in a transaction that writes nothing; it is released when the
+ * action ends (or its connection dies). */
+async function withNamedEnvLock<T>(prisma: PrismaClient, run: () => Promise<T>): Promise<T> {
+  return prisma.$transaction(
+    async (tx) => {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(${NAMED_ENV_LOCK}::bigint)`;
+      return run();
+    },
+    { maxWait: 60_000, timeout: 300_000 },
+  );
+}
+
 const confirmSchema = z.string().min(8).max(64).optional();
 const envName = z.string().regex(NAME_RE, "DNS label: ^[a-z][a-z0-9-]{2,23}$");
 const serviceSchema = z.enum(SERVICE_NAMES as [string, ...string[]]);
@@ -136,6 +201,24 @@ const FILE_CAP = 64 * 1024;
 const promotableSchema = z.enum(PROMOTABLE_NAMES as [string, ...string[]]);
 const targetSchema = z.enum(RELEASE_TARGETS);
 const promotableTag = z.string().regex(PROMOTABLE_TAG_RE, "immutable ECR tag (build-*/nb-*/main-<sha>/pr-<n>-<sha>); aliases are never promoted");
+
+// ── Lifecycle (docs/NEBULA.md §N9) ────────────────────────────────────
+const bundleKeySchema = z.string().regex(LIFECYCLE_BUNDLE_KEY_RE, "sha256 hex bundle key");
+const key12 = (k: string) => k.slice(0, 12);
+
+/** Plan a Lifecycle write BEFORE the gate (both calls), so the human reviews
+ * a summary of what would really happen and the nonce binds it. A precondition
+ * that does not hold is a refusal: audited like every denial, then thrown.
+ * The action re-plans inside the gate — this is not the only check. */
+async function lifecyclePlan<T>(ctx: { prisma: PrismaClient; login: string }, tool: string, resource: string, plan: () => Promise<T>): Promise<T> {
+  try {
+    return await plan();
+  } catch (e) {
+    if (!(e instanceof LifecycleRefusal)) throw e;
+    await auditDenial(ctx.prisma, ctx.login, tool, e.message, resource);
+    throw new TRPCError({ code: "PRECONDITION_FAILED", message: e.message });
+  }
+}
 
 export const actionsRouter = router({
   /** Who am I to Nebula: read-only or operator. */
@@ -194,12 +277,13 @@ export const actionsRouter = router({
     )
     .mutation(async ({ ctx, input }) => {
       const { name, service, imageTag, db, ttlHours, frontendOrigins, confirm } = input;
+      await refuseReservedName(ctx, "create_named_env", name);
       const fields = { name, service, imageTag, db, ttlHours: String(ttlHours), frontendOrigins: (frontendOrigins ?? []).join(" ") };
       const summary = `Create named env '${name}' (${service}:${imageTag}, db=${db}, ttl=${ttlHours}h) -> https://${name}.prv.twizz.com; writes secret ${envSecretName(service, name)} + named-envs/${name}.yaml`;
       const gate = gateFor(ctx.prisma, ctx.login);
       return shape(
         await gate("create_named_env", fields, confirm, summary, () =>
-          createNamedEnv(namedEnvDeps(), { name, service, imageTag, db, ttlHours, frontendOrigins, actor: ctx.login }),
+          thenRefreshLifecycle(() => withNamedEnvLock(ctx.prisma, () => createNamedEnv(namedEnvDeps(), { name, service, imageTag, db, ttlHours, frontendOrigins, actor: ctx.login }))),
         ),
       );
     }),
@@ -229,7 +313,7 @@ export const actionsRouter = router({
       const what = pending ? "pending manifest + values + secret; the build result is discarded" : "manifest + values + secret; app pruned, db dropped";
       return shape(
         await gate("teardown_named_env", { name }, confirm, `Tear down named env '${name}' (${manifest.service}, owner ${manifest.owner}): ${what}`, () =>
-          teardownNamedEnv(namedEnvDeps(), { name, actor: ctx.login }),
+          thenRefreshLifecycle(() => teardownNamedEnv(namedEnvDeps(), { name, actor: ctx.login })),
         ),
       );
     }),
@@ -242,7 +326,7 @@ export const actionsRouter = router({
       const gate = gateFor(ctx.prisma, ctx.login);
       return shape(
         await gate("extend_named_env", { name, ttlHours: String(ttlHours) }, confirm, `Extend named env '${name}' by ${ttlHours}h from now`, () =>
-          extendNamedEnv(namedEnvDeps(), { name, ttlHours, actor: ctx.login }),
+          thenRefreshLifecycle(() => extendNamedEnv(namedEnvDeps(), { name, ttlHours, actor: ctx.login })),
         ),
       );
     }),
@@ -263,7 +347,7 @@ export const actionsRouter = router({
         `- bump config.rev in the manifest so the pods roll (ExternalSecret refresh 1 min + Argo sync)`,
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
-      return shape(await gate("set_env_vars", fields, confirm, summary, () => setEnvVars(namedEnvDeps(), { name, vars, actor: ctx.login })));
+      return shape(await gate("set_env_vars", fields, confirm, summary, () => thenRefreshLifecycle(() => setEnvVars(namedEnvDeps(), { name, vars, actor: ctx.login }))));
     }),
 
   /** Re-dispatch the builder at the CURRENT head of the env's source branch.
@@ -285,7 +369,7 @@ export const actionsRouter = router({
         `- dispatch nebula-build.yml (tag nb-${name}-${head.slice(0, 12)})`,
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
-      return shape(await gate("rebuild_env", fields, confirm, summary, () => rebuildEnv(namedEnvDeps(), { name, sha: head, actor: ctx.login })));
+      return shape(await gate("rebuild_env", fields, confirm, summary, () => thenRefreshLifecycle(() => rebuildEnv(namedEnvDeps(), { name, sha: head, actor: ctx.login }))));
     }),
 
   // ── Release train: previews → staging by gitops PR (§N4) ──────────────
@@ -352,7 +436,7 @@ export const actionsRouter = router({
         `- nothing deploys until that PR is merged (gate 2); then Argo app ${t.argoApp} on ${t.cluster} rolls it out to https://${t.host}`,
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
-      return shape(await gate("promote_release", fields, confirm, summary, () => promoteRelease(namedEnvDeps(), { service, target, imageTag, actor: ctx.login })));
+      return shape(await gate("promote_release", fields, confirm, summary, () => thenRefreshLifecycle(() => promoteRelease(namedEnvDeps(), { service, target, imageTag, actor: ctx.login }))));
     }),
 
   /** Gate 2: merge the promotion PR. The PR is re-read on both calls; the
@@ -378,7 +462,7 @@ export const actionsRouter = router({
         `- Argo app ${t.argoApp} on ${t.cluster} then rolls ${service} to ${imageTag} at https://${t.host} (~3 min)`,
       ].join("\n");
       const gate = gateFor(ctx.prisma, ctx.login);
-      return shape(await gate("merge_promotion", fields, confirm, summary, () => mergePromotion(deps, { prNumber, service, target, imageTag, actor: ctx.login })));
+      return shape(await gate("merge_promotion", fields, confirm, summary, () => thenRefreshLifecycle(() => mergePromotion(deps, { prNumber, service, target, imageTag, actor: ctx.login }))));
     }),
 
   // ── Capacity (docs/NEBULA.md §N5): operators, writable tiers only ──────
@@ -565,6 +649,7 @@ export const actionsRouter = router({
     .mutation(async ({ ctx, input }) => {
       const { name, repo, ref, sha, newBranch, defaultBranch, ttlHours, attach, files, twizzYaml, envOverrides, prTarget, confirm } = input;
       const bad = (message: string) => new TRPCError({ code: "BAD_REQUEST", message });
+      await refuseReservedName(ctx, "create_env_from_repo", name);
 
       // 1. the config is parsed from the exact bytes on BOTH calls; invalid → refused before the gate
       const parsed = parseTwizzYaml(twizzYaml);
@@ -650,7 +735,7 @@ export const actionsRouter = router({
       const gate = gateFor(ctx.prisma, ctx.login);
 
       return shape(
-        await gate("create_env_from_repo", fields, confirm, lines.join("\n"), async () => {
+        await gate("create_env_from_repo", fields, confirm, lines.join("\n"), () => thenRefreshLifecycle(async () => {
           const gh = octokit();
           const [owner, repoName] = repo.split("/");
           const headOf = async (branch: string) => (await gh.git.getRef({ owner, repo: repoName, ref: `heads/${branch}` })).data.object.sha;
@@ -682,25 +767,156 @@ export const actionsRouter = router({
 
           const envVars: Record<string, string> = { ...envOverrides };
           for (const [k, v] of Object.entries(secretValues)) if (v !== "") envVars[k] = v;
-          const created = await createEnvFromRepo(namedEnvDeps(), {
-            name,
-            repo,
-            ref: source.ref,
-            sha: source.sha,
-            kind: config.kind,
-            db,
-            ttlHours,
-            config,
-            envVars,
-            attachTo,
-            attachUrl,
-            prNumber: pr?.number,
-            prUrl: pr?.url,
-            actor: ctx.login,
-          });
+          // count-then-create under the named-env lock: a concurrent create cannot slip past the cap
+          const created = await withNamedEnvLock(ctx.prisma, () =>
+            createEnvFromRepo(namedEnvDeps(), {
+              name,
+              repo,
+              ref: source.ref,
+              sha: source.sha,
+              kind: config.kind,
+              db,
+              ttlHours,
+              config,
+              envVars,
+              attachTo,
+              attachUrl,
+              prNumber: pr?.number,
+              prUrl: pr?.url,
+              actor: ctx.login,
+            }),
+          );
           const unset = secretNames.filter((k) => !secretValues[k]);
           return { name, url, service: svc.service, kind: config.kind, expectedTag: created.expectedTag, secret: created.secret, displayTitle: created.displayTitle, source, pr, prDefault, branchCreated, unsetSecrets: unset };
-        }),
+        })),
       );
+    }),
+
+  // ── Lifecycle (docs/NEBULA.md §N9): PLO's bundle → preview → smoke → staging → sign-off ──
+  // Operators only. Each procedure plans before the gate (fields + summary come
+  // from what would really happen) and the action re-plans inside it, so every
+  // precondition is enforced server-side at the moment of the write. Fields bind
+  // the bundle key, the exact (repository, commit) set and the concrete effect
+  // (env names, smoke targets, image tags, evidence). Nothing here takes a URL,
+  // an env name or an image tag from the caller, and nothing merges a PR.
+
+  /** Queue an on-demand `plan` or `cve` run for plo-dispatch (a database row;
+   * the dashboard never writes to the cluster). Refused while one is in flight. */
+  lifecycleRequestRun: operatorProcedure
+    .input(z.object({ kind: z.enum(LIFECYCLE_RUN_KINDS), confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { kind, confirm } = input;
+      // the queue only: requesting a run needs neither GitHub nor AWS
+      const deps = { queue: lifecycleQueue(ctx.prisma) };
+      const fields = { kind };
+      await lifecyclePlan(ctx, "lifecycle_request_run", JSON.stringify(fields), () => planRequestRun(deps, { kind }));
+      const summary = [
+        `Request an on-demand ${kind === "plan" ? "plan run (every stage: what is outdated or end-of-life)" : "CVE scan (OSV, Node.js releases, CISA KEV, EPSS)"}`,
+        `- queue one ${kind} request; the plo-dispatch CronJob claims it within ~5 minutes and publishes a new snapshot`,
+        `- read-only: an in-cluster ${kind} run changes nothing on any cluster or repository`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_request_run", fields, confirm, summary, () => thenRefreshLifecycle(() => requestLifecycleRun(deps, { kind, actor: ctx.login }))));
+    }),
+
+  /** Create the bundle's preview: one named env per bundled registry service,
+   * each through the existing createEnvFromRepo path, pinned to the bundle
+   * head. All or nothing against the env cap; refused when a bundle branch
+   * moved since the snapshot. The nonce binds the envs it would create. */
+  lifecycleCreatePreview: operatorProcedure
+    .input(z.object({ bundleKey: bundleKeySchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { bundleKey, confirm } = input;
+      const deps = lifecycleDeps(ctx.prisma);
+      const plan = await lifecyclePlan(ctx, "lifecycle_create_preview", JSON.stringify({ bundleKey }), () => planPreview(deps, { bundleKey }));
+      const fields = { bundleKey, setHash: plan.setHash, envs: previewEnvsField(plan), ttlHours: String(LIFECYCLE_PREVIEW_TTL_HOURS) };
+      const summary = [
+        `Create the preview for bundle ${key12(bundleKey)}: ${plan.create.length} named env${plan.create.length === 1 ? "" : "s"} (${plan.cap.live} of ${plan.cap.max} in use now), ttl ${LIFECYCLE_PREVIEW_TTL_HOURS}h`,
+        ...plan.create.map((c) => {
+          const built = c.attachUrl ? `, built against ${c.attachUrl}` : "";
+          const unset = c.secretNames.length ? `; ${c.secretNames.length} declared secret${c.secretNames.length === 1 ? "" : "s"} left unset (${c.secretNames.join(", ")})` : "";
+          return `- ${c.envName} (${c.kind} ${c.service}) from ${c.repo}@${c.branch}@${c.sha.slice(0, 7)} -> ${c.url}${built}; db=${c.db}${unset}`;
+        }),
+        ...plan.existing.map((e) => `- ${e.envName} (${e.service}) already exists for this bundle: kept`),
+        ...plan.skipped.map((s) => `- ${s.github}: skipped — ${s.reason}`),
+        `- per env: write secret preview/<service>/<env>, commit named-envs/pending/<env>.yaml + values, dispatch nebula-build.yml; the build-watcher promotes it when the image lands`,
+        `- all or nothing: if any env cannot be created, the ones this call made are torn down again`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_create_preview", fields, confirm, summary, () =>
+          // the whole batch under the named-env lock: its all-or-nothing cap check cannot be raced by another create
+          thenRefreshLifecycle(() => withNamedEnvLock(ctx.prisma, () => createLifecyclePreview(deps, { bundleKey, setHash: fields.setHash, envs: fields.envs, actor: ctx.login }))),
+        ),
+      );
+    }),
+
+  /** Queue a smoke run against the bundle's preview envs or, for `stg`, the
+   * fixed staging hosts of the release-train services. The targets are built
+   * server-side and bound by the nonce; the caller names only the scope. */
+  lifecycleRequestSmoke: operatorProcedure
+    .input(z.object({ scope: z.enum(LIFECYCLE_SMOKE_SCOPES), bundleKey: bundleKeySchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { scope, bundleKey, confirm } = input;
+      const deps = lifecycleDeps(ctx.prisma);
+      const plan = await lifecyclePlan(ctx, "lifecycle_request_smoke", JSON.stringify({ scope, bundleKey }), () => planSmoke(deps, { scope, bundleKey }));
+      const fields = { scope, bundleKey, setHash: plan.setHash, targets: smokeTargetsField(plan.targets) };
+      const summary = [
+        `Run the ${scope === LIFECYCLE_STG ? "staging" : "preview"} smoke for bundle ${key12(bundleKey)}: ${plan.targets.length} target${plan.targets.length === 1 ? "" : "s"}`,
+        ...plan.targets.map((t) => `- ${t.name} at ${t.baseUrl}`),
+        `- queue one smoke request; plo-dispatch claims it within ~5 minutes and runs the HTTP checks configured for each service in the PLO inventory (GET only, no credentials, no redirects)`,
+        `- a new run replaces the verdict of an earlier one for this bundle`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_request_smoke", fields, confirm, summary, () => thenRefreshLifecycle(() => requestLifecycleSmoke(deps, { scope, bundleKey, setHash: fields.setHash, targets: fields.targets, actor: ctx.login }))));
+    }),
+
+  /** Take the bundle to staging: open the release-train promotion PR(s) with
+   * each preview env's built image, through promoteRelease. Refused unless the
+   * latest preview smoke for exactly this bundle passed, covered every service
+   * and is newer than the preview envs. Merging stays `mergePromotion`. */
+  lifecycleDeployStg: operatorProcedure
+    .input(z.object({ bundleKey: bundleKeySchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { bundleKey, confirm } = input;
+      const deps = lifecycleDeps(ctx.prisma);
+      const plan = await lifecyclePlan(ctx, "lifecycle_deploy_stg", JSON.stringify({ scope: LIFECYCLE_STG, bundleKey }), () => planDeployStg(deps, { bundleKey }));
+      const fields = { scope: LIFECYCLE_STG, bundleKey, setHash: plan.setHash, promote: deployPromoteField(plan) };
+      const summary = [
+        `Deploy bundle ${key12(bundleKey)} to staging: open ${plan.promote.length} promotion PR${plan.promote.length === 1 ? "" : "s"} on twizz-gitops`,
+        ...plan.promote.map((p) => `- ${p.service}: ${p.imageTag} (the image preview env ${p.envName} runs)${p.from ? `, replacing ${p.from}` : ""} -> ${p.valuesFile}, https://${p.host}`),
+        ...plan.already.map((a) => `- ${a.service}: ${a.reason}`),
+        ...plan.noRoute.map((n) => `- ${n.github}: ${LIFECYCLE_NO_STAGING_ROUTE}`),
+        `- evidence: the preview smoke passed (${plan.smoke.checks} check${plan.smoke.checks === 1 ? "" : "s"}${plan.smoke.runId ? `, run ${plan.smoke.runId}` : ""})`,
+        `- nothing deploys until each PR is merged on /releases (the existing merge gate); then Argo CD rolls it out`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_deploy_stg", fields, confirm, summary, () => thenRefreshLifecycle(() => deployLifecycleStg(deps, { bundleKey, setHash: fields.setHash, promote: fields.promote, actor: ctx.login }))));
+    }),
+
+  /** The human gate. Refused unless the latest staging smoke for exactly this
+   * bundle passed on what staging runs now (or, when nothing bundled is on the
+   * release train, the preview smoke). The sign-off is the AuditLog row the
+   * gate writes; each bundled PR gets a comment. It merges NOTHING. */
+  lifecycleSignoff: operatorProcedure
+    .input(z.object({ bundleKey: bundleKeySchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { bundleKey, confirm } = input;
+      const deps = lifecycleDeps(ctx.prisma);
+      const plan = await lifecyclePlan(ctx, "lifecycle_signoff", JSON.stringify({ bundleKey }), () => planSignoff(deps, { bundleKey }));
+      // the sign-off counts only under the field name `bundleKey` (lifecycle-model parseSignoffAudit)
+      const fields = { bundleKey, setHash: plan.setHash, scope: plan.scope, evidenceHash: plan.evidenceHash, prs: String(plan.prs.length) };
+      const ev = (label: string, e: typeof plan.evidence.preview) => (e ? [`- ${label} smoke: PASS, ${e.checks} check${e.checks === 1 ? "" : "s"}${e.runId ? `, run ${e.runId}` : ""}${e.finishedAt ? `, finished ${e.finishedAt}` : ""}`] : []);
+      const summary = [
+        `Sign off bundle ${key12(bundleKey)} as ${ctx.login}: ${plan.commits.length} repositor${plan.commits.length === 1 ? "y" : "ies"}, evidence = the ${plan.scope === LIFECYCLE_STG ? "staging" : "preview"} smoke`,
+        ...plan.commits.map((c) => `- ${c.github}@${c.headSha.slice(0, 7)} (${c.branch})`),
+        ...ev("preview", plan.evidence.preview),
+        ...ev("staging", plan.evidence.stg),
+        ...(plan.scope === LIFECYCLE_STG ? [] : [`- nothing in this bundle has a staging route in Nebula: the sign-off rests on the preview smoke`]),
+        `- record the sign-off in the audit log and comment on ${plan.prs.length} pull request${plan.prs.length === 1 ? "" : "s"}${plan.prs.length ? `: ${plan.prs.map((p) => `${p.repo}#${p.number}`).join(", ")}` : ""}`,
+        ...plan.skippedPrs.map((p) => `- no comment on ${p.repo}#${p.number}: ${p.reason}`),
+        `- nothing is merged: merging each pull request stays a human action in GitHub`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_signoff", fields, confirm, summary, () => thenRefreshLifecycle(() => signoffLifecycle(deps, { bundleKey, setHash: fields.setHash, scope: fields.scope, evidenceHash: fields.evidenceHash, actor: ctx.login }))));
     }),
 });

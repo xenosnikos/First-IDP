@@ -1,0 +1,136 @@
+{
+  "claimed": [
+    {
+      "id": "cm4k2n8xq0000abcd1234efgh",
+      "kind": "plan",
+      "params": {}
+    },
+    {
+      "id": "cm4k2n8xq0000abcd1234efgi",
+      "kind": "cve",
+      "params": {}
+    },
+    {
+      "id": "cm4k2n8xq0001abcd1234efgh",
+      "kind": "smoke",
+      "params": {
+        "scope": "preview",
+        "bundleKey": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5",
+        "targets": [
+          {
+            "name": "moly-backend",
+            "baseUrl": "http://moly-backend.env-plo-2612-moly-backend.svc.cluster.local:8080"
+          },
+          {
+            "name": "twizz-sentinel",
+            "baseUrl": "http://twizz-sentinel.env-plo-2612-twizz-sentinel.svc.cluster.local:8090"
+          }
+        ]
+      }
+    },
+    {
+      "id": "cm4k2n8xq0002abcd1234efgh",
+      "kind": "smoke",
+      "params": {
+        "scope": "stg",
+        "bundleKey": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5",
+        "targets": [
+          {
+            "name": "twizz-sentinel",
+            "baseUrl": "https://sentinel-stg.prv.twizz.com"
+          }
+        ]
+      }
+    }
+  ],
+  "refused": [
+    {
+      "id": "cm4k2n8xq0003abcd1234efgh",
+      "kind": "plan",
+      "params": {
+        "stage": "prod"
+      }
+    },
+    {
+      "id": "cm4k2n8xq0004abcd1234efgh",
+      "kind": "smoke",
+      "params": {
+        "scope": "prod",
+        "bundleKey": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5",
+        "targets": [
+          {
+            "name": "moly-backend",
+            "baseUrl": "http://moly-backend.env-plo-2612-moly-backend.svc.cluster.local:8080"
+          }
+        ]
+      }
+    },
+    {
+      "id": "cm4k2n8xq0005abcd1234efgh",
+      "kind": "smoke",
+      "params": {
+        "scope": "preview",
+        "bundleKey": "not-a-digest",
+        "targets": [
+          {
+            "name": "moly-backend",
+            "baseUrl": "http://moly-backend.env-plo-2612-moly-backend.svc.cluster.local:8080"
+          }
+        ]
+      }
+    },
+    {
+      "id": "cm4k2n8xq0006abcd1234efgh",
+      "kind": "smoke",
+      "params": {
+        "scope": "preview",
+        "bundleKey": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5",
+        "targets": []
+      }
+    },
+    {
+      "id": "cm4k2n8xq0007abcd1234efgh",
+      "kind": "smoke",
+      "params": {
+        "scope": "preview",
+        "bundleKey": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5",
+        "targets": [
+          {
+            "name": "moly-backend",
+            "baseUrl": "http://moly-backend.env-plo-2612-moly-backend.svc.cluster.local:8080",
+            "path": "/admin"
+          }
+        ]
+      }
+    },
+    {
+      "id": "cm4k2n8xq0008abcd1234efgh",
+      "kind": "smoke",
+      "params": {
+        "scope": "preview",
+        "bundleKey": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5",
+        "targets": [
+          {
+            "name": "moly-backend",
+            "baseUrl": "not a url"
+          }
+        ]
+      }
+    }
+  ],
+  "complete": [
+    {
+      "ok": true,
+      "runId": "20261203T091531-cm4k2n8xq0001abcd1234efgh-smoke"
+    },
+    {
+      "ok": false,
+      "error": "cve failed: nothing was scanned",
+      "runId": "20261204T053000-cm4k2n8xq0000abcd1234efgi-cve"
+    },
+    {
+      "ok": false,
+      "error": "invalid smoke request parameters (targets: too_small)"
+    }
+  ]
+}

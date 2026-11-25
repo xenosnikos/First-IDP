@@ -3,7 +3,18 @@ import { parse } from "yaml";
 
 export type Policy = {
   global_deny?: string[];
-  write_tools?: Record<string, { allow?: Record<string, string[]>; deny?: Record<string, string[]>; exempt_global_deny?: string[] }>;
+  write_tools?: Record<
+    string,
+    {
+      allow?: Record<string, string[]>;
+      deny?: Record<string, string[]>;
+      exempt_global_deny?: string[];
+      /** Fields whose value is a SPACE-JOINED LIST: the allow and deny patterns are applied to
+       * EACH item, never to the joined string. Without this a glob would match across items
+       * (`plo-*` matches "plo-a anything-else", `*:nb-plo-*` matches "svc:latest x:nb-plo-y"). */
+      each?: string[];
+    }
+  >;
 };
 
 export type PolicyDecision = { allowed: true } | { allowed: false; reason: string };
@@ -14,7 +25,8 @@ export function loadPolicyFile(path: string): Policy {
 }
 
 function globToRegExp(glob: string): RegExp {
-  const escaped = glob.replace(/[.+^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
+  // `*` is the only wildcard; every other character is literal (a `?` must not become a regex quantifier)
+  const escaped = glob.replace(/[.+?^${}()|[\]\\]/g, "\\$&").replace(/\*/g, ".*");
   return new RegExp(`^${escaped}$`);
 }
 
@@ -40,10 +52,17 @@ export function evaluatePolicy(policy: Policy, tool: string, fields: Record<stri
     return { allowed: false, reason: `tool "${tool}" has no policy entry — denied by default` };
   }
 
+  // a list field is judged item by item (an empty list has no item to allow: it is refused)
+  const each = new Set(rules.each ?? []);
+  const itemsOf = (field: string, value: string): string[] => (each.has(field) ? value.split(" ") : [value]);
+
   for (const [field, patterns] of Object.entries(rules.deny ?? {})) {
     const value = fields[field];
-    if (value !== undefined && patterns.some((p) => globToRegExp(p).test(value))) {
-      return { allowed: false, reason: `${field}="${value}" is denied for ${tool}` };
+    if (value === undefined) continue;
+    for (const item of itemsOf(field, value)) {
+      if (patterns.some((p) => globToRegExp(p).test(item))) {
+        return { allowed: false, reason: `${field}="${item}" is denied for ${tool}` };
+      }
     }
   }
 
@@ -52,11 +71,13 @@ export function evaluatePolicy(policy: Policy, tool: string, fields: Record<stri
     if (value === undefined) {
       return { allowed: false, reason: `missing required field "${field}"` };
     }
-    if (!patterns.some((p) => globToRegExp(p).test(value))) {
-      return {
-        allowed: false,
-        reason: `${field}="${value}" not in allowlist for ${tool} (${patterns.join(", ")})`,
-      };
+    for (const item of itemsOf(field, value)) {
+      if (!patterns.some((p) => globToRegExp(p).test(item))) {
+        return {
+          allowed: false,
+          reason: `${field}="${item}" not in allowlist for ${tool} (${patterns.join(", ")})`,
+        };
+      }
     }
   }
 

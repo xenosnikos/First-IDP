@@ -1,0 +1,147 @@
+{
+  "schemaVersion": 1,
+  "limits": {
+    "bodyBytes": 4194304,
+    "components": 5000,
+    "advisories": 2000,
+    "stringChars": 2000,
+    "smokeTargets": 50
+  },
+  "runIdPattern": "^[A-Za-z0-9._-]{1,120}$",
+  "bundleKeyExample": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5",
+  "jobs": [
+    "plan",
+    "source",
+    "cve",
+    "smoke"
+  ],
+  "tiers": [
+    "control-plane",
+    "addons",
+    "nodes",
+    "helm",
+    "base-images",
+    "npm-direct",
+    "npm-transitive"
+  ],
+  "componentStatuses": [
+    "current",
+    "outdated",
+    "pr-open",
+    "awaiting-approval",
+    "escalated",
+    "applied",
+    "failed",
+    "blocked",
+    "unknown"
+  ],
+  "bumps": [
+    "none",
+    "patch",
+    "minor",
+    "major",
+    "unknown"
+  ],
+  "autonomy": [
+    "auto",
+    "pr",
+    "approval",
+    "escalate",
+    "ignore"
+  ],
+  "rollback": [
+    "supported",
+    "limited",
+    "none"
+  ],
+  "severities": [
+    "critical",
+    "high",
+    "moderate",
+    "low",
+    "unknown"
+  ],
+  "advisorySources": [
+    "osv",
+    "nodejs",
+    "npm-audit"
+  ],
+  "smokeScopes": [
+    "preview",
+    "stg"
+  ],
+  "scheduleRunners": [
+    "nebula",
+    "github-actions"
+  ],
+  "requestKinds": [
+    "plan",
+    "cve",
+    "smoke"
+  ],
+  "snapshotKeys": [
+    "advisories",
+    "bundleKey",
+    "bundles",
+    "changeSets",
+    "components",
+    "coverage",
+    "discoveryErrors",
+    "error",
+    "finishedAt",
+    "job",
+    "ok",
+    "requestId",
+    "runId",
+    "schedule",
+    "schemaVersion",
+    "smoke",
+    "startedAt"
+  ],
+  "componentKeys": [
+    "autonomy",
+    "bump",
+    "changeSetId",
+    "current",
+    "desired",
+    "domain",
+    "environments",
+    "eol",
+    "id",
+    "latest",
+    "name",
+    "pr",
+    "reasons",
+    "rollback",
+    "security",
+    "status",
+    "target",
+    "tier"
+  ],
+  "coverageStates": [
+    "observed",
+    "partial",
+    "not-observed",
+    "not-applicable"
+  ],
+  "environments": [
+    {
+      "name": "nonprod",
+      "clusters": [
+        "EKS-Twizz-NonProd"
+      ]
+    },
+    {
+      "name": "staging",
+      "clusters": [
+        "EKS-Moly-staging"
+      ]
+    },
+    {
+      "name": "prod",
+      "clusters": [
+        "EKS-Moly-Prod"
+      ]
+    }
+  ]
+}

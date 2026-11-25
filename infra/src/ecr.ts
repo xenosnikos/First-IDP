@@ -17,7 +17,9 @@ export function createEcrRepos(tags: Record<string, string>) {
           // Per-target retention: each build pushes 3 targets x (index + image + attestation),
           // so the old global "keep last 20" was ~2 builds and expired the tags gitops
           // pins (the 2026-09 Nebula 503). 30 builds per target is weeks of rollback room.
-          ...["dashboard-", "migrate-", "reaper-"].map((prefix, i) => ({
+          // "plo-" (docs/NEBULA.md §N9) was added to the live policy by scripts/nebula-plo-access.sh
+          // (this program cannot run, see infra/CLAUDE.md); listed here so the reference matches.
+          ...["dashboard-", "migrate-", "reaper-", "plo-"].map((prefix, i) => ({
             rulePriority: 2 + i,
             description: `Keep last 30 ${prefix}*`,
             selection: { tagStatus: "tagged", tagPrefixList: [prefix], countType: "imageCountMoreThan", countNumber: 30 },

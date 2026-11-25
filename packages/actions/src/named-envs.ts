@@ -28,6 +28,16 @@ export const RESERVED_SERVICES = /^(nebula|argocd|shared|kube-.*|default|redis|p
  * = images the central builder produced for one env from one commit. */
 export const IMAGE_TAG_RE = /^(build-[0-9a-f-]{36}|nb-[a-z][a-z0-9-]{2,23}-[0-9a-f]{12})$/;
 export const PENDING_DIR = "named-envs/pending";
+/** Named envs of a PLO bundle preview are `plo-<yymm>-<service>` (docs/NEBULA.md
+ * §N9). The prefix is RESERVED: only `lifecycle_create_preview` (operators,
+ * through its own gate) may create such an env, because the Lifecycle gates
+ * treat the env of that name as the bundle's preview — its smoke target and
+ * the source of the image that goes to staging. Nobody may squat one. */
+export const LIFECYCLE_ENV_PREFIX = "plo-";
+export function isReservedEnvName(name: string): boolean {
+  return name.toLowerCase().startsWith(LIFECYCLE_ENV_PREFIX);
+}
+export const RESERVED_ENV_NAME_MESSAGE = `env names starting with "${LIFECYCLE_ENV_PREFIX}" are reserved for Lifecycle bundle previews (created only on /lifecycle) — pick another name`;
 /** Floating tags CodeBuild re-points on every build — never a "release version". */
 export const ALIAS_TAGS = new Set(["latest", "prod", "dev", "staging"]);
 export const DEFAULT_MAX_NAMED_ENVS = 6;
@@ -455,6 +465,7 @@ export async function createNamedEnv(deps: NamedEnvDeps, input: CreateNamedEnvIn
   const now = deps.now ?? (() => new Date());
   const { name, service, imageTag } = input;
   if (!isValidName(name)) throw new Error(`invalid env name "${name}" (want ${NAME_RE})`);
+  if (isReservedEnvName(name)) throw new Error(RESERVED_ENV_NAME_MESSAGE);
   if (!(service in SERVICES)) throw new Error(`unknown service "${service}"`);
   if (!isValidImageTag(imageTag)) throw new Error(`imageTag must be an immutable build-* tag, got "${imageTag}"`);
   if (!Number.isInteger(input.ttlHours) || input.ttlHours < TTL_HOURS.min || input.ttlHours > TTL_HOURS.max) {
@@ -539,6 +550,22 @@ export async function teardownNamedEnv(deps: Pick<NamedEnvDeps, "gitops" | "secr
     ...(secretError ? { secretError } : {}),
     note: `Argo CD prunes env-${name}; the PostDelete hook drops ${envDbName(name)}. Namespace env-${name} is reaped separately.`,
   };
+}
+
+/** The ECR repository a built env's image lives in — THE one name for the
+ * three places that must agree: where the central builder pushes
+ * (nebula-build.yml's `service` input), where the build-watcher looks before
+ * it promotes, and `image.repository` in the service's Helm values. For a
+ * registry service that is the registry's `ecrRepo` (moly-backend →
+ * `molybackend`, frontend → `twizz-frontend`, business → `twizz-business`),
+ * which is NOT always the service name; for any other repository it is the
+ * service name. */
+export function envEcrRepo(m: Pick<NamedEnvManifest, "service" | "source">): string {
+  if (m.source?.repo) {
+    const svc = resolveService(m.source.repo);
+    if (svc.service === m.service) return svc.ecrRepo;
+  }
+  return REGISTRY.find((s) => s.name === m.service)?.ecrRepo ?? m.service;
 }
 
 /** Per-env non-secret Helm values (port, probes, env block) in twizz-gitops. */
