@@ -1,0 +1,89 @@
+{
+  "schemaVersion": 1,
+  "job": "smoke",
+  "runId": "20261203T091531-cm4k2n8xq0001abcd1234efgh-smoke",
+  "requestId": "cm4k2n8xq0001abcd1234efgh",
+  "startedAt": "2026-12-03T09:15:31.000Z",
+  "finishedAt": "2026-12-03T09:15:42.000Z",
+  "ok": true,
+  "schedule": [
+    {
+      "job": "plan",
+      "cron": "0 6 * * 1",
+      "runner": "nebula",
+      "description": "Inventory every component and report what is outdated or end-of-life (read-only).",
+      "mutates": false
+    },
+    {
+      "job": "cve",
+      "cron": "30 5 * * *",
+      "runner": "nebula",
+      "description": "Check every component and locked npm package against published vulnerabilities (read-only).",
+      "mutates": false
+    },
+    {
+      "job": "source",
+      "cron": "0 7 2 * *",
+      "runner": "nebula",
+      "description": "Open upgrade pull requests on the application repositories and build the monthly bundle branch.",
+      "mutates": true
+    },
+    {
+      "job": "dispatch",
+      "cron": "*/5 * * * *",
+      "runner": "nebula",
+      "description": "Run the plan, CVE and smoke requests operators create in Nebula.",
+      "mutates": false
+    },
+    {
+      "job": "sweep-staging",
+      "cron": "0 7 2 * *",
+      "runner": "github-actions",
+      "description": "Apply low-risk infrastructure upgrades in staging, verify, and roll back on regression.",
+      "mutates": true
+    },
+    {
+      "job": "promote-prod",
+      "cron": "0 7 * * 2",
+      "runner": "github-actions",
+      "description": "Promote changes proven in staging to prod, after human approval of the plan.",
+      "mutates": true
+    }
+  ],
+  "discoveryErrors": [
+    {
+      "domain": "smoke",
+      "error": "frontend: no smoke checks are configured for this service; nothing was verified"
+    }
+  ],
+  "smoke": {
+    "scope": "preview",
+    "bundleKey": "ccd517471eb489d5da5c82d8d539f3d64ce5284b1b8c0963a66f9351e99cc0a5",
+    "results": [
+      {
+        "name": "moly-backend/health",
+        "url": "https://plo-2612-moly-backend.prv.twizz.com/health",
+        "ok": true,
+        "status": 200,
+        "ms": 84,
+        "detail": "status 200, body matched"
+      },
+      {
+        "name": "twizz-sentinel/health",
+        "url": "https://plo-2612-sentinel.prv.twizz.com/health",
+        "ok": false,
+        "status": 503,
+        "ms": 212,
+        "detail": "status 503, expected 200"
+      },
+      {
+        "name": "twizz-admin",
+        "url": "https://203.0.113.9",
+        "ok": false,
+        "status": null,
+        "ms": 0,
+        "detail": "refused: host is not on the smoke allowlist"
+      }
+    ]
+  }
+}

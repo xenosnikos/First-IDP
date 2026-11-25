@@ -1,0 +1,179 @@
+{
+  "schemaVersion": 1,
+  "job": "cve",
+  "runId": "20261203T053000-cve",
+  "requestId": "cm4k2n8xq0000abcd1234efgh",
+  "startedAt": "2026-12-03T05:30:00.000Z",
+  "finishedAt": "2026-12-03T05:30:41.000Z",
+  "ok": true,
+  "schedule": [
+    {
+      "job": "plan",
+      "cron": "0 6 * * 1",
+      "runner": "nebula",
+      "description": "Inventory every component and report what is outdated or end-of-life (read-only).",
+      "mutates": false
+    },
+    {
+      "job": "cve",
+      "cron": "30 5 * * *",
+      "runner": "nebula",
+      "description": "Check every component and locked npm package against published vulnerabilities (read-only).",
+      "mutates": false
+    },
+    {
+      "job": "source",
+      "cron": "0 7 2 * *",
+      "runner": "nebula",
+      "description": "Open upgrade pull requests on the application repositories and build the monthly bundle branch.",
+      "mutates": true
+    },
+    {
+      "job": "dispatch",
+      "cron": "*/5 * * * *",
+      "runner": "nebula",
+      "description": "Run the plan, CVE and smoke requests operators create in Nebula.",
+      "mutates": false
+    },
+    {
+      "job": "sweep-staging",
+      "cron": "0 7 2 * *",
+      "runner": "github-actions",
+      "description": "Apply low-risk infrastructure upgrades in staging, verify, and roll back on regression.",
+      "mutates": true
+    },
+    {
+      "job": "promote-prod",
+      "cron": "0 7 * * 2",
+      "runner": "github-actions",
+      "description": "Promote changes proven in staging to prod, after human approval of the plan.",
+      "mutates": true
+    }
+  ],
+  "discoveryErrors": [
+    {
+      "domain": "epss",
+      "error": "EPSS scores could not be fetched (HTTP 503); advisories are listed without them"
+    }
+  ],
+  "advisories": [
+    {
+      "id": "GHSA-rv95-896h-c2vc",
+      "aliases": [
+        "CVE-2024-29041",
+        "GO-2024-0000"
+      ],
+      "source": "osv",
+      "severity": "critical",
+      "cvss": 9.8,
+      "kev": true,
+      "epss": 0.9731,
+      "summary": "Express.js open redirect in malformed URLs",
+      "url": "https://osv.dev/vulnerability/GHSA-rv95-896h-c2vc",
+      "published": "2024-03-25T19:40:26Z",
+      "modified": "2026-11-30T05:02:11Z",
+      "affected": [
+        {
+          "componentId": "npm-dependency:Moly-backend:express",
+          "name": "express",
+          "tier": "npm-direct",
+          "target": "Moly-backend",
+          "version": "4.19.2",
+          "fixedIn": "4.19.3",
+          "environments": [
+            "staging",
+            "prod"
+          ]
+        },
+        {
+          "componentId": "npm-dependency:twizz-sentinel:__lockfile",
+          "name": "express",
+          "tier": "npm-transitive",
+          "target": "twizz-sentinel",
+          "version": "4.18.2",
+          "fixedIn": "4.19.3",
+          "environments": [
+            "staging",
+            "prod"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "GHSA-jc7w-c686-c4v9",
+      "aliases": [
+        "CVE-2025-1767"
+      ],
+      "source": "osv",
+      "severity": "moderate",
+      "cvss": 6.5,
+      "kev": false,
+      "summary": "Kubernetes GitRepo volume inadvertent local repository access",
+      "url": "https://osv.dev/vulnerability/GHSA-jc7w-c686-c4v9",
+      "affected": [
+        {
+          "componentId": "eks-control-plane:EKS-Moly-Prod:control-plane",
+          "name": "control-plane",
+          "tier": "control-plane",
+          "target": "EKS-Moly-Prod",
+          "version": "1.32",
+          "fixedIn": null,
+          "environments": [
+            "prod"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "NODEJS-v20.19.5",
+      "aliases": [],
+      "source": "nodejs",
+      "severity": "unknown",
+      "kev": false,
+      "summary": "Node.js 20.19.5 is a security release; this image runs 20.11.0",
+      "url": "https://nodejs.org/en/blog/release/v20.19.5",
+      "affected": [
+        {
+          "componentId": "base-image:Moly-backend:Dockerfile node:20.11.0-alpine3.19",
+          "name": "Dockerfile node:20.11.0-alpine3.19",
+          "tier": "base-images",
+          "target": "Moly-backend",
+          "version": "20.11.0",
+          "fixedIn": "20.19.5",
+          "environments": [
+            "staging",
+            "prod"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "GHSA-9wv6-86v2-598j",
+      "aliases": [
+        "CVE-2024-45296"
+      ],
+      "source": "osv",
+      "severity": "low",
+      "cvss": 3.1,
+      "kev": false,
+      "epss": 0.0004,
+      "summary": "path-to-regexp outputs backtracking regular expressions",
+      "url": "https://osv.dev/vulnerability/GHSA-9wv6-86v2-598j",
+      "published": "2024-09-09T20:19:15Z",
+      "affected": [
+        {
+          "componentId": "npm-dependency:Moly-backend:__lockfile",
+          "name": "path-to-regexp",
+          "tier": "npm-transitive",
+          "target": "Moly-backend",
+          "version": "0.1.7",
+          "fixedIn": "0.1.10",
+          "environments": [
+            "staging",
+            "prod"
+          ]
+        }
+      ]
+    }
+  ]
+}

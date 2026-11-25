@@ -167,3 +167,51 @@ write_tools:
       planHash: ["*"]
     deny:
       preset: ["*prod*"]                 # preset names are free text; keep them clean
+
+  # ── Lifecycle (docs/NEBULA.md §N9): PLO's bundle → preview → smoke → staging → sign-off ──
+  # Operators only, from the /lifecycle tab (no MCP write tools). The caller
+  # names a bundle key (and a scope); env names, smoke targets, image tags and
+  # the pull requests are DERIVED in code from the snapshot PLO published, the
+  # registry and gitops — and each is a gate field, so the nonce binds the exact
+  # effect. `bundleKey`, `setHash` and `evidenceHash` are sha256 hex (they can
+  # never spell a denied word). Staging is the literal `stg` here: no field of
+  # these tools is exempt from global_deny, so anything prod-shaped (a service,
+  # an env name, a host) is refused before this table is consulted.
+  # The actions reuse create_env_from_repo / promote_release and evaluate THOSE
+  # entries too, per env and per service — these entries never widen them.
+  lifecycle_request_run:
+    allow:
+      kind: ["plan", "cve"]              # read-only runs; smoke has its own tool
+
+  lifecycle_create_preview:
+    allow:
+      bundleKey: ["*"]
+      setHash: ["*"]                     # the exact (repository, commit) set
+      envs: ["plo-*"]                    # space-joined names it creates; each also checked as create_env_from_repo
+      ttlHours: ["72"]
+    deny:
+      envs: ["*staging*"]
+      # all-or-nothing against the live-env cap, and refused if a bundle branch moved: enforced in code
+
+  lifecycle_request_smoke:
+    allow:
+      scope: ["preview", "stg"]
+      bundleKey: ["*"]
+      setHash: ["*"]
+      targets: ["*.prv.twizz.com"]       # service=origin pairs built in code; each origin re-checked in code
+
+  lifecycle_deploy_stg:
+    allow:
+      scope: ["stg"]
+      bundleKey: ["*"]
+      setHash: ["*"]
+      promote: ["*:nb-plo-*"]            # service:tag pairs; each also checked as promote_release
+      # opens promotion PRs only; merging stays merge_promotion
+
+  lifecycle_signoff:
+    allow:
+      bundleKey: ["*"]                   # the sign-off is read back from the audit row by this field name
+      setHash: ["*"]
+      scope: ["preview", "stg"]          # which smoke the sign-off rests on
+      evidenceHash: ["*"]                # the smoke runs, commits and pull requests confirmed
+      prs: ["*"]                         # how many pull requests get the comment; nothing is merged

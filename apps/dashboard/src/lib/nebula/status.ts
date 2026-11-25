@@ -32,6 +32,13 @@ export const STATUS_WORDS = [
   "OK",
   "WATCH",
   "HOT",
+  // N9: advisory severity. A severity IS its word (mapping "critical" onto
+  // another word would hide the fact), and KEV = known exploited (CISA).
+  "CRITICAL",
+  "HIGH",
+  "MODERATE",
+  "LOW",
+  "KEV",
 ] as const;
 
 export type StatusWord = (typeof STATUS_WORDS)[number];
@@ -63,11 +70,15 @@ export function toneOf(word: StatusWord): Tone {
     case "HOT":
     case "EXPIRED":
     case "DENIED":
+    case "CRITICAL":
+    case "HIGH":
+    case "KEV":
       return "fail";
     case "RUNNING":
     case "PENDING":
     case "EXPIRING":
     case "WATCH":
+    case "MODERATE":
       return "pending";
     case "AWAITING HUMAN":
       return "ember";
@@ -75,6 +86,7 @@ export function toneOf(word: StatusWord): Tone {
     case "PLANNED":
     case "UNKNOWN":
     case "READ-ONLY":
+    case "LOW":
       return "muted";
   }
 }

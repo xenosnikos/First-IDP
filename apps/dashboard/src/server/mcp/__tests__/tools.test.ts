@@ -489,3 +489,92 @@ describe("audit rows never carry a search term", () => {
     expect(JSON.stringify(out)).not.toContain("SECRET");
   });
 });
+
+describe("lifecycle (docs/NEBULA.md §N9): two reads, no writes", () => {
+  const adv = (id: string, over: Record<string, unknown> = {}) => ({ id, aliases: [], severity: "moderate", kev: false, isNew: false, summary: `${id} summary`, affected: [{ componentId: `twizz-sentinel:npm:${id}`, name: "lodash", environments: ["staging"] }], ...over });
+  const advisories = {
+    at: "2026-11-25T12:00:00.000Z",
+    data: {
+      ok: {
+        total: 4,
+        kev: 1,
+        counts: { critical: 1, high: 1, moderate: 1, low: 1, unknown: 0 },
+        advisories: [
+          adv("GHSA-aaaa-bbbb-cccc", { aliases: ["CVE-2026-1111"], severity: "critical", kev: true, isNew: true, affected: [{ componentId: "eks:control-plane", name: "kubernetes", environments: ["prod", "staging"] }] }),
+          adv("GHSA-dddd-eeee-ffff", { severity: "high", affected: [{ componentId: "twizz-sentinel:npm:express", name: "express", environments: ["staging"] }] }),
+          adv("GHSA-gggg-hhhh-iiii"),
+          adv("GHSA-jjjj-kkkk-llll", { severity: "low", isNew: true }),
+        ],
+      },
+    },
+  };
+
+  it("the pinned list gains exactly lifecycle_overview and lifecycle_advisories, as reads for every bound person", async () => {
+    const lifecycle = MCP_TOOL_NAMES.filter((n) => n.startsWith("lifecycle_"));
+    expect(lifecycle).toEqual(["lifecycle_overview", "lifecycle_advisories"]);
+    for (const n of lifecycle) {
+      expect(MCP_READ_TOOLS as readonly string[]).toContain(n);
+      expect(MCP_WRITE_TOOLS as readonly string[]).not.toContain(n);
+      expect(toolsFor({ operator: false, scopes: [] })).toContain(n);
+    }
+    const client = await connect({ caller: fakeCaller().caller, operator: false, scopes: [] });
+    const tools = (await client.listTools()).tools.filter((t) => t.name.startsWith("lifecycle_"));
+    expect(tools.map((t) => t.name).sort()).toEqual(["lifecycle_advisories", "lifecycle_overview"]);
+    for (const t of tools) {
+      expect(t.annotations?.readOnlyHint, t.name).toBe(true);
+      expect(Object.keys((t.inputSchema as { properties?: object }).properties ?? {}), t.name).not.toContain("confirm");
+    }
+  });
+
+  it("no Lifecycle write is reachable over MCP: the gated procedures are never wrapped", () => {
+    const src = readFileSync(path.join(__dirname, "../tools.ts"), "utf8");
+    for (const proc of ["lifecycleRequestRun", "lifecycleCreatePreview", "lifecycleRequestSmoke", "lifecycleDeployStg", "lifecycleSignoff"]) expect(src, proc).not.toContain(proc);
+    expect(src.match(/c\.lifecycle\.(\w+)\(/g)?.sort()).toEqual(["c.lifecycle.advisories(", "c.lifecycle.overview("]);
+  });
+
+  it("lifecycle_overview asks for counts only, and for one tier's rows on request (capped)", async () => {
+    const tier = (name: string, n: number) => ({ tier: name, label: name, total: n, components: Array.from({ length: n }, (_, i) => ({ id: `${name}-${i}` })) });
+    const { caller, calls } = fakeCaller({ "lifecycle.overview": { at: "t", data: { ok: { header: { outdated: 3 }, tiers: [tier("helm", 80), tier("nodes", 2)] } }, bundle: { ok: { state: "bundle-ready" } } } });
+    const client = await connect({ caller });
+    await client.callTool({ name: "lifecycle_overview", arguments: {} });
+    expect(calls[0]).toEqual({ proc: "lifecycle.overview", input: { components: false } });
+    const out = JSON.parse(textOf(await client.callTool({ name: "lifecycle_overview", arguments: { tier: "helm", limit: 5 } })));
+    expect(calls[1]).toEqual({ proc: "lifecycle.overview", input: { components: true } });
+    expect(out.data.ok.header).toEqual({ outdated: 3 });
+    expect(out.bundle).toEqual({ ok: { state: "bundle-ready" } });
+    expect(out.data.ok.tiers[0]).toMatchObject({ tier: "helm", total: 80, componentsShown: 5, componentsTotal: 80 });
+    expect(out.data.ok.tiers[0].components).toHaveLength(5);
+    expect(out.data.ok.tiers[1].components).toEqual([]);
+    const bad = await client.callTool({ name: "lifecycle_overview", arguments: { tier: "production" } });
+    expect(bad.isError).toBe(true);
+  });
+
+  it("lifecycle_advisories is a CVE lookup: by id, alias or package, by severity, KEV, new, environment — totals stay whole-scan", async () => {
+    const { caller, calls } = fakeCaller({ "lifecycle.advisories": advisories });
+    const client = await connect({ caller });
+    const ask = async (args: Record<string, unknown>) => JSON.parse(textOf(await client.callTool({ name: "lifecycle_advisories", arguments: args }))).data.ok as { total: number; kev: number; matched: number; shown: number; advisories: Array<{ id: string }> };
+    const ids = async (args: Record<string, unknown>) => (await ask(args)).advisories.map((a) => a.id);
+    expect(await ask({})).toMatchObject({ total: 4, kev: 1, matched: 4, shown: 4 });
+    expect(calls[0]).toEqual({ proc: "lifecycle.advisories", input: undefined });
+    expect(await ids({ q: "cve-2026-1111" })).toEqual(["GHSA-aaaa-bbbb-cccc"]);
+    expect(await ids({ q: "GHSA-dddd" })).toEqual(["GHSA-dddd-eeee-ffff"]);
+    expect(await ids({ q: "express" })).toEqual(["GHSA-dddd-eeee-ffff"]);
+    expect(await ids({ q: "kubernetes" })).toEqual(["GHSA-aaaa-bbbb-cccc"]);
+    expect(await ids({ q: "no-such-package" })).toEqual([]);
+    expect(await ids({ minSeverity: "high" })).toEqual(["GHSA-aaaa-bbbb-cccc", "GHSA-dddd-eeee-ffff"]);
+    expect(await ids({ minSeverity: "critical" })).toEqual(["GHSA-aaaa-bbbb-cccc"]);
+    expect(await ids({ minSeverity: "unknown" })).toHaveLength(4);
+    expect(await ids({ kevOnly: true })).toEqual(["GHSA-aaaa-bbbb-cccc"]);
+    expect(await ids({ newOnly: true })).toEqual(["GHSA-aaaa-bbbb-cccc", "GHSA-jjjj-kkkk-llll"]);
+    expect(await ids({ environment: "prod" })).toEqual(["GHSA-aaaa-bbbb-cccc"]);
+    expect(await ask({ limit: 2 })).toMatchObject({ total: 4, matched: 4, shown: 2 });
+    expect((await client.callTool({ name: "lifecycle_advisories", arguments: { minSeverity: "urgent" } })).isError).toBe(true);
+  });
+
+  it("a read failure comes back as the data it is, not as an invented empty scan", async () => {
+    const { caller } = fakeCaller({ "lifecycle.advisories": { at: "t", data: { error: "db down" } }, "lifecycle.overview": { at: "t", data: { error: "db down" }, bundle: { error: "db down" } } });
+    const client = await connect({ caller });
+    expect(JSON.parse(textOf(await client.callTool({ name: "lifecycle_advisories", arguments: { q: "lodash" } })))).toEqual({ at: "t", data: { error: "db down" } });
+    expect(JSON.parse(textOf(await client.callTool({ name: "lifecycle_overview", arguments: { tier: "helm" } })))).toEqual({ at: "t", data: { error: "db down" }, bundle: { error: "db down" } });
+  });
+});

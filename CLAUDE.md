@@ -35,6 +35,7 @@ and the strictly-authorized MCP toolset. See STATE.md for phase status.
 | `/clusters` | Pods + logs across all three clusters (observe-only for staging/prod); URL-addressable log queries; the Observer panel |
 | `/capacity` | Capacity (docs/NEBULA.md §N5): NonProd/staging-sentinel presets + calculator → gitops PR; staging/prod live sizing editor (§N5.2); prod Atlas tier (§N5.3); traffic estimate + past-case library (§N5.4) — operators, gated |
 | `/monitor` | Monitor (docs/NEBULA.md §N6): prod + staging traffic, CPU/memory, pods, node headroom, Atlas — OK/WATCH/HOT board, 60 s refresh, read-only |
+| `/lifecycle` | Lifecycle (docs/NEBULA.md §N9): what PLO reports — schedule, outdated components per tier, the CVE watch (KEV first), and the monthly upgrade bundle: preview → smoke → staging → human sign-off (operators, gated; merges nothing) |
 | `POST /api/mcp` | Nebula MCP endpoint (docs/NEBULA.md §N7): GitHub + Google + AWS identity gate (§N7.1), same RBAC/gate/audit as the UI via `appRouter.createCaller`; NonProd + staging + prod READS, writes non-prod/staging only; MCP list = `NEBULA_MCP_IDENTITIES`; plugin repo TwizzyNicky/nebula-mcp |
 | `/releases` | Release train (docs/NEBULA.md §N4): per service on the train, ECR candidates, what staging runs, open promotion PRs; Promote / Merge (operators, gated) |
 
@@ -80,6 +81,8 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
 - `capacity` - overview, tier, plan, estimate (queries; presets/profiles from twizz-gitops `capacity/`;
   staging/prod `live` = straight from the cluster via `server/nebula/live-cluster.ts`; `prodAtlasPlan`)
 - `monitor` - snapshot({tier, window}) (queries only; `server/nebula/monitor.ts`, 30 s shared cache)
+- `lifecycle` - overview, advisories, preview, history (queries only; `server/nebula/lifecycle.ts` + pure `lifecycle-model.ts`; reads the snapshots PLO POSTs to `/api/lifecycle/ingest`, §N9)
+- `actions.lifecycleRequestRun` / `lifecycleCreatePreview` / `lifecycleRequestSmoke` / `lifecycleDeployStg` / `lifecycleSignoff` - operators; gated (`@twizz-idp/actions` lifecycle.ts). Queue a plan/cve/smoke request for `plo-dispatch`, create the bundle's preview envs, open the staging promotion PR(s), record the sign-off. None merges a PR or writes to a kube API
 - `actions.applyLiveCapacity` - operators; resizes workloads + node groups ON EKS-Moly-staging/Prod
   (`@twizz-idp/actions` live-capacity.ts: pair advisory, ×3/×0.5 step limits, caps, never delete; nonce binds planHash; prod templates Baseline/Campaign/Max may step down to their own values, never below `baseline`)
 - `actions.setProdAtlasTier` - operators; resizes ONE prod Atlas cluster (prod-atlas.ts: allowlist, +2/−1 tier, IDLE, nonce binds `from`)
@@ -95,7 +98,8 @@ budget, `deps.ts` gate wiring). Deleted (git history has them): the old
   or the `ALLOWED_GITHUB_LOGINS` allowlist (what actually admits people today). Upserts
   `User`, writes an `AuditLog` row per attempt. In-cluster sign-in uses the GitHub App
   `twizz-nebula` (client `Iv23liulodACgG6rqlKr`); `NEBULA_OPERATORS` gates writes.
-- Middleware matcher covers `/projects`, `/environments`, `/pipelines`, `/clusters`, `/releases`, `/capacity`, `/monitor`.
+- Middleware matcher covers `/projects`, `/environments`, `/pipelines`, `/clusters`, `/releases`, `/capacity`, `/monitor`, `/lifecycle`.
+- `/api/lifecycle/*` (PLO ingest, §N9) is NOT a session route and must stay out of the matcher: bearer `LIFECYCLE_INGEST_TOKEN` (SM `preview/nebula`), 503 when unset or shorter than 32 chars.
 - Every write anywhere (dashboard or MCP) must create an `AuditLog` row. Observer runs
   (an LLM call is cost-bearing) write one too: `nebula.observer.<kind>`.
 - User management (Nebula sign-in allowlist, operators, VPN, SSO gates): see the

@@ -16,6 +16,7 @@ const NAV: { href: string; label: string; glyph: string; blurb: string }[] = [
   { href: "/releases", label: "Release train", glyph: "Rt", blurb: "promote sentinel + admin from previews to staging by gitops PR (operators)" },
   { href: "/monitor", label: "Monitor", glyph: "Mo", blurb: "prod + staging at a glance: traffic, CPU/memory, pods, node headroom, database (live)" },
   { href: "/capacity", label: "Capacity", glyph: "Ca", blurb: "size pods, nodes and Atlas: NonProd/staging by PR, staging/prod live (operators, gated)" },
+  { href: "/lifecycle", label: "Lifecycle", glyph: "Lc", blurb: "what is outdated or vulnerable across the stack, and this month's upgrade bundle: preview, smoke, staging, sign-off (operators, gated)" },
 ];
 
 const STORAGE_KEY = "nebula.sidebar.collapsed";

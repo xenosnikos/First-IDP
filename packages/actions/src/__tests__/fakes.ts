@@ -162,3 +162,62 @@ export class FakePromotions implements PromotionRepo {
     return this.baseChanges.get(branch) ?? [];
   }
 }
+
+// ── lifecycle (docs/NEBULA.md §N9) ─────────────────────────────────────
+import type { LifecycleEnqueue, LifecycleQueue, LifecycleQueued, LifecycleRepos } from "../lifecycle";
+
+/** GitHub as the Lifecycle writes see it. `calls` records every method used:
+ * there is no merge to call, and the tests assert nothing else was reached. */
+export class FakeLifecycleRepos implements LifecycleRepos {
+  /** `${repo}#${branch}` → head sha */
+  heads = new Map<string, string>();
+  /** `${repo}@${sha}:${path}` → content */
+  files = new Map<string, string>();
+  comments: Array<{ repo: string; pr: number; body: string }> = [];
+  /** `${repo}#${pr}` whose comment call fails */
+  failComment = new Set<string>();
+  calls: string[] = [];
+  async headOf(repo: string, branch: string) {
+    this.calls.push("headOf");
+    return this.heads.get(`${repo}#${branch}`) ?? null;
+  }
+  async readFile(repo: string, sha: string, path: string) {
+    this.calls.push("readFile");
+    return this.files.get(`${repo}@${sha}:${path}`) ?? null;
+  }
+  async hasComment(repo: string, pr: number, marker: string) {
+    this.calls.push("hasComment");
+    return this.comments.some((c) => c.repo === repo && c.pr === pr && c.body.includes(marker));
+  }
+  async comment(repo: string, pr: number, body: string) {
+    this.calls.push("comment");
+    if (this.failComment.has(`${repo}#${pr}`)) throw new Error("Resource not accessible by integration (403)");
+    this.comments.push({ repo, pr, body });
+    return { url: `https://github.com/${repo}/pull/${pr}#issuecomment-${this.comments.length}` };
+  }
+}
+
+/** The request queue, with the real one's rule: one active request per kind
+ * (and, for a smoke, per scope + bundle). */
+export class FakeLifecycleQueue implements LifecycleQueue {
+  rows: Array<LifecycleQueued & { kind: string; params: unknown }> = [];
+  private seq = 0;
+  private key(i: { kind: string; params: unknown }) {
+    const p = i.params as { scope?: string; bundleKey?: string };
+    return i.kind === "smoke" ? `smoke:${p.scope}:${p.bundleKey}` : i.kind;
+  }
+  private active(key: string) {
+    return this.rows.find((r) => (r.status === "pending" || r.status === "claimed") && this.key(r) === key) ?? null;
+  }
+  async findActive(kind: "plan" | "cve") {
+    const r = this.active(kind);
+    return r ? { id: r.id, status: r.status, requestedBy: r.requestedBy, createdAt: r.createdAt } : null;
+  }
+  async enqueue(input: LifecycleEnqueue, requestedBy: string) {
+    const existing = this.active(this.key(input));
+    if (existing) return { created: false as const, existing: { id: existing.id, status: existing.status, requestedBy: existing.requestedBy, createdAt: existing.createdAt } };
+    const id = `req-${++this.seq}`;
+    this.rows.push({ id, kind: input.kind, params: input.params, requestedBy, status: "pending", createdAt: "2026-11-25T12:00:00.000Z" });
+    return { created: true as const, id };
+  }
+}

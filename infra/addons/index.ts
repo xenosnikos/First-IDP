@@ -127,3 +127,91 @@ new aws.iam.RolePolicy("nebula-sentinel-archive-read", {
 });
 
 export const archiveBucket = archive.bucket;
+
+// ── 5. PLO in Nebula (docs/NEBULA.md §N9): the read-only identity of the plo CronJobs ───────
+// CronJobs plo-plan / plo-cve / plo-dispatch (twizz-gitops apps/nebula/plo.yaml, SA `plo`) list
+// what runs on the three clusters and what is newer. REPORT ONLY: no Update*, no Create*, no
+// Delete*, no iam, no secretsmanager, no S3. The job that runs application repo code
+// (plo-source, SA `plo-source`) has NO role at all and is not trusted here.
+// On each cluster the role gets AmazonEKSViewPolicy (no Secrets) and the group `nebula-plo`, which
+// has no rights until scripts/nebula-plo-access.sh applies infra/k8s/nebula-plo-rbac.yaml.
+export const PLO_CLUSTERS = ["EKS-Twizz-NonProd", "EKS-Moly-staging", "EKS-Moly-Prod"] as const;
+export const PLO_K8S_GROUP = "nebula-plo";
+
+const ploHostCluster = aws.eks.getClusterOutput({ name: "EKS-Twizz-NonProd" });
+const ploOidc = aws.iam.getOpenIdConnectProviderOutput({ url: ploHostCluster.identities[0].oidcs[0].issuer });
+const ploRole = new aws.iam.Role("twizz-nebula-plo", {
+  name: "twizz-nebula-plo",
+  description: "Nebula PLO CronJobs (ns nebula, SA plo) on EKS-Twizz-NonProd: read-only EKS/SSM/CloudWatch/EC2 for lifecycle reports",
+  assumeRolePolicy: pulumi.all([ploOidc.arn, ploOidc.url]).apply(([arn, url]) => {
+    const host = url.replace(/^https?:\/\//, "");
+    return JSON.stringify({
+      Version: "2012-10-17",
+      Statement: [
+        {
+          Effect: "Allow",
+          Principal: { Federated: arn },
+          Action: "sts:AssumeRoleWithWebIdentity",
+          // exactly one ServiceAccount; never a wildcard (plo-source must not match)
+          Condition: { StringEquals: { [`${host}:sub`]: "system:serviceaccount:nebula:plo", [`${host}:aud`]: "sts.amazonaws.com" } },
+        },
+      ],
+    });
+  }),
+  tags,
+});
+
+const ploClusterArns = PLO_CLUSTERS.flatMap((c) => [
+  `arn:aws:eks:${region}:${acct}:cluster/${c}`,
+  `arn:aws:eks:${region}:${acct}:addon/${c}/*/*`,
+  `arn:aws:eks:${region}:${acct}:nodegroup/${c}/*/*`,
+]);
+new aws.iam.RolePolicy("nebula-plo-read", {
+  role: ploRole.name,
+  name: "twizz-nebula-plo-read",
+  policy: JSON.stringify({
+    Version: "2012-10-17",
+    Statement: [
+      {
+        Sid: "EksReadThreeClusters",
+        Effect: "Allow",
+        Action: ["eks:DescribeCluster", "eks:ListAddons", "eks:DescribeAddon", "eks:ListNodegroups", "eks:DescribeNodegroup", "eks:ListUpdates", "eks:DescribeUpdate", "eks:ListInsights", "eks:DescribeInsight"],
+        Resource: ploClusterArns,
+      },
+      // version catalogues: these actions have no resource-level form
+      { Sid: "EksVersionCatalogues", Effect: "Allow", Action: ["eks:ListClusters", "eks:DescribeAddonVersions", "eks:DescribeAddonConfiguration", "eks:DescribeClusterVersions"], Resource: "*" },
+      // AWS-published AMI release parameters only (public, account-less ARNs); no account parameter is readable
+      {
+        Sid: "PublicAmiParameters",
+        Effect: "Allow",
+        Action: ["ssm:GetParameter", "ssm:GetParameters"],
+        Resource: [`arn:aws:ssm:${region}::parameter/aws/service/eks/*`, `arn:aws:ssm:${region}::parameter/aws/service/bottlerocket/*`],
+      },
+      { Sid: "CloudWatchRead", Effect: "Allow", Action: ["cloudwatch:DescribeAlarms", "cloudwatch:GetMetricStatistics", "cloudwatch:GetMetricData", "cloudwatch:ListMetrics"], Resource: "*" },
+      // Deliberately NOT ec2:DescribeLaunchTemplateVersions: versions carry instance user data.
+      { Sid: "Ec2ImagesAndTemplates", Effect: "Allow", Action: ["ec2:DescribeImages", "ec2:DescribeLaunchTemplates"], Resource: "*" },
+    ],
+  }),
+});
+
+for (const cluster of PLO_CLUSTERS) {
+  const entry = new aws.eks.AccessEntry(`nebula-plo-${cluster.toLowerCase()}`, {
+    clusterName: cluster,
+    principalArn: ploRole.arn,
+    type: "STANDARD",
+    kubernetesGroups: [PLO_K8S_GROUP],
+    tags,
+  });
+  new aws.eks.AccessPolicyAssociation(
+    `nebula-plo-view-${cluster.toLowerCase()}`,
+    {
+      clusterName: cluster,
+      principalArn: ploRole.arn,
+      policyArn: "arn:aws:eks::aws:cluster-access-policy/AmazonEKSViewPolicy",
+      accessScope: { type: "cluster" },
+    },
+    { dependsOn: [entry] },
+  );
+}
+
+export const ploRoleArn = ploRole.arn;

@@ -10,6 +10,7 @@ import { nebulaRouter } from "./nebula";
 import { observerRouter } from "./observer";
 import { capacityRouter } from "./capacity";
 import { monitorRouter } from "./monitor";
+import { lifecycleRouter } from "./lifecycle";
 
 export const appRouter = router({
   project: projectRouter,
@@ -28,6 +29,8 @@ export const appRouter = router({
   capacity: capacityRouter,
   // §N6: consolidated near-real-time view of the Moly clusters (queries only)
   monitor: monitorRouter,
+  // §N9: what the Platform Lifecycle Orchestrator last reported (queries only; writes are in `actions`)
+  lifecycle: lifecycleRouter,
 });
 
 export type AppRouter = typeof appRouter;

@@ -19,6 +19,7 @@ import {
   type SecretStore,
 } from "./named-envs";
 import type { PromotionPr, PromotionRepo } from "./promote";
+import type { LifecycleRepos } from "./lifecycle";
 import type { AtlasClusters } from "./capacity";
 import { ATLAS_TIERS, type AtlasSize, type AtlasTier } from "@twizz-idp/shared";
 
@@ -340,5 +341,50 @@ export class AtlasTierAdapter implements AtlasClusters {
 
   setTier(cluster: string, size: AtlasSize, expect?: AtlasSize) {
     return this.svc.updateClusterTier(cluster, size, expect);
+  }
+}
+
+/** GitHub for the Lifecycle writes (docs/NEBULA.md §N9), on the platform
+ * token: read a branch head, read a file at a commit, comment on a pull
+ * request. Deliberately nothing else — no merge, no push, no review. */
+export class GithubLifecycleRepos implements LifecycleRepos {
+  constructor(private readonly gh: Octokit) {}
+
+  private split(slug: string): { owner: string; repo: string } {
+    const [owner, repo, ...rest] = slug.split("/");
+    if (!owner || !repo || rest.length) throw new Error(`"${slug}" is not an owner/name repository`);
+    return { owner, repo };
+  }
+
+  async headOf(slug: string, branch: string): Promise<string | null> {
+    try {
+      const { data } = await this.gh.git.getRef({ ...this.split(slug), ref: `heads/${branch}` });
+      return data.object.sha;
+    } catch (e) {
+      if ((e as { status?: number }).status === 404) return null;
+      throw e;
+    }
+  }
+
+  async readFile(slug: string, sha: string, path: string): Promise<string | null> {
+    try {
+      const { data } = await this.gh.repos.getContent({ ...this.split(slug), path, ref: sha });
+      if (Array.isArray(data) || data.type !== "file") return null;
+      return Buffer.from(data.content, "base64").toString("utf8");
+    } catch (e) {
+      if ((e as { status?: number }).status === 404) return null;
+      throw e;
+    }
+  }
+
+  async hasComment(slug: string, pr: number, marker: string): Promise<boolean> {
+    // a pull request's conversation comments are issue comments
+    const comments = await this.gh.paginate(this.gh.issues.listComments, { ...this.split(slug), issue_number: pr, per_page: 100 });
+    return comments.some((c) => (c.body ?? "").includes(marker));
+  }
+
+  async comment(slug: string, pr: number, body: string): Promise<{ url: string }> {
+    const { data } = await this.gh.issues.createComment({ ...this.split(slug), issue_number: pr, body });
+    return { url: data.html_url };
   }
 }

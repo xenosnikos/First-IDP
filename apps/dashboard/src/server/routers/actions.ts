@@ -55,10 +55,28 @@ import {
   PROD_ATLAS,
   planProdAtlas,
   setProdAtlasTier,
+  LIFECYCLE_NO_STAGING_ROUTE,
+  LIFECYCLE_PREVIEW_TTL_HOURS,
+  LIFECYCLE_RUN_KINDS,
+  LIFECYCLE_STG,
+  LifecycleRefusal,
+  createLifecyclePreview,
+  deployLifecycleStg,
+  deployPromoteField,
+  planDeployStg,
+  planPreview,
+  planRequestRun,
+  planSignoff,
+  planSmoke,
+  previewEnvsField,
+  requestLifecycleRun,
+  requestLifecycleSmoke,
+  signoffLifecycle,
+  smokeTargetsField,
   type GateResult,
   type NamedEnvManifest,
 } from "@twizz-idp/actions";
-import { AtlasSize, ENV_KEY_RE, EstimateLiveInput, SECRET_SHAPE_RE, TierSize } from "@twizz-idp/shared";
+import { AtlasSize, ENV_KEY_RE, EstimateLiveInput, LIFECYCLE_BUNDLE_KEY_RE, LIFECYCLE_SMOKE_SCOPES, SECRET_SHAPE_RE, TierSize } from "@twizz-idp/shared";
 import type { PrismaClient } from "@twizz-idp/db";
 import { router, protectedProcedure } from "../trpc";
 import { isOperator } from "@/lib/nebula/operators";
@@ -67,6 +85,7 @@ import { gateFor, namedEnvDeps, octokit } from "../nebula/deps";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "../nebula/argo";
 import { atlasPort, liveTemplateOpts, nodePoolUsedCpu, prodAtlasPort, readAtlas, readLive, pinReviewedCapacity, capacitySourcesFrom, type CapacitySources, targetFor } from "../nebula/capacity";
 import { liveClusterPort } from "../nebula/live-cluster";
+import { lifecycleDeps, lifecycleQueue } from "../nebula/lifecycle-actions";
 import { resolveSize } from "./capacity";
 
 // The Nebula write path (docs/NEBULA.md §4.2, §4.7, §N3.7). Every mutation here:
@@ -136,6 +155,24 @@ const FILE_CAP = 64 * 1024;
 const promotableSchema = z.enum(PROMOTABLE_NAMES as [string, ...string[]]);
 const targetSchema = z.enum(RELEASE_TARGETS);
 const promotableTag = z.string().regex(PROMOTABLE_TAG_RE, "immutable ECR tag (build-*/nb-*/main-<sha>/pr-<n>-<sha>); aliases are never promoted");
+
+// ── Lifecycle (docs/NEBULA.md §N9) ────────────────────────────────────
+const bundleKeySchema = z.string().regex(LIFECYCLE_BUNDLE_KEY_RE, "sha256 hex bundle key");
+const key12 = (k: string) => k.slice(0, 12);
+
+/** Plan a Lifecycle write BEFORE the gate (both calls), so the human reviews
+ * a summary of what would really happen and the nonce binds it. A precondition
+ * that does not hold is a refusal: audited like every denial, then thrown.
+ * The action re-plans inside the gate — this is not the only check. */
+async function lifecyclePlan<T>(ctx: { prisma: PrismaClient; login: string }, tool: string, resource: string, plan: () => Promise<T>): Promise<T> {
+  try {
+    return await plan();
+  } catch (e) {
+    if (!(e instanceof LifecycleRefusal)) throw e;
+    await auditDenial(ctx.prisma, ctx.login, tool, e.message, resource);
+    throw new TRPCError({ code: "PRECONDITION_FAILED", message: e.message });
+  }
+}
 
 export const actionsRouter = router({
   /** Who am I to Nebula: read-only or operator. */
@@ -702,5 +739,129 @@ export const actionsRouter = router({
           return { name, url, service: svc.service, kind: config.kind, expectedTag: created.expectedTag, secret: created.secret, displayTitle: created.displayTitle, source, pr, prDefault, branchCreated, unsetSecrets: unset };
         }),
       );
+    }),
+
+  // ── Lifecycle (docs/NEBULA.md §N9): PLO's bundle → preview → smoke → staging → sign-off ──
+  // Operators only. Each procedure plans before the gate (fields + summary come
+  // from what would really happen) and the action re-plans inside it, so every
+  // precondition is enforced server-side at the moment of the write. Fields bind
+  // the bundle key, the exact (repository, commit) set and the concrete effect
+  // (env names, smoke targets, image tags, evidence). Nothing here takes a URL,
+  // an env name or an image tag from the caller, and nothing merges a PR.
+
+  /** Queue an on-demand `plan` or `cve` run for plo-dispatch (a database row;
+   * the dashboard never writes to the cluster). Refused while one is in flight. */
+  lifecycleRequestRun: operatorProcedure
+    .input(z.object({ kind: z.enum(LIFECYCLE_RUN_KINDS), confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { kind, confirm } = input;
+      // the queue only: requesting a run needs neither GitHub nor AWS
+      const deps = { queue: lifecycleQueue(ctx.prisma) };
+      const fields = { kind };
+      await lifecyclePlan(ctx, "lifecycle_request_run", JSON.stringify(fields), () => planRequestRun(deps, { kind }));
+      const summary = [
+        `Request an on-demand ${kind === "plan" ? "plan run (every stage: what is outdated or end-of-life)" : "CVE scan (OSV, Node.js releases, CISA KEV, EPSS)"}`,
+        `- queue one ${kind} request; the plo-dispatch CronJob claims it within ~5 minutes and publishes a new snapshot`,
+        `- read-only: an in-cluster ${kind} run changes nothing on any cluster or repository`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_request_run", fields, confirm, summary, () => requestLifecycleRun(deps, { kind, actor: ctx.login })));
+    }),
+
+  /** Create the bundle's preview: one named env per bundled registry service,
+   * each through the existing createEnvFromRepo path, pinned to the bundle
+   * head. All or nothing against the env cap; refused when a bundle branch
+   * moved since the snapshot. The nonce binds the envs it would create. */
+  lifecycleCreatePreview: operatorProcedure
+    .input(z.object({ bundleKey: bundleKeySchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { bundleKey, confirm } = input;
+      const deps = lifecycleDeps(ctx.prisma);
+      const plan = await lifecyclePlan(ctx, "lifecycle_create_preview", JSON.stringify({ bundleKey }), () => planPreview(deps, { bundleKey }));
+      const fields = { bundleKey, setHash: plan.setHash, envs: previewEnvsField(plan), ttlHours: String(LIFECYCLE_PREVIEW_TTL_HOURS) };
+      const summary = [
+        `Create the preview for bundle ${key12(bundleKey)}: ${plan.create.length} named env${plan.create.length === 1 ? "" : "s"} (${plan.cap.live} of ${plan.cap.max} in use now), ttl ${LIFECYCLE_PREVIEW_TTL_HOURS}h`,
+        ...plan.create.map((c) => {
+          const built = c.attachUrl ? `, built against ${c.attachUrl}` : "";
+          const unset = c.secretNames.length ? `; ${c.secretNames.length} declared secret${c.secretNames.length === 1 ? "" : "s"} left unset (${c.secretNames.join(", ")})` : "";
+          return `- ${c.envName} (${c.kind} ${c.service}) from ${c.repo}@${c.branch}@${c.sha.slice(0, 7)} -> ${c.url}${built}; db=${c.db}${unset}`;
+        }),
+        ...plan.existing.map((e) => `- ${e.envName} (${e.service}) already exists for this bundle: kept`),
+        ...plan.skipped.map((s) => `- ${s.github}: skipped — ${s.reason}`),
+        `- per env: write secret preview/<service>/<env>, commit named-envs/pending/<env>.yaml + values, dispatch nebula-build.yml; the build-watcher promotes it when the image lands`,
+        `- all or nothing: if any env cannot be created, the ones this call made are torn down again`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_create_preview", fields, confirm, summary, () => createLifecyclePreview(deps, { bundleKey, setHash: fields.setHash, envs: fields.envs, actor: ctx.login })));
+    }),
+
+  /** Queue a smoke run against the bundle's preview envs or, for `stg`, the
+   * fixed staging hosts of the release-train services. The targets are built
+   * server-side and bound by the nonce; the caller names only the scope. */
+  lifecycleRequestSmoke: operatorProcedure
+    .input(z.object({ scope: z.enum(LIFECYCLE_SMOKE_SCOPES), bundleKey: bundleKeySchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { scope, bundleKey, confirm } = input;
+      const deps = lifecycleDeps(ctx.prisma);
+      const plan = await lifecyclePlan(ctx, "lifecycle_request_smoke", JSON.stringify({ scope, bundleKey }), () => planSmoke(deps, { scope, bundleKey }));
+      const fields = { scope, bundleKey, setHash: plan.setHash, targets: smokeTargetsField(plan.targets) };
+      const summary = [
+        `Run the ${scope === LIFECYCLE_STG ? "staging" : "preview"} smoke for bundle ${key12(bundleKey)}: ${plan.targets.length} target${plan.targets.length === 1 ? "" : "s"}`,
+        ...plan.targets.map((t) => `- ${t.name} at ${t.baseUrl}`),
+        `- queue one smoke request; plo-dispatch claims it within ~5 minutes and runs the HTTP checks configured for each service in the PLO inventory (GET only, no credentials, no redirects)`,
+        `- a new run replaces the verdict of an earlier one for this bundle`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_request_smoke", fields, confirm, summary, () => requestLifecycleSmoke(deps, { scope, bundleKey, setHash: fields.setHash, targets: fields.targets, actor: ctx.login })));
+    }),
+
+  /** Take the bundle to staging: open the release-train promotion PR(s) with
+   * each preview env's built image, through promoteRelease. Refused unless the
+   * latest preview smoke for exactly this bundle passed, covered every service
+   * and is newer than the preview envs. Merging stays `mergePromotion`. */
+  lifecycleDeployStg: operatorProcedure
+    .input(z.object({ bundleKey: bundleKeySchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { bundleKey, confirm } = input;
+      const deps = lifecycleDeps(ctx.prisma);
+      const plan = await lifecyclePlan(ctx, "lifecycle_deploy_stg", JSON.stringify({ scope: LIFECYCLE_STG, bundleKey }), () => planDeployStg(deps, { bundleKey }));
+      const fields = { scope: LIFECYCLE_STG, bundleKey, setHash: plan.setHash, promote: deployPromoteField(plan) };
+      const summary = [
+        `Deploy bundle ${key12(bundleKey)} to staging: open ${plan.promote.length} promotion PR${plan.promote.length === 1 ? "" : "s"} on twizz-gitops`,
+        ...plan.promote.map((p) => `- ${p.service}: ${p.imageTag} (the image preview env ${p.envName} runs)${p.from ? `, replacing ${p.from}` : ""} -> ${p.valuesFile}, https://${p.host}`),
+        ...plan.already.map((a) => `- ${a.service}: ${a.reason}`),
+        ...plan.noRoute.map((n) => `- ${n.github}: ${LIFECYCLE_NO_STAGING_ROUTE}`),
+        `- evidence: the preview smoke passed (${plan.smoke.checks} check${plan.smoke.checks === 1 ? "" : "s"}${plan.smoke.runId ? `, run ${plan.smoke.runId}` : ""})`,
+        `- nothing deploys until each PR is merged on /releases (the existing merge gate); then Argo CD rolls it out`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_deploy_stg", fields, confirm, summary, () => deployLifecycleStg(deps, { bundleKey, setHash: fields.setHash, promote: fields.promote, actor: ctx.login })));
+    }),
+
+  /** The human gate. Refused unless the latest staging smoke for exactly this
+   * bundle passed on what staging runs now (or, when nothing bundled is on the
+   * release train, the preview smoke). The sign-off is the AuditLog row the
+   * gate writes; each bundled PR gets a comment. It merges NOTHING. */
+  lifecycleSignoff: operatorProcedure
+    .input(z.object({ bundleKey: bundleKeySchema, confirm: confirmSchema }))
+    .mutation(async ({ ctx, input }) => {
+      const { bundleKey, confirm } = input;
+      const deps = lifecycleDeps(ctx.prisma);
+      const plan = await lifecyclePlan(ctx, "lifecycle_signoff", JSON.stringify({ bundleKey }), () => planSignoff(deps, { bundleKey }));
+      // the sign-off counts only under the field name `bundleKey` (lifecycle-model parseSignoffAudit)
+      const fields = { bundleKey, setHash: plan.setHash, scope: plan.scope, evidenceHash: plan.evidenceHash, prs: String(plan.prs.length) };
+      const ev = (label: string, e: typeof plan.evidence.preview) => (e ? [`- ${label} smoke: PASS, ${e.checks} check${e.checks === 1 ? "" : "s"}${e.runId ? `, run ${e.runId}` : ""}${e.finishedAt ? `, finished ${e.finishedAt}` : ""}`] : []);
+      const summary = [
+        `Sign off bundle ${key12(bundleKey)} as ${ctx.login}: ${plan.commits.length} repositor${plan.commits.length === 1 ? "y" : "ies"}, evidence = the ${plan.scope === LIFECYCLE_STG ? "staging" : "preview"} smoke`,
+        ...plan.commits.map((c) => `- ${c.github}@${c.headSha.slice(0, 7)} (${c.branch})`),
+        ...ev("preview", plan.evidence.preview),
+        ...ev("staging", plan.evidence.stg),
+        ...(plan.scope === LIFECYCLE_STG ? [] : [`- nothing in this bundle has a staging route in Nebula: the sign-off rests on the preview smoke`]),
+        `- record the sign-off in the audit log and comment on ${plan.prs.length} pull request${plan.prs.length === 1 ? "" : "s"}${plan.prs.length ? `: ${plan.prs.map((p) => `${p.repo}#${p.number}`).join(", ")}` : ""}`,
+        ...plan.skippedPrs.map((p) => `- no comment on ${p.repo}#${p.number}: ${p.reason}`),
+        `- nothing is merged: merging each pull request stays a human action in GitHub`,
+      ].join("\n");
+      const gate = gateFor(ctx.prisma, ctx.login);
+      return shape(await gate("lifecycle_signoff", fields, confirm, summary, () => signoffLifecycle(deps, { bundleKey, setHash: fields.setHash, scope: fields.scope, evidenceHash: fields.evidenceHash, actor: ctx.login })));
     }),
 });

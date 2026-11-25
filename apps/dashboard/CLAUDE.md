@@ -41,7 +41,14 @@ release-image drawer for operators; non-prod tier only), `/environments/topology
 introspection map, `/projects` (kind column + "Spin up"), `/clusters` (Observer), `/pipelines`,
 `/releases` the release train (`components/releases/release-train.tsx`), `/capacity` the capacity
 planner (`components/capacity/capacity-view.tsx`), `/monitor` the read-only prod/staging monitor
-(`components/monitor/monitor-view.tsx`, server `server/nebula/monitor.ts` + pure `monitor-model.ts`, §N6).
+(`components/monitor/monitor-view.tsx`, server `server/nebula/monitor.ts` + pure `monitor-model.ts`, §N6),
+`/lifecycle` what PLO reports: schedule, tiers, advisories (CVE watch), the bundle preview and
+sign-off, history (`components/lifecycle/lifecycle-view.tsx` + one file per pane; pure UI helpers
+`lib/nebula/lifecycle.ts`; server `server/nebula/lifecycle.ts` + pure `lifecycle-model.ts`; the five
+writes are gated `actions.lifecycle*`, §N9).
+
+`app/api/lifecycle/{ingest,requests/claim,requests/[id]/complete}` are PLO's machine routes (§N9):
+bearer `LIFECYCLE_INGEST_TOKEN`, POST only, never in the middleware matcher, never a session route.
 
 ## MCP endpoint (docs/NEBULA.md §N7)
 `src/app/api/mcp/route.ts` (stateless Streamable HTTP) → `server/mcp/auth.ts` + `identity.ts` (HARD gate:

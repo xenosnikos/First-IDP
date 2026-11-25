@@ -19,6 +19,7 @@ Vercel + Neon; cluster addons get installed via a Phase 2 `bootstrap.ts`.)
   inline IAM it needs on `twizz-prod-sentinel` / `twizz-nebula-dashboard` (docs/NEBULA.md §N8).
   `cd infra/addons && pulumi preview` must show only add-on resources (its Pulumi.yaml sets
   `main: index.ts`; without it the root program runs).
+- PLO in Nebula (docs/NEBULA.md §N9): `addons/index.ts` §5 = IRSA role `twizz-nebula-plo` (SA `nebula:plo`, read-only) + its EKS access entries (AmazonEKSViewPolicy, group `nebula-plo`) on NonProd, staging and prod; `k8s/nebula-plo-rbac.yaml` = namespaces/nodes read + `list secrets` for Helm discovery, applied by scripts/nebula-plo-access.sh (never by Pulumi)
 
 ## Usage
 - add-ons: `pulumi preview` / `pulumi up` from `infra/addons/` (see State above)
