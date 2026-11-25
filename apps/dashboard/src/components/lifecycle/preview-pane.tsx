@@ -17,7 +17,7 @@ import {
   requestWord,
   shortSha,
   shortTag,
-  verdictWord,
+  smokePill,
   type BundleView,
   type LifecyclePreview,
   type SmokeVerdict,
@@ -205,8 +205,10 @@ function BundleCard({ b, now }: { b: BundleView; now: number }) {
 }
 
 function SmokeSection({ title, v, now, skipped }: { title: string; v: SmokeVerdict; now: number; skipped?: boolean }) {
+  // a pass that is no longer evidence opens no gate: WATCH with the reason, never the green PASS
+  const pill = smokePill(v);
   return (
-    <Section title={title} right={skipped ? <span style={muted}>not applicable: nothing here has a staging route in Nebula</span> : <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}><span style={muted}>{v.detail}</span><Pill word={verdictWord(v.verdict)} /></span>}>
+    <Section title={title} right={skipped ? <span style={muted}>not applicable: nothing here has a staging route in Nebula</span> : <span style={{ display: "inline-flex", gap: 8, alignItems: "center" }}><span style={muted}>{pill.detail}</span><Pill word={pill.word} /></span>}>
       {v.request && (
         <div style={{ display: "flex", gap: 8, alignItems: "baseline", fontSize: 11, color: "var(--n-ink-muted)", marginBottom: v.results.length ? 10 : 0, flexWrap: "wrap" }}>
           {/* a finished request's outcome is the verdict in the header; a second pill here would contradict a failed smoke */}

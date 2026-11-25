@@ -115,6 +115,7 @@ export function env(name: string, repo: string, sha: string, over: Partial<Previ
     build: "ready",
     buildReason: null,
     argo: "PASS",
+    argoUnread: false,
     // Argo reports the pods on this image, rolled out three hours ago; created by an operator
     runsImage: true,
     rolledOutAt: ago(3 * HOUR).toISOString(),

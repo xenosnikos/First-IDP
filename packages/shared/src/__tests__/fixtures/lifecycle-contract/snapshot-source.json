@@ -241,6 +241,94 @@
       "escalationUrl": "https://github.com/twizz-app/platform-lifecycle-orchestrator/issues/320"
     }
   ],
+  "coverage": [
+    {
+      "environment": "staging",
+      "clusters": [
+        "EKS-Moly-staging"
+      ],
+      "tiers": [
+        {
+          "tier": "base-images",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "partial",
+          "components": 2,
+          "gaps": [
+            "lolygram-discover: package-lock.json could not be read from origin/dev"
+          ]
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "partial",
+          "components": 1,
+          "gaps": [
+            "lolygram-discover: package-lock.json could not be read from origin/dev"
+          ]
+        }
+      ]
+    },
+    {
+      "environment": "prod",
+      "clusters": [
+        "EKS-Moly-Prod"
+      ],
+      "tiers": [
+        {
+          "tier": "base-images",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "partial",
+          "components": 2,
+          "gaps": [
+            "lolygram-discover: package-lock.json could not be read from origin/dev"
+          ]
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "partial",
+          "components": 1,
+          "gaps": [
+            "lolygram-discover: package-lock.json could not be read from origin/dev"
+          ]
+        }
+      ]
+    },
+    {
+      "environment": "nonprod",
+      "clusters": [
+        "EKS-Twizz-NonProd"
+      ],
+      "tiers": [
+        {
+          "tier": "base-images",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        }
+      ]
+    }
+  ],
   "bundles": [
     {
       "repo": "twizz-sentinel",

@@ -1044,7 +1044,8 @@ Nebula or in-cluster PLO change a cluster.*
    row (`lifecycle.ingest`, actor `plo`). A snapshot is written ONCE: the same `runId` with the
    same content is an idempotent retry (200 `{id, duplicate: true}`, nothing changes), with
    different content a 409 — a stored snapshot is never replaced. The newest 60 per job are kept.
-3. `/lifecycle` renders the latest snapshots: Schedule · Tiers · Advisories · Preview · History.
+3. `/lifecycle` renders the latest snapshots: Schedule · Environments · Tiers · Advisories ·
+   Preview · History.
 4. On-demand runs are **requests**: an operator confirms through the gate, a `LifecycleRequest`
    row is inserted, and the `plo-dispatch` CronJob claims it within about 5 minutes
    (`POST /api/lifecycle/requests/claim`, one `UPDATE … FOR UPDATE SKIP LOCKED`), runs it,
@@ -1105,16 +1106,20 @@ is silently NOT covered — the pane shows what was found, never "this component
     build records (gitops), image existence (ECR), what staging and the previews RUN (Argo),
     the sign-off (AuditLog).
 - **`LIFECYCLE_DISPATCH_TOKEN` — the dispatcher's own credential.** With one shared token every
-  PLO pod (and anything that can read the token) could answer a smoke request. With this second
-  secret (≥ 32 chars, different from the ingest token) the two are separate credentials: the
-  request queue (`claim`, `complete`) and smoke snapshots need the dispatch token; `source`
-  snapshots need the ingest token; plan/cve snapshots take either. A misconfigured second
-  token is a 503, never a fall back. It is wired end to end: `scripts/nebula-set-plo-secrets.sh`
+  PLO pod (and anything that can read the token) could answer a smoke request, so there is no
+  shared-token mode. This second secret (≥ 32 chars, different from the ingest token) is a
+  separate credential: the request queue (`claim`, `complete`) and smoke snapshots need the
+  dispatch token; `source` snapshots need the ingest token; plan/cve snapshots take either. A
+  misconfigured second token is a 503 for everyone. An UNSET one fails closed for the
+  dispatcher role only (`identifyIngestCaller`): the ingest token still publishes plan, cve and
+  source snapshots, but it gets 403 on `claim`, `complete` and a smoke snapshot, and the
+  dispatch token is unknown (401) — nobody can answer a smoke request. It is wired end to end: `scripts/nebula-set-plo-secrets.sh`
   writes both tokens into SM `nebula/plo` (`NEBULA_INGEST_TOKEN`, `NEBULA_DISPATCH_TOKEN`);
   twizz-gitops syncs the second into its own Secret `plo-dispatch-env`, which only the
-  `plo-dispatch` pod (as its `NEBULA_INGEST_TOKEN`) and the dashboard mount. The code still
-  runs without it (one shared credential) and the Preview pane then says so under "Holding it
-  back" — that is the state of a dashboard that started before `plo-dispatch-env` synced.
+  `plo-dispatch` pod (as its `NEBULA_INGEST_TOKEN`) and the dashboard mount. The Preview pane
+  says so under "Holding it back" while it is unset ("the dispatcher's credential is not
+  configured") — that is the state of a dashboard that started before `plo-dispatch-env`
+  synced; restart it once both Secrets are Ready.
 - Externally these paths sit behind the browser SSO gate AND the bearer. **In-cluster, on the
   Service, the bearer is the only credential and there is no rate limit**: any pod in the
   NonProd cluster may try tokens. The token is 32 random bytes.
@@ -1178,7 +1183,17 @@ only a run kind, a scope or a bundle key.
   one passing check, AND the request was created after
   the env was built AND after Argo finished rolling out what runs now
   (`status.operationState.finishedAt`, phase Succeeded). An unknown rollout time is not
-  evidence: run the smoke again.
+  evidence: run the smoke again (and a preview smoke is not queued for an env Argo gives no
+  rollout time for). A preview env that is GONE — torn down, or reaped after its 72 h — keeps
+  its recorded pass, but "gone" must hold (review pass 3, #1): the named-env manifests were
+  read, gitops has no manifest of that name left (an env that expired but is not reaped yet,
+  or one of that name that is not the bundle's, is neither the env nor gone: refused), and
+  Nebula's AuditLog shows no write to that env (`rebuild_env`, `set_env_vars`,
+  `clone_staging_db`, a create) since the smoke was requested. An audit log that cannot be
+  read is "not known": refused. So a pass that was refused as stale never becomes good again
+  by removing the env it was stale against. Not covered: an Argo re-sync nobody in Nebula
+  caused (same manifest, same image) followed by the env's removal, and edits made directly
+  in twizz-gitops — neither leaves a record Nebula can read once the manifest is gone.
 - *sign-off* needs the preview smoke of EVERY bundled service — also when the bundle has a
   staging route. The staging smoke only calls the release-train services and can never stand
   in for the others.
@@ -1192,14 +1207,17 @@ only a run kind, a scope or a bundle key.
   against its bundled backend's 72 h preview env, so today **a bundle that contains
   `twizz-admin` cannot be taken to staging from `/lifecycle`** — see **Not done**.
 
-**The tab** (`/lifecycle`, sidebar `Lc`). Header: six tiles (outdated, critical/high, known
-exploited, bundle state, last plan, last CVE scan — each a button to its pane) and ONE "next"
+**The tab** (`/lifecycle`, sidebar `Lc`). Header: seven tiles (outdated, critical/high, known
+exploited, environments observed, bundle state, last plan, last CVE scan — each a button to its
+pane) and ONE "next"
 line derived from what the server allows (`lib/nebula/lifecycle.ts` `nextAction`): the
 bundle's pipeline step first, else KEV, else critical/high, else stale data, else what is
 outdated.
 - **Schedule**: job · what · when (plain words + the cron) · next run (UTC + relative) · last
   run · result · where it runs · "Run now" for plan/cve. `sweep-staging` and `promote-prod`
   are listed as "GitHub Actions / not reported to Nebula".
+- **Environments** (added 2026-11-25): the Tiers pane turned ninety degrees — see
+  **Environments: how each one stands, and whether that is known** below.
 - **Tiers**: one plate per tier in dependency order (control plane → add-ons → nodes → Helm →
   base images → npm direct → npm transitive), a summary line that always counts everything,
   and a table. The default filter keeps "what needs attention": any non-current status, any
@@ -1219,6 +1237,95 @@ outdated.
   plain text next to the pill. **Five words were added** to `lib/nebula/status.ts` —
   `CRITICAL`, `HIGH`, `KEV` (fail tone), `MODERATE` (pending), `LOW` (muted) — because a
   severity is its own word. None is Ember; `AWAITING HUMAN` stays the only Ember word.
+
+**Environments: how each one stands, and whether that is known** (added 2026-11-25; pure
+`server/nebula/lifecycle-environments.ts` `buildEnvironments`, part `environments` of
+`lifecycle.overview`).
+- **Which environments.** The three of PLO's inventory — `nonprod` (EKS-Twizz-NonProd),
+  `staging` (EKS-Moly-staging), `prod` (EKS-Moly-Prod) — are ALWAYS listed, in promotion order,
+  from the constant `LIFECYCLE_ENVIRONMENTS` in `@twizz-idp/shared` (pinned against PLO's
+  inventory by the contract fixture `vocabulary.json`). Then any other environment name a
+  snapshot uses (kind `reported`), then the live `plo-*` preview envs of the current bundle
+  (kind `preview`, read live from twizz-gitops and Argo, not from a snapshot).
+- **Per environment**: one status word (worst-of, existing vocabulary only); per tier the counts
+  current / behind (outdated, PR open, awaiting approval) / blocked / escalated / end-of-life and
+  the open advisories; open advisories by severity with the KEV count called out; the change
+  sets that still need something to happen, with their PR or escalation issue (an audit-only
+  environment's are `OBSERVE ONLY`: reported, never applied); where the monthly bundle stands
+  FOR THAT ENVIRONMENT (nonprod: preview envs and preview smoke; staging: bundle image deployed
+  and staging smoke; prod: the sign-off — the only Ember word on the pane, and only while the
+  bundle really awaits it); and how fresh each job's data is.
+- **The contract field behind it: `coverage`** (plan and source snapshots; additive and
+  optional, schemaVersion stays 1). Before it, a snapshot could not tell "prod has nothing
+  outdated" from "prod was not read": a cluster PLO could not reach simply had no rows, and a
+  discovery error was free text. `coverage` is PLO's own account of what it read:
+  `[{ environment, clusters[], tiers: [{ tier, state, components, gaps[] }] }]`, with `state`
+  one of `observed` (every target read, no gap), `partial` (rows read, but a gap recorded —
+  e.g. Helm releases readable in 4 of 9 namespaces), `not-observed` (nothing read), and
+  `not-applicable` (no repository deploys to nonprod, so its three source tiers do not apply).
+  A tier ABSENT from the list was not surveyed by that run (`--only`, or a source run, which
+  speaks for the repository tiers only).
+- **Never green by default — the rules, each unit-tested**
+  (`__tests__/lifecycle-environments.test.ts`):
+  - no plan snapshot, the environment missing from `coverage`, or its control plane
+    `not-observed` (a cluster that answered always has one) → **not observed**, word `UNKNOWN`,
+    with the reason — whatever older rows say;
+  - any applicable tier `partial` or `not-observed` next to a cluster that was read → **observed
+    in part**, `WATCH`, naming the tier and PLO's own gap text;
+  - the plan (or, for the repository tiers, the newer of plan and source) older than its
+    schedule allows (plan 8 days, source 32 days) → **stale**, `WATCH`; a CVE scan older than
+    36 h is `WATCH`, and no CVE scan at all is `UNKNOWN` ("open advisories are not known");
+  - rows from a failed run are never a clean observation, and a newer failed plan is said
+    (`WATCH`) while the older data stays up;
+  - a snapshot WITHOUT `coverage` (a PLO image that predates the field) vouches only for tiers
+    it has rows for; a tier with no rows is "not read", because nothing says it was looked at;
+  - a tier whose `coverage` entry counts MORE components than the snapshot carries rows for is
+    **observed in part**: PLO drops rows to fit the size limits (5000 components, the body cap)
+    and keeps the coverage list, so the counts understate. In a whole snapshot the two are equal
+    per environment and tier (pinned by the contract fixtures);
+  - an environment or tier listed twice in one `coverage` list: the entry that claims least
+    counts, and the row says it was listed twice;
+  - a pending change set whose components have no row, and an advisory that names no listed
+    environment, are in no row — the pane's notice says how many, never silently;
+  - a cluster of the environment with NO control-plane row in the run was not read, whatever
+    its `coverage` entry says (a row filed under another cluster does not count);
+  - the CVE scan carries no `coverage`, only `discoveryErrors`: one that starts with
+    `<cluster or repository>:` concerns that cluster's environment (or the environments that
+    repository's components are in), EVERY other one concerns every environment
+    (`cveGapsFor`). An environment with such a gap, or shown from a failed scan, is `WATCH`,
+    its advisories read "none found · the scan did not cover all of it" and the gaps are
+    listed (`advisories.gaps`); a newer CVE run that failed is `WATCH` too, like a newer
+    failed plan;
+  - a FAILED source run never speaks instead of a successful plan (`weakerRunFirst`, used for
+    the rows, the tier reading and the change sets alike);
+  - "last observed" counts only a run that speaks for EVERY tier (a `plan --only` run does
+    not);
+  - a preview env's smoke line is PASS only for its own checks, from a result that is the
+    request's own (`SmokeVerdict.trusted`), requested after the env last rolled out; a row
+    named exactly after the service is PLO's refusal and is FAIL; a smoke with no check for
+    the service is `WATCH` (not verified); a stale bundle-wide pass is `WATCH` on nonprod and
+    staging; and with Argo unreachable the env is "read in part", never "observed";
+  - the header's next action never says "Nothing to do" while a fixed environment is not
+    observed, read in part or not OK (`nextAction` takes the environments part);
+  - `OK` therefore needs: every applicable tier `observed`, plan and CVE scan fresh, every
+    component current, no open advisory.
+- **Last observed.** "observed 1 d ago by the plan job" comes from the run shown when it read
+  the environment; otherwise from the newest EARLIER plan that did — `readPlanCoverage` selects
+  only `data->'coverage'` of the last 30 plan snapshots (never the megabyte payloads). An
+  environment no stored run ever read says so ("never read by a run Nebula has").
+- **The pane.** One table, one row per environment (status + reason, observed, components,
+  advisories, change sets, bundle), and a detail plate for the selected one (per-tier table with
+  what was read, freshness per job, pending change sets). The detail opens on the environment
+  that is least known or worst off. "Components in <env>" / "Advisories in <env>" set the
+  environment filter of the Tiers / Advisories panes (the filter now lives in the view and
+  always offers the three fixed environments). Runtime health is NOT duplicated: staging and
+  prod link to `/monitor?tier=staging|production`.
+- **What it cannot know.** Coverage is PLO's word about its own run; Nebula does not probe the
+  clusters. In-cluster PLO reads Helm releases only in the namespaces its role may list Secrets
+  in, so the Helm tier is `partial` (and the environment `WATCH`) until those namespaces are
+  opened — that is the honest reading, not a defect of the pane. An EKS lookup that fails takes
+  the whole domain with it in PLO (`survey`), so one unreachable cluster marks that tier
+  `not-observed` for all three environments.
 
 **Where it runs.** twizz-gitops `apps/nebula/plo.yaml`: CronJobs `plo-cve` (`30 5 * * *`),
 `plo-plan` (`0 6 * * 1`), `plo-source` (`0 7 2 * *`), `plo-dispatch` (`*/5 * * * *`), all UTC,
@@ -1243,17 +1350,22 @@ staging infrastructure sweep and the prod promotion stay in PLO's GitHub Actions
   claim and complete handlers and builds the view from what was stored. Never edit the
   files by hand: regenerate in PLO and copy (the copy is a manual step).
 - Server: `server/nebula/lifecycle-model.ts` (pure: cron evaluator, tiers, advisories, stale
-  flags, the preview state machine), `lifecycle.ts` (reader + the one enqueue helper),
+  flags, the preview state machine), `lifecycle-environments.ts` (pure: the per-environment
+  view and its observation rules), `lifecycle.ts` (reader + the one enqueue helper),
   `lifecycle-ingest.ts` (handlers), `lifecycle-actions.ts` (wiring), `app/api/lifecycle/**`.
 - tRPC: `lifecycle.overview`, `.advisories`, `.preview`, `.history` (queries, any signed-in
   user; every sub-source failure is returned as `{ error }`); the five `actions.lifecycle*`
   mutations above.
 - UI: `app/(dashboard)/lifecycle/page.tsx`, `components/lifecycle/` (`lifecycle-view`,
-  `schedule-pane`, `tiers-pane`, `advisories-pane`, `preview-pane`, `history-pane`,
+  `schedule-pane`, `environments-pane`, `tiers-pane`, `advisories-pane`, `preview-pane`, `history-pane`,
   `gate-result`, `parts`), pure helpers `lib/nebula/lifecycle.ts`. Types come from the router
   (`inferRouterOutputs`) and from the action functions (type-only imports).
 - MCP: read tools `lifecycle_overview` and `lifecycle_advisories`. No lifecycle write is
-  exposed over MCP.
+  exposed over MCP. `lifecycle_overview` also returns `environments` — the same per-environment
+  summary as the Environments pane (status word, observation state with reasons and last
+  observed, per-tier counts, advisories with KEV, pending change sets, bundle stage), always
+  for all three fixed environments; an environment that was not observed arrives as `UNKNOWN`
+  with its reason, never dropped and never defaulted (pinned in `mcp/__tests__/tools.test.ts`).
 - Env: `LIFECYCLE_INGEST_TOKEN` (required for ingest; from Secret `plo-env`);
   `LIFECYCLE_DISPATCH_TOKEN` (the dispatcher's own credential, from Secret `plo-dispatch-env`; see
   **Trust boundaries**). `NEBULA_STAGING_API_URL` is now also
@@ -1364,14 +1476,24 @@ staging infrastructure sweep and the prod promotion stay in PLO's GitHub Actions
    tunnel up for prod). A plain run opens NO Secrets: it lists the namespaces that hold Helm
    releases and you name the ones to open with `--helm-namespaces <cluster>=<ns,…>` — that is
    the Secret exposure you are accepting. It also adds the ECR keep-rule for `plo-*`.
-5. **[human]** twizz-gitops: pin dashboard AND migrate to the new sha (migration
-   `0003_lifecycle` must run) and wait for the Argo app to be Synced + Healthy. Merge the PLO
-   workload PR (`plo.yaml`, placeholder tag, suspended; `dashboard.yaml` reading the two
-   tokens). Then, with `K = kubectl --kubeconfig ~/.kube/twizz-nonprod.yaml -n nebula`:
+5. **[human]** twizz-gitops: pin dashboard, migrate AND both image lines of `reaper.yaml`
+   (reaper, build-watcher) to the new sha in ONE commit (migration `0003_lifecycle` must run;
+   the new dashboard starts builds under the service's ECR repository name and an older
+   build-watcher looks under the service name, so envs built from moly-backend, frontend or
+   business would never leave `named-envs/pending`) and wait for the Argo app to be Synced +
+   Healthy. Merge the PLO workload PR (`plo.yaml`, placeholder tag, suspended; `dashboard.yaml`
+   reading the two tokens) — safe at any time, also before steps 2 to 4: its two
+   ExternalSecrets are parked in `apps/nebula/disabled/`, which Argo does not read. Then, ONLY
+   AFTER steps 2 and 3, a PR that moves `apps/nebula/disabled/plo-externalsecrets.yaml` to
+   `apps/nebula/plo-externalsecrets.yaml` (enabled earlier they are SecretSyncError, which Argo
+   CD counts as Degraded and which fails every sync of the app `nebula`). When Argo has synced
+   it, with `K = kubectl --kubeconfig ~/.kube/twizz-nonprod.yaml -n nebula`:
+   `K annotate externalsecret plo-env plo-dispatch-env force-sync="$(date +%s)" --overwrite`,
    `K wait --for=condition=Ready externalsecret/plo-env externalsecret/plo-dispatch-env --timeout=10m`
    and only then `K rollout restart deploy/dashboard` (it reads both tokens at start). Check:
-   `/lifecycle` loads and shows "Nothing has reported yet", WITHOUT the shared-token notice; an
-   unauthenticated `POST /api/lifecycle/ingest` from a pod answers 401, not 503.
+   `/lifecycle` loads and shows "Nothing has reported yet", WITHOUT the "dispatcher's
+   credential is not configured" notice; an unauthenticated `POST /api/lifecycle/ingest` from
+   a pod answers 401, not 503.
 6. **[human]** Create `twizz-app/platform-lifecycle-orchestrator` (private), push PLO as
    TwizzyNicky; its `build-image.yml` pushes `twizz-idp:plo-<sha>` (the OIDC role
    `twizz-gha-ecr-push` must trust that repository). A SECOND twizz-gitops PR then replaces

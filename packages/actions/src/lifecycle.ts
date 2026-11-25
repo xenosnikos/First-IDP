@@ -493,6 +493,8 @@ export async function planSmoke(deps: Pick<LifecycleDeps, "state" | "repos">, in
     for (const b of all) {
       if (!b.env || !b.env.up) refuse(`${b.service}: its preview env is not up`);
       const name = b.env!.name;
+      // a smoke is evidence only when it was requested after the env's last rollout: an env Argo gives no rollout time for could never be vouched for
+      if (!Number.isFinite(Date.parse(b.env!.rolledOutAt ?? ""))) refuse(`Argo does not say when ${name} rolled out, so a smoke run now could not be tied to what it runs — wait for Argo to finish a sync of it`);
       // the target is the bundle's OWN env, by its deterministic name — never another env on the same commit
       if (name !== b.envName || !isValidName(name) || !name.startsWith(LIFECYCLE_ENV_PREFIX)) refuse(`${b.service}: "${name}" is not this bundle's preview env (${b.envName})`);
       const origin = b.env!.port === null ? null : lifecyclePreviewSmokeOrigin(b.service, name, b.env!.port);
@@ -555,7 +557,9 @@ type PreviewEvidence = { manifests: Map<string, NamedEnvManifest> };
 /** The preview smoke counts for this bundle only when it covers every bundled
  * service where its env runs AND was requested after each of those envs was
  * (re)built — a pass from before a rebuild or a recreate proves nothing about
- * what runs now. `mustExist` names the services whose env is needed anyway. */
+ * what runs now. `mustExist` names the services whose env is needed anyway.
+ * An env that is really gone keeps its recorded pass; one the state does not
+ * list but gitops still has does not (pass 3 #1). */
 async function assertPreviewSmoke(deps: Pick<LifecycleDeps, "gitops">, state: LifecycleState, mustExist: ReadonlySet<string>): Promise<PreviewEvidence> {
   const all = previewableOf(state);
   const ev = state.smoke.preview;
@@ -581,7 +585,11 @@ async function assertPreviewSmoke(deps: Pick<LifecycleDeps, "gitops">, state: Li
     const needed = mustExist.has(b.service);
     if (!b.env) {
       if (needed) refuse(`${b.service}: its preview env is gone — create the preview and run the preview smoke again`);
-      continue; // expired after it was smoked: the recorded pass stands
+      // "Gone" must be true in gitops, not only in the state: an env of that name that is still there (expired but
+      // not reaped, rebuilt from another commit, being rebuilt, not an operator's) is not the env that was smoked
+      // and is not gone either — the recorded pass cannot be tied to it.
+      if (!b.envName || (await findEnv(deps, b.envName))) refuse(`${b.service}: ${b.envName ?? "its preview env"} still exists but is not usable as this bundle's preview env (expired, or no longer what the bundle built), so the preview smoke cannot be tied to it — tear it down on /environments, then create the preview and run the preview smoke again`);
+      continue; // really gone after it was smoked: the recorded pass stands (the state machine has checked Nebula's audit log for changes since)
     }
     const found = await findEnv(deps, b.env.name);
     if (!found) {

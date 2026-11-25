@@ -15,6 +15,10 @@ type OkOf<T> = T extends { ok: infer U } ? U : never;
 
 export type LifecycleOverview = OkOf<Out["overview"]["data"]>;
 export type BundleSummary = OkOf<Out["overview"]["bundle"]>;
+export type LifecycleEnvironments = OkOf<Out["overview"]["environments"]>;
+export type EnvironmentView = LifecycleEnvironments["environments"][number];
+export type EnvTierView = EnvironmentView["tiers"][number];
+export type EnvChangeSet = EnvironmentView["changeSets"][number];
 export type LifecycleAdvisories = OkOf<Out["advisories"]["data"]>;
 export type LifecyclePreview = OkOf<Out["preview"]["data"]>;
 export type LifecycleHistory = OkOf<Out["history"]["data"]>;
@@ -35,9 +39,9 @@ export type ComponentStatus = ComponentRow["status"];
 export type Severity = AdvisoryRow["severity"];
 export type Tier = TierView["tier"];
 
-export const LIFECYCLE_TABS = ["schedule", "tiers", "advisories", "preview", "history"] as const;
+export const LIFECYCLE_TABS = ["schedule", "environments", "tiers", "advisories", "preview", "history"] as const;
 export type LifecycleTab = (typeof LIFECYCLE_TABS)[number];
-export const TAB_LABEL: Record<LifecycleTab, string> = { schedule: "Schedule", tiers: "Tiers", advisories: "Advisories", preview: "Preview", history: "History" };
+export const TAB_LABEL: Record<LifecycleTab, string> = { schedule: "Schedule", environments: "Environments", tiers: "Tiers", advisories: "Advisories", preview: "Preview", history: "History" };
 
 const plural = (n: number, one: string, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 
@@ -238,6 +242,22 @@ export function verdictWord(verdict: SmokeVerdict["verdict"]): StatusWord {
   return verdict === "pass" ? "PASS" : verdict === "fail" ? "FAIL" : verdict === "running" ? "RUNNING" : "PLANNED";
 }
 
+/** The pill and line of a smoke verdict. A pass that is stale (what runs now rolled out after it, or it cannot be
+ * tied to its env any more) opens no gate, so it is never shown as PASS — the same rule as the Environments tab. */
+export function smokePill(v: Pick<SmokeVerdict, "verdict" | "detail" | "stale">): { word: StatusWord; detail: string } {
+  if (v.verdict === "pass" && v.stale) return { word: "WATCH", detail: `${v.detail}, but that is no longer evidence: ${v.stale}` };
+  return { word: verdictWord(v.verdict), detail: v.detail };
+}
+
+/** What the Advisories pane says when the scan lists nothing. "None" is a claim about a scan that ran and read
+ * everything: a scan that failed, a newer one that failed, or a source that did not answer makes it "none found". */
+export function advisoriesEmptyLine(view: Pick<LifecycleAdvisories, "scan" | "discoveryErrors" | "lastFailed">): { word: StatusWord; text: string } {
+  if (view.scan && !view.scan.ok) return { word: "WATCH", text: "None listed — but the scan itself failed, so the list may be incomplete." };
+  if (view.lastFailed) return { word: "WATCH", text: `None found by the scan shown — but the latest scan (${view.lastFailed.runId}) failed, so what has changed since is not known.` };
+  if (view.discoveryErrors.length > 0) return { word: "WATCH", text: `None found — but ${plural(view.discoveryErrors.length, "source")} did not answer, so advisories may be missing.` };
+  return { word: "OK", text: "No known advisory affects anything in the inventory." };
+}
+
 /** A preview env's build → word. */
 export function envBuildWord(build: NonNullable<BundleView["env"]>["build"]): StatusWord {
   return build === "ready" ? "PASS" : build === "failed" ? "FAIL" : "RUNNING";
@@ -348,6 +368,94 @@ export function tierWord(t: Pick<TierView, "total" | "actionable" | "counts"> & 
   return "OK";
 }
 
+// ── environments ──────────────────────────────────────────────────────────
+
+/** How well an environment was read, in the words the pane uses. */
+export const OBSERVATION_TEXT: Record<EnvironmentView["observation"]["state"], string> = {
+  observed: "observed",
+  partial: "observed in part",
+  stale: "stale",
+  "not-observed": "not observed",
+};
+
+/** What a run read of one tier of one environment (the per-tier column). */
+export const COVERAGE_TEXT: Record<EnvTierView["state"], string> = {
+  observed: "read",
+  partial: "read in part",
+  "not-observed": "not read",
+  "not-applicable": "does not apply",
+};
+
+const JOB_TEXT: Record<NonNullable<EnvironmentView["observation"]["lastObserved"]>["job"], string> = { plan: "the plan job", source: "the source job", live: "a live read of twizz-gitops and Argo" };
+
+/** "observed 1d 0h ago by the plan job" — and, for an environment that was
+ * NOT read by the run shown, when it last was (or that it never was). Never
+ * reads as fresh when it is not: the state leads the sentence. */
+export function observationLine(e: Pick<EnvironmentView, "observation" | "kind">, nowMs: number): string {
+  const o = e.observation;
+  const last = o.lastObserved;
+  const when = last ? `${relTime(last.at, Math.max(nowMs, Date.parse(last.at) || nowMs))} by ${JOB_TEXT[last.job]}` : null;
+  // a preview env is read live; when Argo did not answer, only gitops was read — never "and Argo"
+  if (e.kind === "preview") return o.state === "observed" ? "read live from twizz-gitops and Argo" : "read in part: twizz-gitops was read, Argo could not be";
+  if (o.state === "not-observed") return when ? `not observed by the run shown · last observed ${when}` : "not observed · never read by a run Nebula has";
+  return when ? `${OBSERVATION_TEXT[o.state]} ${when}` : OBSERVATION_TEXT[o.state];
+}
+
+/** "34 components · 30 current · 3 behind · 1 blocked" — zeros dropped; the
+ * order is fixed (current first) so three environments read down a column. */
+export function envCountsLine(c: EnvironmentView["counts"]): string {
+  if (c.total === 0) return "no components reported";
+  const parts: Array<[number, string]> = [
+    [c.current, "current"],
+    [c.behind, "behind"],
+    [c.blocked, "blocked"],
+    [c.escalated, "escalated"],
+    [c.failed, "failed"],
+    [c.unknown, "unknown"],
+    [c.eol, "end of life"],
+  ];
+  return [plural(c.total, "component"), ...parts.filter(([n]) => n > 0).map(([n, what]) => `${n} ${what}`)].join(" · ");
+}
+
+/** "2 critical · 1 high · 3 moderate" (worst first), or why there is no number. */
+export function envAdvisoriesLine(a: EnvironmentView["advisories"]): string {
+  if (!a.scanned) return "no CVE scan yet";
+  // the scan says it could not read part of this environment: "none" is then only "none found"
+  const incomplete = a.gaps.length > 0;
+  if (a.total === 0) return incomplete ? "none found · the scan did not cover all of it" : "none open";
+  const line = SEVERITIES.filter((s) => a.counts[s] > 0)
+    .map((s) => `${a.counts[s]} ${s}`)
+    .join(" · ");
+  return incomplete ? `${line} · the scan did not cover all of it` : line;
+}
+
+/** The worst severity word an environment's open advisories carry (null: none, or no scan). */
+export function envSeverityWord(a: EnvironmentView["advisories"]): StatusWord | null {
+  const worst = SEVERITIES.find((s) => a.counts[s] > 0);
+  return a.scanned && worst ? SEVERITY_WORD[worst] : null;
+}
+
+/** The environment a reader should look at first: the worst-standing fixed
+ * one (the server's order breaks ties), so the detail plate never opens on a
+ * healthy environment while another one is not known. */
+export function defaultEnvironment(view: Pick<LifecycleEnvironments, "environments">): string | null {
+  const rank = (w: StatusWord) => {
+    const i = ["UNKNOWN", "FAIL", "DENIED", "AWAITING HUMAN", "WATCH", "PENDING", "RUNNING"].indexOf(w);
+    return i < 0 ? 99 : i;
+  };
+  const fixed = view.environments.filter((e) => e.kind !== "preview");
+  const pool = fixed.length ? fixed : view.environments;
+  return [...pool].sort((a, b) => rank(a.word) - rank(b.word))[0]?.name ?? null;
+}
+
+/** Names for the environment filter of the Tiers and Advisories panes: every
+ * fixed environment (even with nothing reported, so a focused-but-empty one
+ * still shows as the active filter), then whatever else the data names. */
+export function environmentFilterNames(envs: Pick<LifecycleEnvironments, "environments"> | null, present: readonly string[], active: string | null = null): string[] {
+  const fixed = (envs?.environments ?? []).filter((e) => e.kind !== "preview").map((e) => e.name);
+  return [...new Set([...fixed, ...present, ...(active ? [active] : [])])];
+}
+
 // ── links ─────────────────────────────────────────────────────────────────
 
 const PREVIEW_HOST_RE = /^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.prv\.twizz\.com$/;
@@ -436,17 +544,49 @@ export function emptyStateLines(o: Pick<LifecycleOverview, "runs" | "schedule">)
 
 export type HeaderTile = { key: string; label: string; word: StatusWord; value: string; detail: string; tab: LifecycleTab };
 
-export function headerTiles(o: LifecycleOverview, bundle: { state: PreviewState; detail: string; key12: string | null } | { error: string } | null, nowMs: number): HeaderTile[] {
+/** The environments tile: how many of the fixed environments the data covers.
+ * Its word is the worst observation, so one unread cluster is visible from the header. */
+export function environmentsTile(envs: LifecycleEnvironments | { error: string } | null): HeaderTile {
+  const base = { key: "environments", label: "environments", tab: "environments" as const };
+  if (envs === null) return { ...base, word: "PENDING", value: "…", detail: "reading how each environment stands" };
+  if ("error" in envs) return { ...base, word: "UNKNOWN", value: "unreadable", detail: envs.error };
+  const fixed = envs.environments.filter((e) => e.kind === "fixed");
+  const unread = fixed.filter((e) => e.observation.state === "not-observed");
+  const shaky = fixed.filter((e) => e.observation.state === "partial" || e.observation.state === "stale");
+  const word: StatusWord = unread.length > 0 ? "UNKNOWN" : shaky.length > 0 ? "WATCH" : "OK";
+  const detail = unread.length > 0 ? `not observed: ${unread.map((e) => e.name).join(", ")}` : shaky.length > 0 ? `${shaky.map((e) => `${e.name} ${OBSERVATION_TEXT[e.observation.state]}`).join(", ")}` : "every environment was read by the latest runs";
+  return { ...base, word, value: `${envs.observed} of ${envs.fixed} read`, detail };
+}
+
+export function headerTiles(o: LifecycleOverview, bundle: { state: PreviewState; detail: string; key12: string | null } | { error: string } | null, nowMs: number, envs?: LifecycleEnvironments | { error: string } | null): HeaderTile[] {
   const h = o.header;
   const noPlan = !o.runs.plan && !o.runs.source;
   const noCve = !o.runs.cve;
   // the same count the Tiers pane's default filter keeps (an up-to-date but vulnerable component counts)
   const attention = o.tiers.reduce((n, t) => n + t.components.filter(needsAttention).length, 0);
+  // A zero is green only when the run behind it is good. "0 outdated" over a failed plan, or next to components
+  // that failed, are blocked or could not be assessed, is not OK; nor is "0 advisories" from a scan that failed,
+  // is stale, was followed by a failed one, or says a source did not answer.
+  const runShaky = (r: LifecycleOverview["runs"]["plan"]) => !!r && (!r.ok || !!r.lastFailed);
+  const stuck = o.tiers.reduce((n, t) => n + t.counts.failed + t.counts.blocked + t.counts.escalated + t.counts.unknown, 0);
+  const planShaky = runShaky(o.runs.plan) || runShaky(o.runs.source) || stuck > 0;
+  const cveWhy = noCve
+    ? null
+    : !o.runs.cve!.ok
+      ? "the scan shown failed, so the list may be incomplete"
+      : o.runs.cve!.lastFailed
+        ? `the latest scan (${o.runs.cve!.lastFailed.runId}) failed; this is the scan from before it`
+        : o.discoveryErrors.some((e) => e.job === "cve")
+          ? `${plural(o.discoveryErrors.filter((e) => e.job === "cve").length, "source")} did not answer, so advisories may be missing`
+          : o.stale.cve.word !== "OK"
+            ? o.stale.cve.detail
+            : null;
   const tiles: HeaderTile[] = [
     {
       key: "outdated",
       label: "outdated",
-      word: noPlan ? "UNKNOWN" : h.outdated > 0 ? "PENDING" : "OK",
+      // nothing outdated, but upgrades still open or waiting for approval: work is pending, which is not OK either
+      word: noPlan ? "UNKNOWN" : h.outdated > 0 ? "PENDING" : planShaky ? "WATCH" : h.actionable > 0 ? "PENDING" : "OK",
       value: noPlan ? "—" : String(h.outdated),
       detail: noPlan ? "no plan snapshot yet" : `of ${plural(h.components, "component")} · ${attention} need${attention === 1 ? "s" : ""} attention`,
       tab: "tiers",
@@ -455,19 +595,20 @@ export function headerTiles(o: LifecycleOverview, bundle: { state: PreviewState;
       key: "critical-high",
       label: "critical / high",
       // the header counts critical + high together (the split is on the pane), so the word is "act now", not one severity
-      word: noCve ? "UNKNOWN" : h.criticalHigh > 0 ? "HOT" : "OK",
+      word: noCve ? "UNKNOWN" : h.criticalHigh > 0 ? "HOT" : cveWhy ? "WATCH" : "OK",
       value: noCve ? "—" : String(h.criticalHigh),
-      detail: noCve ? "no CVE scan yet" : `advisories · ${h.newAdvisories > 0 ? `${h.newAdvisories} new since the previous scan` : "none new since the previous scan"}`,
+      detail: noCve ? "no CVE scan yet" : h.criticalHigh === 0 && cveWhy ? `none found — ${cveWhy}` : `advisories · ${h.newAdvisories > 0 ? `${h.newAdvisories} new since the previous scan` : "none new since the previous scan"}`,
       tab: "advisories",
     },
     {
       key: "kev",
       label: "known exploited",
-      word: noCve ? "UNKNOWN" : h.kev > 0 ? "KEV" : "OK",
+      word: noCve ? "UNKNOWN" : h.kev > 0 ? "KEV" : cveWhy ? "WATCH" : "OK",
       value: noCve ? "—" : String(h.kev),
-      detail: noCve ? "no CVE scan yet" : h.kev > 0 ? "in CISA's catalogue of vulnerabilities exploited in the wild" : "nothing here is in CISA's exploited catalogue",
+      detail: noCve ? "no CVE scan yet" : h.kev > 0 ? "in CISA's catalogue of vulnerabilities exploited in the wild" : cveWhy ? `none found — ${cveWhy}` : "nothing here is in CISA's exploited catalogue",
       tab: "advisories",
     },
+    ...(envs === undefined ? [] : [environmentsTile(envs)]),
     bundle === null
       ? { key: "bundle", label: "bundle", word: "PENDING", value: "…", detail: "reading the bundle state", tab: "preview" }
       : "error" in bundle
@@ -512,7 +653,13 @@ const act = (word: StatusWord, title: string, detail: string, tab: LifecycleTab 
  * (`preview.actions` are the same checks the gated writes enforce). The
  * bundle's pipeline comes first — it is how a vulnerable dependency actually
  * gets fixed; with no bundle in flight the riskiest open finding leads. */
-export function nextAction(input: { overview: LifecycleOverview; preview: LifecyclePreview | null; previewError?: string | null }): NextAction {
+export function nextAction(input: {
+  overview: LifecycleOverview;
+  preview: LifecyclePreview | null;
+  previewError?: string | null;
+  /** the per-environment part; `{ error }`: it could not be read; absent: the caller does not have it */
+  environments?: LifecycleEnvironments | { error: string } | null;
+}): NextAction {
   const { overview: o, preview: p } = input;
   if (!hasAnySnapshot(o)) {
     const first = o.schedule.rows.filter((r) => r.runner === "nebula" && r.nextRun && ["plan", "cve", "source"].includes(r.job)).sort((a, b) => Date.parse(a.nextRun!) - Date.parse(b.nextRun!))[0];
@@ -554,6 +701,25 @@ export function nextAction(input: { overview: LifecycleOverview; preview: Lifecy
     const src = o.schedule.rows.find((r) => r.job === "source");
     return act("PENDING", `${plural(h.actionable, "component")} need${h.actionable === 1 ? "s" : ""} attention`, src?.nextRun ? `the next source run (${fmtUtc(src.nextRun)}) opens the upgrade pull requests and bundles them for a preview` : "see what is outdated per tier", "tiers");
   }
+  // "Nothing to do" is a claim about every environment. One that was not read, or read in part, or whose
+  // standing is not known, takes it away — the header never says OK over an environment that is UNKNOWN.
+  const envs = input.environments;
+  if (envs && "error" in envs) return act("UNKNOWN", "The environments could not be read", `${envs.error}; whether every environment was observed is not known`, "environments");
+  if (envs) {
+    const fixed = envs.environments.filter((e) => e.kind !== "preview");
+    const names = (xs: typeof fixed) => xs.map((e) => e.name).join(", ");
+    const unread = fixed.filter((e) => e.observation.state === "not-observed");
+    if (unread.length) return act("UNKNOWN", `${names(unread)} ${unread.length === 1 ? "was" : "were"} not observed`, `${unread[0].observation.reasons[0] ?? unread[0].headline}; nothing is known about ${unread.length === 1 ? "it" : "them"} until a plan run reads ${unread.length === 1 ? "it" : "them"}`, "environments");
+    const inPart = fixed.filter((e) => e.observation.state !== "observed");
+    if (inPart.length) return act("WATCH", `${names(inPart)} ${inPart.length === 1 ? "was" : "were"} not fully observed`, inPart[0].observation.reasons[0] ?? inPart[0].headline, "environments");
+    const notOk = fixed.filter((e) => e.word !== "OK");
+    if (notOk.length) return act(notOk[0].word === "UNKNOWN" ? "UNKNOWN" : "WATCH", `Look at ${names(notOk)}`, notOk[0].headline, "environments");
+  }
+  // …and a claim that every job ran. A source run that failed (with or without an older good one behind it) opened
+  // no upgrade pull requests and built no bundle this month: that is something to look at, not nothing to do.
+  const src = o.runs.source;
+  const srcFailed = src && !src.ok ? { runId: src.runId, error: src.error } : (src?.lastFailed ?? null);
+  if (srcFailed) return act("WATCH", "The last source run failed", `source run ${srcFailed.runId} failed${srcFailed.error ? `: ${srcFailed.error}` : ""}; no upgrade pull requests or bundle came out of it — see its log, the next scheduled run tries again`, "schedule");
   return act("OK", "Nothing to do", "everything reported is up to date and no advisory is open", null);
 }
 

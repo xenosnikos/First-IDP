@@ -31,9 +31,10 @@
 # removed on exit. Only key names are echoed back.
 #
 # Legacy copies. An earlier design kept the token in preview/plo and as LIFECYCLE_INGEST_TOKEN in
-# preview/nebula. If either is found the script STOPS before writing anything: a copy there is
-# readable by preview pods, and the dashboard would fall back to it whenever Secret plo-env is
-# missing. --remove-legacy-copy deletes that one key from preview/nebula (every other key is
+# preview/nebula. If either is found, or a LIFECYCLE_DISPATCH_TOKEN in preview/nebula, the script
+# STOPS before writing anything: a copy there is readable by preview pods, and the dashboard
+# (envFrom nebula-env) would fall back to it whenever Secret plo-env or plo-dispatch-env is
+# missing. --remove-legacy-copy deletes those keys from preview/nebula (every other key is
 # kept, verified before writing) and tells you how to delete preview/plo.
 #
 # After --rotate, PLO jobs get 401 until plo-env has synced and the dashboard has restarted:
@@ -48,7 +49,8 @@ PLO_KEY=NEBULA_INGEST_TOKEN
 DISPATCH_KEY=NEBULA_DISPATCH_TOKEN
 LEGACY_PLO_SECRET=preview/plo
 LEGACY_NEBULA_SECRET=preview/nebula
-LEGACY_NEBULA_KEY=LIFECYCLE_INGEST_TOKEN
+# the dashboard's names for the two tokens: neither may be a key of preview/nebula
+LEGACY_NEBULA_KEYS='["LIFECYCLE_INGEST_TOKEN","LIFECYCLE_DISPATCH_TOKEN"]'
 MIN_LEN=32
 ROTATE=false
 REMOVE_LEGACY=false
@@ -69,30 +71,51 @@ GOT=$(aws sts get-caller-identity --query Account --output text)
 
 D=$(mktemp -d)
 trap 'rm -rf "$D"' EXIT
-exists() { aws secretsmanager describe-secret --region "$REGION" --secret-id "$1" >/dev/null 2>&1; }
+# secret_state <id> → present | deleting | missing.
+# `describe-secret` still answers for a secret that is scheduled for deletion (with DeletedDate) while nobody can
+# read or write it any more, so "it describes" is not "it exists". And only ResourceNotFoundException is "missing":
+# any other failure (access denied, the network) stops the script — "could not check" is never "not there".
+secret_state() {
+  local out
+  if out=$(aws secretsmanager describe-secret --region "$REGION" --secret-id "$1" --output json 2>"$D/describe.err"); then
+    if jq -e '(.DeletedDate // null) != null' >/dev/null 2>&1 <<<"$out"; then echo deleting; else echo present; fi
+  elif grep -q 'ResourceNotFoundException' "$D/describe.err"; then
+    echo missing
+  else
+    echo "could not check whether $1 exists (describe-secret failed: $(tr '\n' ' ' < "$D/describe.err" | head -c 300)). Nothing written." >&2
+    return 1
+  fi
+}
 get() { aws secretsmanager get-secret-value --region "$REGION" --secret-id "$1" --query SecretString --output text; }
 
 # ── legacy copies under preview/*: stop, or remove on request ────────
 LEGACY=0
-if exists "$LEGACY_PLO_SECRET"; then
+LEGACY_PLO_STATE=$(secret_state "$LEGACY_PLO_SECRET")
+if [ "$LEGACY_PLO_STATE" = present ]; then
   echo "LEGACY: $LEGACY_PLO_SECRET exists. Preview pods can read it. Delete it (nothing uses it any more):" >&2
   echo "  aws secretsmanager delete-secret --region $REGION --secret-id $LEGACY_PLO_SECRET --recovery-window-in-days 7" >&2
   LEGACY=1
+elif [ "$LEGACY_PLO_STATE" = deleting ]; then
+  # the command above was run: for the recovery window the secret still describes, and nobody can read it
+  echo "$LEGACY_PLO_SECRET is scheduled for deletion: nobody can read it any more (do not restore it)"
 fi
-if exists "$LEGACY_NEBULA_SECRET"; then
+LEGACY_NEBULA_STATE=$(secret_state "$LEGACY_NEBULA_SECRET")
+if [ "$LEGACY_NEBULA_STATE" = present ]; then
   get "$LEGACY_NEBULA_SECRET" > "$D/nebula.json"
   jq -e 'type == "object"' "$D/nebula.json" >/dev/null || { echo "$LEGACY_NEBULA_SECRET is not a JSON object; nothing written" >&2; exit 1; }
-  if jq -e --arg k "$LEGACY_NEBULA_KEY" 'has($k)' "$D/nebula.json" >/dev/null; then
+  FOUND=$(jq -r --argjson ks "$LEGACY_NEBULA_KEYS" '[$ks[] as $k | select(has($k)) | $k] | join(", ")' "$D/nebula.json")
+  if [ -n "$FOUND" ]; then
     if $REMOVE_LEGACY; then
-      jq --arg k "$LEGACY_NEBULA_KEY" 'del(.[$k])' "$D/nebula.json" > "$D/nebula.new.json"
-      # the only difference allowed is that one key
-      [ "$(jq -S --arg k "$LEGACY_NEBULA_KEY" 'del(.[$k])' "$D/nebula.json" | openssl dgst -sha256)" = "$(jq -S . "$D/nebula.new.json" | openssl dgst -sha256)" ] \
-        || { echo "refusing to write $LEGACY_NEBULA_SECRET: removing the key would change its other keys" >&2; exit 1; }
-      aws secretsmanager put-secret-value --region "$REGION" --secret-id "$LEGACY_NEBULA_SECRET" --secret-string "file://$D/nebula.new.json" --query VersionId --output text | xargs echo "$LEGACY_NEBULA_SECRET: $LEGACY_NEBULA_KEY removed, new version:"
-      echo "  that value was readable by preview pods: run this script with --rotate once the dashboard reads plo-env"
+      jq --argjson ks "$LEGACY_NEBULA_KEYS" 'delpaths([$ks[] | [.]])' "$D/nebula.json" > "$D/nebula.new.json"
+      # the only difference allowed is those keys: every other key must come out with the same value
+      jq -e --argjson ks "$LEGACY_NEBULA_KEYS" --slurpfile old "$D/nebula.json" \
+        '. as $new | ($old[0] | with_entries(select(.key as $k | $ks | index($k) | not))) == $new' "$D/nebula.new.json" >/dev/null \
+        || { echo "refusing to write $LEGACY_NEBULA_SECRET: removing the keys would change its other keys" >&2; exit 1; }
+      aws secretsmanager put-secret-value --region "$REGION" --secret-id "$LEGACY_NEBULA_SECRET" --secret-string "file://$D/nebula.new.json" --query VersionId --output text | xargs echo "$LEGACY_NEBULA_SECRET: $FOUND removed, new version:"
+      echo "  those values were readable by preview pods: run this script with --rotate once the dashboard reads plo-env and plo-dispatch-env"
     else
-      echo "LEGACY: $LEGACY_NEBULA_SECRET still has the key $LEGACY_NEBULA_KEY. Preview pods can read it, and the dashboard" >&2
-      echo "  falls back to it when Secret plo-env is missing. Remove it: bash $0 --remove-legacy-copy" >&2
+      echo "LEGACY: $LEGACY_NEBULA_SECRET still has the key(s) $FOUND. Preview pods can read them, and the dashboard" >&2
+      echo "  falls back to them when Secret plo-env or plo-dispatch-env is missing. Remove: bash $0 --remove-legacy-copy" >&2
       LEGACY=1
     fi
   fi
@@ -102,7 +125,14 @@ fi
 # ── nebula/plo: keep valid tokens unless --rotate ────────────────────
 PLO_EXISTS=false
 echo '{}' > "$D/plo.json"
-if exists "$PLO_SECRET"; then
+PLO_STATE=$(secret_state "$PLO_SECRET")
+if [ "$PLO_STATE" = deleting ]; then
+  echo "$PLO_SECRET is scheduled for deletion: it can be neither read nor written. Restore it first, then run this again:" >&2
+  echo "  aws secretsmanager restore-secret --region $REGION --secret-id $PLO_SECRET" >&2
+  echo "nothing written" >&2
+  exit 1
+fi
+if [ "$PLO_STATE" = present ]; then
   PLO_EXISTS=true
   get "$PLO_SECRET" > "$D/plo.json"
   jq -e 'type == "object"' "$D/plo.json" >/dev/null || { echo "$PLO_SECRET is not a JSON object; nothing written" >&2; exit 1; }
@@ -152,7 +182,10 @@ cat <<'NEXT'
 
 Next (not run by this script), in this order:
   1. External Secrets must be allowed to read nebula/plo: `pulumi up` in infra/addons (once).
-  2. twizz-gitops apps/nebula/plo.yaml and the dashboard.yaml change must be merged (once).
+  2. twizz-gitops apps/nebula/plo.yaml and the dashboard.yaml change must be merged (once), and
+     then, by a PR of its own, the two ExternalSecrets enabled (once): move
+     apps/nebula/disabled/plo-externalsecrets.yaml to apps/nebula/plo-externalsecrets.yaml.
+     Only after step 1 and this script: an ExternalSecret that cannot sync degrades the Argo app.
   3. kubectl --kubeconfig ~/.kube/twizz-nonprod.yaml -n nebula annotate externalsecret plo-env plo-dispatch-env force-sync=$(date +%s) --overwrite
   4. kubectl --kubeconfig ~/.kube/twizz-nonprod.yaml -n nebula wait --for=condition=Ready externalsecret/plo-env externalsecret/plo-dispatch-env --timeout=10m
   5. kubectl --kubeconfig ~/.kube/twizz-nonprod.yaml -n nebula rollout restart deploy/dashboard

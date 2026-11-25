@@ -143,6 +143,10 @@ class FakeStore implements LifecycleIngestStore {
 }
 
 const deps = (store: FakeStore, over: Partial<IngestDeps> = {}): IngestDeps => ({ store, token: TOKEN, now: () => NOW, ...over });
+/** For the suites about the request queue and smoke results: TOKEN (what `post` presents by default) is the
+ * DISPATCHER's credential there and the publishers hold another one. There is no shared-token mode. */
+const PUBLISHER = "p0blisher-".repeat(5);
+const asDispatcher = (store: FakeStore, over: Partial<IngestDeps> = {}): IngestDeps => ({ store, token: PUBLISHER, dispatchToken: TOKEN, now: () => NOW, ...over });
 const auth = (token = TOKEN) => ({ authorization: `Bearer ${token}` });
 
 function post(path: string, body: unknown, headers: Record<string, string> = auth()): Request {
@@ -542,6 +546,7 @@ describe("POST /api/lifecycle/ingest", () => {
 });
 
 describe("POST /api/lifecycle/requests/claim", () => {
+  const deps = asDispatcher;
   const smokeParams = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] };
   const claim = async (store: FakeStore, over: Partial<IngestDeps> = {}) => {
     const res = await handleClaim(post("/requests/claim", ""), deps(store, over));
@@ -662,6 +667,7 @@ describe("POST /api/lifecycle/requests/claim", () => {
 });
 
 describe("POST /api/lifecycle/requests/:id/complete", () => {
+  const deps = asDispatcher;
   const complete = async (store: FakeStore, id: string, body: unknown) => {
     const res = await handleComplete(post(`/requests/${id}/complete`, body), id, deps(store));
     return { status: res.status, body: (await res.json()) as Record<string, unknown> };
@@ -797,6 +803,7 @@ describe("the ingest-token holder is not trusted: bundle keys", () => {
 });
 
 describe("the ingest-token holder is not trusted: smoke results", () => {
+  const deps = asDispatcher;
   const params = { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] };
   const result = (ok = true) => ({ name: "twizz-sentinel/health", url: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090/health", ok, status: ok ? 200 : 503, ms: 12, detail: ok ? "status 200" : "status 503, expected 200" });
   const smoke = (requestId: string | undefined, over: Record<string, unknown> = {}) =>
@@ -920,8 +927,12 @@ describe("the dispatcher's own credential (LIFECYCLE_DISPATCH_TOKEN)", () => {
   const smokeBody = (requestId: string) => snapshot({ job: "smoke", runId: "smoke-1", components: undefined, requestId, smoke: { scope: "preview", bundleKey: KEY, results: [] } });
   const split = (store: FakeStore) => deps(store, { dispatchToken: DISPATCH });
 
-  it("identifyIngestCaller: one shared token is both roles; two tokens are two separate credentials", () => {
-    expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, undefined)).toMatchObject({ ok: true, split: false, roles: new Set(["publisher", "dispatcher"]) });
+  it("identifyIngestCaller: two tokens are two separate credentials; without the dispatcher's, nobody is the dispatcher", () => {
+    // fail closed: the publisher token alone is never both roles (a dashboard started before plo-dispatch-env synced)
+    const alone = identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, undefined);
+    expect(alone).toMatchObject({ ok: true, split: false });
+    expect(alone.ok && [...alone.roles]).toEqual(["publisher"]);
+    expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, "")).toMatchObject({ ok: true, split: false, roles: new Set(["publisher"]) });
     expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, DISPATCH)).toMatchObject({ ok: true, split: true, roles: new Set(["publisher"]) });
     expect(identifyIngestCaller(`Bearer ${DISPATCH}`, TOKEN, DISPATCH)).toMatchObject({ ok: true, split: true, roles: new Set(["dispatcher"]) });
     expect(identifyIngestCaller(`Bearer ${DISPATCH}`, TOKEN, undefined)).toMatchObject({ ok: false, status: 401 });
@@ -930,6 +941,22 @@ describe("the dispatcher's own credential (LIFECYCLE_DISPATCH_TOKEN)", () => {
     expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, "short")).toMatchObject({ ok: false, status: 503 });
     expect(identifyIngestCaller(`Bearer ${TOKEN}`, TOKEN, TOKEN)).toMatchObject({ ok: false, status: 503 });
     expect(identifyIngestCaller(`Bearer ${DISPATCH}`, undefined, DISPATCH)).toMatchObject({ ok: false, status: 503 });
+  });
+
+  it("WITHOUT it, the publisher token still cannot claim, complete or post a smoke result (no shared-token mode)", async () => {
+    const store = new FakeStore();
+    const alone = deps(store, { dispatchToken: undefined });
+    const req = store.addRequest("smoke", { status: "claimed", claimedAt: NOW, params });
+    store.addRequest("plan");
+    expect((await handleClaim(post("/requests/claim", ""), alone)).status).toBe(403);
+    expect((await handleComplete(post(`/requests/${req.id}/complete`, { ok: true }), req.id, alone)).status).toBe(403);
+    expect((await handleIngest(post("/ingest", smokeBody(req.id)), alone)).status).toBe(403);
+    expect(store.snapshots).toEqual([]);
+    expect(store.requests.map((r) => r.status)).toEqual(["claimed", "pending"]);
+    // the dispatcher's own token is not known to this dashboard either: 401, never accepted
+    expect((await handleClaim(post("/requests/claim", "", auth(DISPATCH)), alone)).status).toBe(401);
+    // what the publisher token is for still works
+    expect((await handleIngest(post("/ingest", snapshot({ runId: "plan-1" })), alone)).status).toBe(200);
   });
 
   it("with it set, the publisher token cannot claim, complete or post a smoke result", async () => {

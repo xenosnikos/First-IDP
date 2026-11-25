@@ -71,8 +71,8 @@ function Err({ what, msg }: { what: string; msg: string }) {
 // Monitor (docs/NEBULA.md §N6): one page that answers "are we OK, and how much
 // room is left?" for prod and staging, so nobody has to sit on CloudWatch,
 // Atlas and kubectl at once. Read-only; resizing is on /capacity.
-export function MonitorView({ operator }: { operator: boolean }) {
-  const [tier, setTier] = useState<Tier>("production");
+export function MonitorView({ operator, initialTier = "production" }: { operator: boolean; initialTier?: Tier }) {
+  const [tier, setTier] = useState<Tier>(initialTier);
   const [win, setWin] = useState<Win>("1h");
   const q = trpc.monitor.snapshot.useQuery({ tier, window: win }, { refetchInterval: REFRESH_MS, retry: false, placeholderData: (prev) => (prev?.tier === tier ? prev : undefined) });
   const [, tick] = useState(0);

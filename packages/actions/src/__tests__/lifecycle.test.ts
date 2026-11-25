@@ -1263,3 +1263,46 @@ describe("external review: policy list fields are judged item by item (idp #12)"
     expect(evaluate(p, "q", { v: "b" }).allowed).toBe(false);
   });
 });
+
+describe("pass 3 #1: the gates never read a preview env they cannot vouch for as 'expired' (fail closed)", () => {
+  const ready = () => {
+    const w = smokedPreview();
+    w.state.bundles[0].staging = { deployed: true, rolledOutAt: ROLLED_OUT, promotion: null };
+    w.state.smoke.stg = passed("stg", [{ name: "twizz-sentinel", baseUrl: STG_S }]);
+    return w;
+  };
+
+  it("sign-off and deploy: the state has no env for a service, but a manifest of that name still exists → refused", async () => {
+    // the state machine dropped the env (expired but not reaped, another commit, a non-operator): gitops still has it
+    const sign = ready();
+    sign.state.bundles[1].env = null;
+    await expect(planSignoff(sign.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/plo-2611-moly-backend still exists but is not usable as this bundle's preview env/));
+    expect(sign.repos.comments).toEqual([]);
+    const dep = smokedPreview();
+    dep.state.bundles[1].env = null;
+    await expect(planDeployStg(dep.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/plo-2611-moly-backend still exists but is not usable as this bundle's preview env/));
+    expect(dep.promotions.prs).toEqual([]);
+    // also while it is being rebuilt (a pending manifest)
+    const pending = ready();
+    pending.gitops.files.delete(`named-envs/${ENV_B}.yaml`);
+    deployed(pending, ENV_B, BACKEND, SHA_B, "moly-backend", { imageTag: undefined, build: { status: "RUNNING", expectedTag: nebulaTag(ENV_B, SHA_B), startedAt: "2026-11-25T11:30:00.000Z" } }, "pending");
+    pending.state.bundles[1].env = null;
+    await expect(planSignoff(pending.deps, { bundleKey: KEY })).rejects.toEqual(refusal(/plo-2611-moly-backend still exists/));
+  });
+
+  it("sign-off: an env that is really gone keeps its recorded pass", async () => {
+    const w = ready();
+    w.state.bundles[1].env = null;
+    w.gitops.files.delete(`named-envs/${ENV_B}.yaml`);
+    await expect(planSignoff(w.deps, { bundleKey: KEY })).resolves.toMatchObject({ scope: "stg" });
+  });
+
+  it("smoke: an env whose rollout time Argo does not report is never a target", async () => {
+    const w = world();
+    deployed(w, ENV_S, SENTINEL, SHA_S, "twizz-sentinel");
+    deployed(w, ENV_B, BACKEND, SHA_B, "moly-backend");
+    w.state.bundles[0].env = { name: ENV_S, up: true, rolledOutAt: null, port: 8080 };
+    await expect(planSmoke(w.deps, { scope: "preview", bundleKey: KEY })).rejects.toEqual(refusal(/Argo does not say when plo-2611-twizz-sentinel rolled out/));
+    expect(w.queue.rows).toEqual([]);
+  });
+});

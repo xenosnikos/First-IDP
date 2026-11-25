@@ -287,5 +287,163 @@
         "helm-release:EKS-Moly-staging:cert-manager"
       ]
     }
+  ],
+  "coverage": [
+    {
+      "environment": "staging",
+      "clusters": [
+        "EKS-Moly-staging"
+      ],
+      "tiers": [
+        {
+          "tier": "control-plane",
+          "state": "not-observed",
+          "components": 0,
+          "gaps": [
+            "no control plane was read for EKS-Moly-staging"
+          ]
+        },
+        {
+          "tier": "addons",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "nodes",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "helm",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "base-images",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "observed",
+          "components": 2,
+          "gaps": []
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        }
+      ]
+    },
+    {
+      "environment": "prod",
+      "clusters": [
+        "EKS-Moly-Prod"
+      ],
+      "tiers": [
+        {
+          "tier": "control-plane",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "addons",
+          "state": "observed",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "nodes",
+          "state": "observed",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "helm",
+          "state": "partial",
+          "components": 1,
+          "gaps": [
+            "EKS-Moly-Prod: Helm releases read in 4 of 9 namespaces (Secrets are listable only there); a release in any other namespace is not seen"
+          ]
+        },
+        {
+          "tier": "base-images",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "observed",
+          "components": 2,
+          "gaps": []
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "observed",
+          "components": 1,
+          "gaps": []
+        }
+      ]
+    },
+    {
+      "environment": "nonprod",
+      "clusters": [
+        "EKS-Twizz-NonProd"
+      ],
+      "tiers": [
+        {
+          "tier": "control-plane",
+          "state": "not-observed",
+          "components": 0,
+          "gaps": [
+            "no control plane was read for EKS-Twizz-NonProd"
+          ]
+        },
+        {
+          "tier": "addons",
+          "state": "observed",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "nodes",
+          "state": "observed",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "helm",
+          "state": "observed",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "base-images",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "npm-direct",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        },
+        {
+          "tier": "npm-transitive",
+          "state": "not-applicable",
+          "components": 0,
+          "gaps": []
+        }
+      ]
+    }
   ]
 }

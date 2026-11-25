@@ -8,10 +8,11 @@ import { Button } from "@/components/nebula/button";
 import { PageHeader } from "@/components/nebula/plate";
 import { GateDialog } from "@/components/nebula/gate-dialog";
 import { mayHaveWritten, useGatedAction, type GateResult } from "@/lib/nebula/use-gated-action";
-import { LIFECYCLE_TABS, TAB_LABEL, emptyStateLines, fmtUtc, hasAnySnapshot, headerTiles, needsAttention, nextAction, relTime, type LifecycleTab } from "@/lib/nebula/lifecycle";
+import { LIFECYCLE_TABS, TAB_LABEL, defaultEnvironment, emptyStateLines, fmtUtc, hasAnySnapshot, headerTiles, needsAttention, nextAction, relTime, type LifecycleTab } from "@/lib/nebula/lifecycle";
 import { GateResultView, gateTitle, type LifecycleAction } from "./gate-result";
 import { Err, label, linkStyle, muted } from "./parts";
 import { SchedulePane } from "./schedule-pane";
+import { EnvironmentsPane } from "./environments-pane";
 import { TiersPane } from "./tiers-pane";
 import { AdvisoriesPane } from "./advisories-pane";
 import { PreviewPane } from "./preview-pane";
@@ -30,6 +31,9 @@ export function LifecycleView({ operator, login }: { operator: boolean; login: s
   const utils = trpc.useUtils();
   const [tab, setTab] = useState<LifecycleTab>("tiers");
   const [action, setAction] = useState<LifecycleAction | null>(null);
+  // the environment the Environments pane has selected, and the one the Tiers and Advisories panes filter to
+  const [envSelected, setEnvSelected] = useState<string | null>(null);
+  const [envFilter, setEnvFilter] = useState<string | null>(null);
 
   const overviewQ = trpc.lifecycle.overview.useQuery(undefined, { refetchInterval: REFRESH_MS, retry: false, placeholderData: keep });
   const previewQ = trpc.lifecycle.preview.useQuery(undefined, { refetchInterval: REFRESH_MS, retry: false, placeholderData: keep });
@@ -76,14 +80,16 @@ export function LifecycleView({ operator, login }: { operator: boolean; login: s
   const preview = previewQ.data && "ok" in previewQ.data.data ? previewQ.data.data.ok : null;
   const previewError = previewQ.error?.message ?? (previewQ.data && "error" in previewQ.data.data ? previewQ.data.data.error : null);
   const advisories = advisoriesQ.data && "ok" in advisoriesQ.data.data ? advisoriesQ.data.data.ok : null;
+  const environments = overviewQ.data && "ok" in overviewQ.data.environments ? overviewQ.data.environments.ok : null;
+  const environmentsError = overviewQ.data && "error" in overviewQ.data.environments ? overviewQ.data.environments.error : null;
   const advisoriesError = advisoriesQ.error?.message ?? (advisoriesQ.data && "error" in advisoriesQ.data.data ? advisoriesQ.data.data.error : null);
   const history = historyQ.data && "ok" in historyQ.data.data ? historyQ.data.data.ok : null;
   const historyError = historyQ.error?.message ?? (historyQ.data && "error" in historyQ.data.data ? historyQ.data.data.error : null);
 
   // the bundle tile prefers the full preview read; the overview carries a summary as a fallback
   const bundleTile = preview ? { state: preview.state, detail: preview.detail, key12: preview.key12 } : overviewQ.data ? ("ok" in overviewQ.data.bundle ? overviewQ.data.bundle.ok : overviewQ.data.bundle) : null;
-  const tiles = overview ? headerTiles(overview, bundleTile, now) : [];
-  const next = overview && (preview || previewError || !previewQ.isLoading) ? nextAction({ overview, preview, previewError }) : null;
+  const tiles = overview ? headerTiles(overview, bundleTile, now, overviewQ.data ? ("ok" in overviewQ.data.environments ? overviewQ.data.environments.ok : overviewQ.data.environments) : null) : [];
+  const next = overview && (preview || previewError || !previewQ.isLoading) ? nextAction({ overview, preview, previewError, environments: overviewQ.data?.environments ? ("ok" in overviewQ.data.environments ? overviewQ.data.environments.ok : overviewQ.data.environments) : null }) : null;
   const empty = overview ? (hasAnySnapshot(overview) ? [] : emptyStateLines(overview)) : [];
   const fetching = overviewQ.isFetching || previewQ.isFetching;
 
@@ -117,7 +123,7 @@ export function LifecycleView({ operator, login }: { operator: boolean; login: s
 
       {overview && (
         <>
-          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(190px, 1fr))", gap: 12, marginBottom: 12 }}>
+          <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(180px, 1fr))", gap: 12, marginBottom: 12 }}>
             {tiles.map((t) => (
               <button
                 key={t.key}
@@ -195,10 +201,23 @@ export function LifecycleView({ operator, login }: { operator: boolean; login: s
 
           <div role="tabpanel" id="lifecycle-panel" aria-labelledby={`lifecycle-tab-${tab}`}>
             {tab === "schedule" && <SchedulePane overview={overview} now={now} operator={operator} onRun={(job) => start({ kind: "run", job })} />}
-            {tab === "tiers" && <TiersPane overview={overview} advisories={advisories} advisoriesError={advisoriesError} now={now} goTo={goTo} />}
+            {tab === "environments" && (
+              <EnvironmentsPane
+                view={environments}
+                error={environmentsError}
+                now={now}
+                selected={envSelected ?? (environments ? defaultEnvironment(environments) : null)}
+                onSelect={setEnvSelected}
+                onFilter={(env, to) => {
+                  setEnvFilter(env);
+                  goTo(to);
+                }}
+              />
+            )}
+            {tab === "tiers" && <TiersPane overview={overview} environments={environments} advisories={advisories} advisoriesError={advisoriesError} now={now} goTo={goTo} environment={envFilter} onEnvironment={setEnvFilter} />}
             {tab === "advisories" &&
               (advisories ? (
-                <AdvisoriesPane view={advisories} now={now} />
+                <AdvisoriesPane view={advisories} now={now} environments={environments} environment={envFilter} onEnvironment={setEnvFilter} />
               ) : advisoriesError ? (
                 <div className="n-plate" style={{ padding: 16 }}><Err what="The CVE scan could not be read" msg={advisoriesError} /></div>
               ) : (

@@ -19,6 +19,8 @@ import {
   LIFECYCLE_BUMPS,
   LIFECYCLE_BUNDLE_KEY_RE,
   LIFECYCLE_COMPONENT_STATUSES,
+  LIFECYCLE_COVERAGE_STATES,
+  LIFECYCLE_ENVIRONMENTS,
   LIFECYCLE_JOBS,
   LIFECYCLE_LIMITS,
   LIFECYCLE_MAX_SMOKE_TARGETS,
@@ -61,6 +63,18 @@ describe("PLO contract fixtures", () => {
     expect(cve.advisories!.some((a) => a.kev)).toBe(true);
     expect(smoke.smoke!.bundleKey).toBe(source.bundleKey);
     expect(smoke.smoke!.results.some((r) => r.status === null)).toBe(true);
+    // coverage: every inventory environment, every state, and a source run speaks for the repository tiers only
+    expect(plan.coverage!.map((e) => e.environment).sort()).toEqual(LIFECYCLE_ENVIRONMENTS.map((e) => e.name).sort());
+    expect(new Set(plan.coverage!.flatMap((e) => e.tiers.map((t) => t.state)))).toEqual(new Set(LIFECYCLE_COVERAGE_STATES));
+    expect(source.coverage!.every((e) => e.tiers.every((t) => ["base-images", "npm-direct", "npm-transitive"].includes(t.tier)))).toBe(true);
+    expect(cve.coverage).toBeUndefined();
+    // a whole snapshot carries exactly the rows its coverage counts, per environment and tier — the dashboard
+    // reads "fewer rows than counted" as rows left out on the way (lifecycle-environments.ts tierCoverage)
+    for (const s of [plan, source]) {
+      for (const e of s.coverage!) {
+        for (const t of e.tiers) expect([s.job, e.environment, t.tier, s.components!.filter((c) => c.tier === t.tier && c.environments.includes(e.environment)).length]).toEqual([s.job, e.environment, t.tier, t.components]);
+      }
+    }
     expect(failed.ok).toBe(false);
     expect(failed.error).toBeTruthy();
   });
@@ -85,6 +99,8 @@ describe("PLO contract fixtures", () => {
       requestKinds: [...LIFECYCLE_REQUEST_KINDS],
       snapshotKeys: Object.keys(LifecycleSnapshotDoc.shape).sort(),
       componentKeys: Object.keys(LifecycleComponent.shape).sort(),
+      coverageStates: [...LIFECYCLE_COVERAGE_STATES],
+      environments: LIFECYCLE_ENVIRONMENTS.map((e) => ({ name: e.name, clusters: [...e.clusters] })),
     });
     expect(v.bundleKeyExample).toMatch(LIFECYCLE_BUNDLE_KEY_RE);
   });

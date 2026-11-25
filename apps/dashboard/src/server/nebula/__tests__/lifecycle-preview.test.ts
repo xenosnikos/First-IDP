@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import {
   LIFECYCLE_TOOLS,
   PREVIEW_STATES,
+  SMOKE_LOOKBACK,
+  selectSnapshots,
   argoRunsImage,
   bundleImageTag,
   SIGNOFF_AUDIT_ACTION,
@@ -39,7 +41,7 @@ const stagingOn = (tag: string | null, over: Partial<StagingTargetInput> = {}): 
 const promotion = (tag = TAG_S): PromotionInput => ({ service: "twizz-sentinel", imageTag: tag, number: 77, url: "https://github.com/TwizzyNicky/twizz-gitops/pull/77", headSha: "d".repeat(40) });
 
 function preview(over: Partial<PreviewInput> = {}): PreviewView {
-  return buildPreview({ rows: [source()], requests: [], services: SERVICES, envs: [], promotions: [], staging: stagingOn("main-" + "1".repeat(40)), signoffs: [], now: NOW, ...over });
+  return buildPreview({ rows: [source()], requests: [], services: SERVICES, envs: [], promotions: [], staging: stagingOn("main-" + "1".repeat(40)), signoffs: [], envChanges: [], now: NOW, ...over });
 }
 const allowed = (v: PreviewView) => Object.entries(v.actions).filter(([, a]) => a.allowed).map(([k]) => k);
 const reason = (a: PreviewView["actions"][keyof PreviewView["actions"]]) => (a.allowed ? "" : a.reason);
@@ -648,5 +650,79 @@ describe("smokeVerdict: a result counts only as the one answer to Nebula's own r
     // a look-alike origin: the request's origin as a PREFIX of another one (port 80901, not 8090)
     const prefix = smokeSnap(r, "preview", KEY, green, ago(12 * 60_000), { smoke: { scope: "preview", bundleKey: KEY, results: [{ name: "twizz-sentinel/health", url: `${PREVIEW_SVC}1/health`, ok: true, status: 200, ms: 1, detail: "" }] } });
     expect(smokeVerdict("preview", KEY, [r], [prefix]).verdict).toBe("fail");
+  });
+});
+
+describe("pass 3 #10: the smoke result a gate rests on does not age out behind later smoke runs", () => {
+  it("thirty-one staging smoke retries after it do not turn a passed preview smoke into 'no result received'", () => {
+    const pre = smoked("preview", [{ ok: true }], KEY, 600);
+    const retries = Array.from({ length: SMOKE_LOOKBACK + 1 }, (_, i) => {
+      const req = smokeRequest("stg", KEY, { status: "done", createdAt: ago((500 - i * 10) * 60_000), claimedAt: ago((498 - i * 10) * 60_000), finishedAt: ago((495 - i * 10) * 60_000), runId: `smoke-stg-${i}` });
+      return { req, row: smokeSnap(req, "stg", KEY, [{ ok: false }], ago((495 - i * 10) * 60_000)) };
+    });
+    const v = preview({ envs: envsUp(), staging: stagingOn(TAG_S), requests: [pre.req, ...retries.map((r) => r.req)], rows: [source(), pre.row, ...retries.map((r) => r.row)] });
+    expect(v.smoke.preview).toMatchObject({ verdict: "pass", runId: "smoke-preview" });
+    expect(v.smoke.stg.verdict).toBe("fail");
+    // …and the views still look over a bounded window
+    expect(selectSnapshots([pre.row, ...retries.map((r) => r.row)]).smoke).toHaveLength(SMOKE_LOOKBACK);
+  });
+});
+
+describe("pass 3 #1: a preview pass that cannot be tied to its env opens no human gate (fail closed)", () => {
+  // preview smoke requested 35 min ago, staging smoke 15 min ago: with both envs up this bundle awaits its sign-off
+  const pre = smoked("preview", [{ ok: true }], KEY, 30);
+  const stg = smoked("stg", [{ ok: true }], KEY, 10);
+  const base = { rows: [source(), pre.row, stg.row], requests: [pre.req, stg.req], staging: stagingOn(TAG_S) };
+  const refusedBoth = (v: PreviewView, why: RegExp) => {
+    expect(v.smoke.preview.verdict).toBe("pass");
+    expect(v.smoke.preview.stale).toMatch(why);
+    expect(reason(v.actions.signoff)).toMatch(why);
+    expect(v.actions.deployStg.allowed).toBe(false);
+    expect(v.state).not.toBe("awaiting-signoff");
+    expect(v.blockers.join("\n")).toMatch(why);
+  };
+
+  it("baseline: every env up and smoked after its rollout → the sign-off is available", () => {
+    expect(preview({ ...base, envs: envsUp() }).actions.signoff).toEqual({ allowed: true });
+    // an env that is gone (torn down or reaped) with nothing recorded against it keeps its pass
+    expect(preview({ ...base, envs: [env(ENV_S, SENTINEL, SHA_SENTINEL)] }).actions.signoff).toEqual({ allowed: true });
+  });
+
+  it("an env that re-rolled after the smoke is refused — and stays refused once it has EXPIRED but is still there", () => {
+    const rerolled = { rolledOutAt: ago(60_000).toISOString() };
+    refusedBoth(preview({ ...base, envs: [env(ENV_S, SENTINEL, SHA_SENTINEL), env(ENV_B, BACKEND, SHA_BACKEND, rerolled)] }), /plo-2611-moly-backend rolled out at .* after the preview smoke was requested/);
+    const expired = preview({ ...base, envs: [env(ENV_S, SENTINEL, SHA_SENTINEL), env(ENV_B, BACKEND, SHA_BACKEND, { ...rerolled, expiresAt: ago(60_000).toISOString() })] });
+    expect(expired.bundles[1].env).toBeNull();
+    refusedBoth(expired, /plo-2611-moly-backend has expired but is still there/);
+  });
+
+  it("an env of that name that is NOT the bundle's (another commit, a non-operator) is refused, not read as 'expired'", () => {
+    refusedBoth(preview({ ...base, envs: [env(ENV_S, SENTINEL, SHA_SENTINEL), env(ENV_B, BACKEND, "7".repeat(40))] }), /plo-2611-moly-backend exists but is not this bundle's preview/);
+    refusedBoth(preview({ ...base, envs: [env(ENV_S, SENTINEL, SHA_SENTINEL), env(ENV_B, BACKEND, SHA_BACKEND, { trusted: false })] }), /plo-2611-moly-backend exists but is not this bundle's preview/);
+  });
+
+  it("an env changed through Nebula after the smoke was requested stays refused after it is torn down", () => {
+    const gone = [env(ENV_S, SENTINEL, SHA_SENTINEL)];
+    const change = (minutesAgo: number, envName = ENV_B) => ({ envName, action: "nebula.rebuild_env", at: ago(minutesAgo * 60_000) });
+    // rebuilt 20 min ago (the smoke was requested 35 min ago), then torn down
+    refusedBoth(preview({ ...base, envs: gone, envChanges: [change(20)] }), /plo-2611-moly-backend was changed in Nebula \(nebula\.rebuild_env at .*\) after the preview smoke was requested and is gone now — create the preview and run the preview smoke again/);
+    // the same while the env is still there
+    refusedBoth(preview({ ...base, envs: envsUp(), envChanges: [change(20)] }), /plo-2611-moly-backend was changed in Nebula .* after the preview smoke was requested — run the preview smoke again/);
+    // a change from before the request, or of another env, is not held against it
+    expect(preview({ ...base, envs: gone, envChanges: [change(50), change(20, "plo-2611-twizz-admin")] }).actions.signoff).toEqual({ allowed: true });
+    // the audit log could not be read: an env that is gone cannot be vouched for
+    refusedBoth(preview({ ...base, envs: gone, envChanges: null }), /the audit log could not be read/);
+    expect(preview({ ...base, envs: envsUp(), envChanges: null }).actions.signoff.allowed).toBe(false);
+  });
+
+  it("manifests that could not be read are not 'every env expired'", () => {
+    refusedBoth(preview({ ...base, envs: null }), /named-env manifests could not be read/);
+  });
+
+  it("a preview smoke is not queued while Argo does not say when an env rolled out", () => {
+    const v = preview({ envs: [env(ENV_S, SENTINEL, SHA_SENTINEL, { rolledOutAt: null }), env(ENV_B, BACKEND, SHA_BACKEND)] });
+    expect(v.state).toBe("preview-up");
+    expect(v.actions.smokePreview).toEqual({ allowed: false, reason: expect.stringMatching(/Argo does not say when plo-2611-twizz-sentinel rolled out/) });
+    expect(preview({ envs: envsUp() }).actions.smokePreview).toEqual({ allowed: true });
   });
 });

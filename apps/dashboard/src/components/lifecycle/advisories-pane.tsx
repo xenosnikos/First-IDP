@@ -6,9 +6,11 @@ import { Button } from "@/components/nebula/button";
 import { inputStyle } from "@/components/nebula/plate";
 import {
   DEFAULT_ADVISORY_FILTER,
+  advisoriesEmptyLine,
   SEVERITIES,
   SEVERITY_WORD,
   STATUS_TEXT,
+  environmentFilterNames,
   epssPct,
   filterAdvisories,
   fmtUtc,
@@ -17,6 +19,7 @@ import {
   type AdvisoryFilter,
   type AdvisoryRow,
   type LifecycleAdvisories,
+  type LifecycleEnvironments,
 } from "@/lib/nebula/lifecycle";
 import { Chip, Empty, EnvChips, Ext, FilterGroup, Notice, Section, Toggle, label, muted, rowStyle, selectStyle, tableStyle, tdStyle, thStyle } from "./parts";
 
@@ -68,13 +71,21 @@ function Affected({ a }: { a: AdvisoryRow }) {
 // first, then severity, then EPSS, and that order is kept. Every row says
 // which component and which environments are affected and what version fixes
 // it — "is this us, where, and what do we do" without leaving the page.
-export function AdvisoriesPane({ view, now }: { view: LifecycleAdvisories; now: number }) {
-  const [filter, setFilter] = useState<AdvisoryFilter>(DEFAULT_ADVISORY_FILTER);
+// The environment filter is owned by the view, as in the Tiers pane.
+export function AdvisoriesPane({ view, now, environments, environment, onEnvironment }: { view: LifecycleAdvisories; now: number; environments: LifecycleEnvironments | null; environment: string | null; onEnvironment: (env: string | null) => void }) {
+  const [rest, setRest] = useState<Omit<AdvisoryFilter, "environment">>(DEFAULT_ADVISORY_FILTER);
+  const filter = useMemo<AdvisoryFilter>(() => ({ ...rest, environment }), [rest, environment]);
   const [all, setAll] = useState(false);
-  const set = (patch: Partial<AdvisoryFilter>) => setFilter((f) => ({ ...f, ...patch }));
+  const set = ({ environment: env, ...patch }: Partial<AdvisoryFilter>) => {
+    if (env !== undefined) onEnvironment(env);
+    if (Object.keys(patch).length) setRest((f) => ({ ...f, ...patch }));
+  };
+  const envNames = environmentFilterNames(environments, view.facets.environments, environment);
   const rows = useMemo(() => filterAdvisories(view.advisories, filter), [view.advisories, filter]);
   const shown = all ? rows : rows.slice(0, ROW_CAP);
   const stale = staleNote("cve", view.stale, now);
+  // "none" only from a scan that ran and read everything; otherwise "none found", in WATCH
+  const none = advisoriesEmptyLine(view);
 
   if (!view.scan) {
     return (
@@ -116,10 +127,10 @@ export function AdvisoriesPane({ view, now }: { view: LifecycleAdvisories; now: 
             <Toggle on={filter.kevOnly} onClick={() => set({ kevOnly: !filter.kevOnly })} title="in CISA's catalogue of vulnerabilities exploited in the wild">known exploited · {view.kev}</Toggle>
             <Toggle on={filter.newOnly} onClick={() => set({ newOnly: !filter.newOnly })} title="not in the previous scan">new · {view.new}</Toggle>
           </FilterGroup>
-          {view.facets.environments.length > 0 && (
+          {envNames.length > 0 && (
             <FilterGroup name="environment">
               <Toggle on={!filter.environment} onClick={() => set({ environment: null })}>all</Toggle>
-              {view.facets.environments.map((e) => (
+              {envNames.map((e) => (
                 <Toggle key={e} on={filter.environment === e} onClick={() => set({ environment: filter.environment === e ? null : e })}>{e}</Toggle>
               ))}
             </FilterGroup>
@@ -142,10 +153,12 @@ export function AdvisoriesPane({ view, now }: { view: LifecycleAdvisories; now: 
 
         {view.total === 0 ? (
           <div style={{ display: "flex", gap: 8, alignItems: "baseline", fontSize: 12 }}>
-            <Pill word="OK" /> <span>No known advisory affects anything in the inventory.</span>
+            <Pill word={none.word} /> <span>{none.text}</span>
           </div>
         ) : rows.length === 0 ? (
-          <div style={{ color: "var(--n-ink-muted)", fontSize: 12 }}>No advisory matches the filters.</div>
+          <div style={{ color: "var(--n-ink-muted)", fontSize: 12 }}>
+            No advisory matches the filters{filter.environment && !view.facets.environments.includes(filter.environment) ? ` — the scan names no advisory for ${filter.environment}. That is "none found by this scan", not proof the environment was scanned: see the Environments tab for what was read.` : "."}
+          </div>
         ) : (
           <div style={{ overflowX: "auto" }}>
             <table style={{ ...tableStyle, minWidth: 1040 }}>

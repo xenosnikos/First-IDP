@@ -212,20 +212,25 @@ export function checkIngestAuth(authorization: string | null | undefined, token:
   return { ok: true };
 }
 
-/** What a caller may do. One shared token (LIFECYCLE_DISPATCH_TOKEN unset) is
- * both; with the dispatcher's own token configured the two are separate
- * credentials and neither works for the other's job. */
+/** What a caller may do. The publisher's token (LIFECYCLE_INGEST_TOKEN) and the
+ * dispatcher's (LIFECYCLE_DISPATCH_TOKEN) are two separate credentials and
+ * neither works for the other's job. There is no shared-token mode: without
+ * the dispatcher's token NOBODY holds the dispatcher role. */
 export type IngestRole = "publisher" | "dispatcher";
 export type IngestWho = { ok: true; roles: ReadonlySet<IngestRole>; split: boolean } | Extract<IngestAuth, { ok: false }>;
 
-/** Who is calling. `dispatchToken` unset/empty → one shared credential with
- * both roles. Set → it must itself be a real secret (≥ 32 chars, different
- * from the publisher's); a misconfigured one is a 503 for everyone rather
- * than a silent fall back to the shared credential. */
+/** Who is calling. `dispatchToken` unset/empty → FAIL CLOSED for the dispatcher
+ * role: the publisher token still publishes plan/cve/source snapshots, but it
+ * can not claim or complete a request, and no smoke result is accepted from
+ * anyone (a dashboard that started before Secret `plo-dispatch-env` synced
+ * must not hand every PLO pod the power to answer a smoke request). `split`
+ * says whether the dispatcher's credential is configured. Set → it must itself
+ * be a real secret (≥ 32 chars, different from the publisher's); a
+ * misconfigured one is a 503 for everyone. */
 export function identifyIngestCaller(authorization: string | null | undefined, token: string | undefined, dispatchToken: string | undefined): IngestWho {
   const publisher = checkIngestAuth(authorization, token);
   if (!publisher.ok && publisher.status === 503) return publisher;
-  if (!dispatchToken) return publisher.ok ? { ok: true, roles: new Set<IngestRole>(["publisher", "dispatcher"]), split: false } : publisher;
+  if (!dispatchToken) return publisher.ok ? { ok: true, roles: new Set<IngestRole>(["publisher"]), split: false } : publisher;
   // (digests compared in constant time, like every other token comparison here)
   if (dispatchToken.length < MIN_TOKEN_CHARS || timingSafeEqual(sha256(dispatchToken), sha256(token ?? ""))) return { ok: false, status: 503, message: "lifecycle ingest is not configured on this Nebula" };
   if (publisher.ok) return { ok: true, roles: new Set<IngestRole>(["publisher"]), split: true };

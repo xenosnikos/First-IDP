@@ -26,10 +26,20 @@ case "$1 $2" in
   "ecr get-lifecycle-policy") echo '{"rules":[{"rulePriority":1,"description":"Keep last 30 plo-*","selection":{"tagStatus":"tagged","tagPrefixList":["plo-"],"countType":"imageCountMoreThan","countNumber":30},"action":{"type":"expire"}}]}' ;;
   "eks describe-access-entry") [ -f "$STUB/no-entry" ] && exit 254; cat "$STUB/entry-groups" 2>/dev/null || echo nebula-plo ;;
   "eks list-associated-access-policies") [ -f "$STUB/policies-denied" ] && { echo "AccessDenied" >&2; exit 254; }; cat "$STUB/policies" 2>/dev/null || true ;;
-  "secretsmanager describe-secret") [ -f "$(f "$(arg --secret-id "$@")")" ] || exit 254 ;;
-  "secretsmanager get-secret-value") cat "$(f "$(arg --secret-id "$@")")" ;;
+  # like AWS: a secret scheduled for deletion ($STUB/sm/<name>.json.deleting) still DESCRIBES (with DeletedDate)
+  # and no longer reads; a missing one is ResourceNotFoundException; $STUB/describe-denied lists names it refuses
+  "secretsmanager describe-secret")
+    n=$(arg --secret-id "$@")
+    if grep -qxF "$n" "$STUB/describe-denied" 2>/dev/null; then echo "An error occurred (AccessDeniedException) when calling the DescribeSecret operation: not authorized" >&2; exit 254; fi
+    if [ -f "$(f "$n").deleting" ]; then echo "{\"Name\":\"$n\",\"DeletedDate\":\"2026-11-26T10:00:00+00:00\"}"
+    elif [ -f "$(f "$n")" ]; then echo "{\"Name\":\"$n\"}"
+    else echo "An error occurred (ResourceNotFoundException) when calling the DescribeSecret operation: Secrets Manager can't find the specified secret." >&2; exit 254; fi ;;
+  "secretsmanager get-secret-value")
+    n=$(arg --secret-id "$@")
+    if [ -f "$(f "$n").deleting" ]; then echo "An error occurred (InvalidRequestException) when calling the GetSecretValue operation: You can't perform this operation on the secret because it was marked for deletion." >&2; exit 254; fi
+    cat "$(f "$n")" ;;
   "secretsmanager create-secret") n=$(arg --name "$@"); s=$(arg --secret-string "$@"); cp "${s#file://}" "$(f "$n")"; echo "write $n" >> "$STUB/writes"; echo "$n" ;;
-  "secretsmanager put-secret-value") n=$(arg --secret-id "$@"); s=$(arg --secret-string "$@"); cp "${s#file://}" "$(f "$n")"; echo "write $n" >> "$STUB/writes"; echo v2 ;;
+  "secretsmanager put-secret-value") n=$(arg --secret-id "$@"); [ -f "$(f "$n").deleting" ] && { echo "An error occurred (InvalidRequestException): marked for deletion" >&2; exit 254; }; s=$(arg --secret-string "$@"); cp "${s#file://}" "$(f "$n")"; echo "write $n" >> "$STUB/writes"; echo v2 ;;
   *) echo "stub aws: unexpected $*" >&2; exit 99 ;;
 esac
 STUB
@@ -151,6 +161,7 @@ check "the token is not in the output" bash -c '! grep -qF "$1" <<<"$2"' _ "$tok
 check "the token is never on a command line" bash -c '! grep -qF "$1" "$2"' _ "$tok" "$STUB/calls"
 check "the next steps restart the dashboard after the sync, with --kubeconfig" bash -c 'grep -n "wait --for=condition=Ready externalsecret/plo-env\|rollout restart deploy/dashboard" <<<"$1" | grep -c -- "--kubeconfig" | grep -qx 2' _ "$OUT"
 check "the next steps wait for BOTH secrets before the restart" grep -q "wait --for=condition=Ready externalsecret/plo-env externalsecret/plo-dispatch-env" <<<"$OUT"
+check "the next steps enable the parked ExternalSecrets before asking for a sync" bash -c '[ "$(grep -n "apps/nebula/disabled/plo-externalsecrets.yaml" <<<"$1" | head -n1 | cut -d: -f1)" -lt "$(grep -n "annotate externalsecret plo-env plo-dispatch-env force-sync" <<<"$1" | head -n1 | cut -d: -f1)" ]' _ "$OUT"
 : > "$STUB/writes"; secrets
 check "a second run writes nothing" test "$RC" = 0 -a ! -s "$STUB/writes"
 secrets --rotate
@@ -166,6 +177,28 @@ secrets --remove-legacy-copy
 check "--remove-legacy-copy removes that one key and keeps the others" test "$RC" = 0 -a "$(jq -c . "$STUB/sm/preview__nebula.json")" = '{"DATABASE_URL":"x"}'
 fresh; echo '{}' > "$STUB/sm/preview__plo.json"; secrets
 check "a legacy preview/plo stops the run before any write" test "$RC" != 0 -a ! -s "$STUB/writes"
+# the dashboard takes LIFECYCLE_DISPATCH_TOKEN from nebula-env (SM preview/nebula, readable by preview
+# pods) whenever Secret plo-dispatch-env is missing: a copy there is as bad as the ingest token's
+fresh; echo '{"DATABASE_URL":"x","LIFECYCLE_DISPATCH_TOKEN":"old"}' > "$STUB/sm/preview__nebula.json"; secrets
+check "a dispatch token in preview/nebula stops the run before any write" test "$RC" != 0 -a ! -s "$STUB/writes"
+check "and the key is named" grep -q "LIFECYCLE_DISPATCH_TOKEN" <<<"$OUT"
+fresh; echo '{"DATABASE_URL":"x","LIFECYCLE_DISPATCH_TOKEN":"old","LIFECYCLE_INGEST_TOKEN":"old2"}' > "$STUB/sm/preview__nebula.json"; secrets --remove-legacy-copy
+check "--remove-legacy-copy removes both token keys and keeps the others" test "$RC" = 0 -a "$(jq -c . "$STUB/sm/preview__nebula.json")" = '{"DATABASE_URL":"x"}'
+check "the old values are not printed" bash -c '! grep -q "old" <<<"$1"' _ "$(grep -v "falls back\|readable by preview pods" <<<"$OUT")"
+
+# pass 3 #7: the script's own advice is `delete-secret --recovery-window-in-days 7`; for those seven days AWS still
+# DESCRIBES the secret (with DeletedDate) while nobody can read it any more
+fresh; echo '{"DATABASE_URL":"x"}' > "$STUB/sm/preview__nebula.json"; touch "$STUB/sm/preview__plo.json.deleting"; secrets
+check "a legacy preview/plo that is scheduled for deletion does not block the run" test "$RC" = 0 -a "$(cat "$STUB/writes")" = "write nebula/plo"
+check "and it is said" grep -q "preview/plo is scheduled for deletion" <<<"$OUT"
+fresh; echo '{}' > "$STUB/sm/nebula__plo.json"; touch "$STUB/sm/nebula__plo.json.deleting"; secrets
+check "nebula/plo itself scheduled for deletion is refused with what to do, before any write" bash -c '[ "$1" != 0 ] && [ ! -s "$3" ] && grep -q "nebula/plo is scheduled for deletion" <<<"$2" && grep -q "restore-secret" <<<"$2"' _ "$RC" "$OUT" "$STUB/writes"
+# …and "could not check" is never "not there": a legacy copy that cannot be looked at stops the run
+fresh; echo '{"DATABASE_URL":"x","LIFECYCLE_INGEST_TOKEN":"old"}' > "$STUB/sm/preview__nebula.json"; echo preview/nebula > "$STUB/describe-denied"; secrets
+check "a legacy secret that cannot be described stops the run before any write" test "$RC" != 0 -a ! -s "$STUB/writes"
+check "and the AWS error is named, not swallowed" grep -q "could not check whether preview/nebula exists.*AccessDeniedException" <<<"$OUT"
+fresh; echo preview/plo > "$STUB/describe-denied"; secrets
+check "the same for preview/plo" test "$RC" != 0 -a ! -s "$STUB/writes"
 
 echo "── nebula-set-plo-source-token.sh"
 GOOD=github_pat_$(printf 'A%.0s' {1..40})
@@ -187,12 +220,22 @@ fresh; gh_ok; echo "x-oauth-scopes: repo, workflow" > "$STUB/gh-headers"; token 
 check "a token that announces OAuth scopes is refused" test "$RC" != 0 -a ! -s "$STUB/writes"
 fresh; gh_ok; echo -e '200\n{"private":true,"permissions":{"push":true}}' > "$STUB/gh/__repos__TwizzyNicky__twizz-gitops"; token "$GOOD"
 check "a token that can see twizz-gitops is refused" test "$RC" != 0 -a ! -s "$STUB/writes"
+fresh; gh_ok; echo -e '200\n{"private":false,"permissions":{"push":false,"pull":true}}' > "$STUB/gh/__repos__xenosnikos__First-IDP"; token "$GOOD"
+check "a public repository the token cannot push to does not block the token" test "$RC" = 0 -a -s "$STUB/writes"
+fresh; gh_ok; echo -e '200\n{"private":false,"permissions":{"push":true}}' > "$STUB/gh/__repos__xenosnikos__First-IDP"; token "$GOOD"
+check "a public repository the token CAN push to is refused" test "$RC" != 0 -a ! -s "$STUB/writes"
+fresh; gh_ok; echo -e '200\n{"permissions":{"push":false}}' > "$STUB/gh/__repos__xenosnikos__First-IDP"; token "$GOOD"
+check "an answer that does not say the repository is public is refused" test "$RC" != 0 -a ! -s "$STUB/writes"
 fresh; gh_ok; echo -e '500\n{}' > "$STUB/gh/__repos__TwizzyNicky__twizz-gitops"; token "$GOOD"
 check "an unclear answer about twizz-gitops is refused (not assumed safe)" test "$RC" != 0 -a ! -s "$STUB/writes"
 fresh; gh_ok; echo -e '200\n{"private":true,"permissions":{"push":true,"admin":true}}' > "$STUB/gh/__repos__twizz-app__frontend"; token "$GOOD"
 check "a token of a repository admin is refused" test "$RC" != 0 -a ! -s "$STUB/writes"
 fresh; gh_ok; rm "$STUB/gh/__repos__twizz-app__frontend"; token "$GOOD"
 check "a token that lacks one of the six repositories is refused" test "$RC" != 0 -a ! -s "$STUB/writes"
+fresh; gh_ok; touch "$STUB/sm/nebula__plo-source-github.json.deleting"; token "$GOOD"
+check "a token secret that is scheduled for deletion is refused with what to do" bash -c '[ "$1" != 0 ] && [ ! -s "$3" ] && grep -q "nebula/plo-source-github is scheduled for deletion" <<<"$2"' _ "$RC" "$OUT" "$STUB/writes"
+fresh; gh_ok; echo nebula/plo-source-github > "$STUB/describe-denied"; token "$GOOD"
+check "a token secret that cannot be described is not assumed missing" bash -c '[ "$1" != 0 ] && [ ! -s "$3" ] && grep -q "could not check whether nebula/plo-source-github exists" <<<"$2"' _ "$RC" "$OUT" "$STUB/writes"
 fresh; gh_ok; run bash "$HERE/scripts/nebula-set-plo-source-token.sh" "$GOOD"
 check "a token on the command line is a usage error" test "$RC" = 2 -a ! -s "$STUB/writes"
 

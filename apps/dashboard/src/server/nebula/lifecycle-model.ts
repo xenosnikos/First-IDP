@@ -10,6 +10,7 @@
 import {
   LIFECYCLE_BUNDLE_KEY_RE,
   LIFECYCLE_COMPONENT_STATUSES,
+  LIFECYCLE_SMOKE_SCOPES,
   LIFECYCLE_TIERS,
   LifecycleSmokeParams,
   type LifecycleAdvisory,
@@ -207,8 +208,27 @@ export type RequestRow = {
 
 const newestFirst = <T extends { createdAt: Date; id: string }>(a: T, b: T) => b.createdAt.getTime() - a.createdAt.getTime() || (a.id < b.id ? 1 : a.id > b.id ? -1 : 0);
 
-/** how many smoke snapshots the views look back over */
+/** how many smoke snapshots the views look back over (both scopes together). The gates do not depend on it: the
+ * result bound to the latest smoke request of the open bundle is loaded by its run id (`boundSmokeRunIds`). */
 export const SMOKE_LOOKBACK = 30;
+
+/** Run ids of the results the latest preview and stg smoke request for `bundleKey` were answered with — the
+ * snapshots `smokeVerdict` will look for, wherever they are in the table. */
+export function boundSmokeRunIds(requests: readonly RequestRow[], bundleKey: string | null): string[] {
+  if (!bundleKey) return [];
+  const out: string[] = [];
+  for (const scope of LIFECYCLE_SMOKE_SCOPES) {
+    const latest = requests
+      .filter((r) => {
+        if (r.kind !== "smoke") return false;
+        const p = LifecycleSmokeParams.safeParse(r.params);
+        return p.success && p.data.scope === scope && p.data.bundleKey === bundleKey;
+      })
+      .sort(newestFirst)[0];
+    if (latest?.runId) out.push(latest.runId);
+  }
+  return out;
+}
 
 export type SnapshotPick<T extends SnapshotMeta> = {
   /** newest run of the job, failed or not */
@@ -473,7 +493,12 @@ export function advisoriesByComponent(advisories: readonly LifecycleAdvisory[], 
  * whatever id it names. PLO's publisher enforces the same on its side (src/nebula/rundir.ts). */
 export const SOURCE_RUN_TIERS: readonly LifecycleTier[] = ["base-images", "npm-direct", "npm-transitive"];
 
-/** plan + source components by id; when both runs report one, the newer run wins */
+/** Order in which a plan and a source run are laid over each other (the LAST one wins): the newer run over the
+ * older one — but a FAILED run never over a successful one. A failed source run has read only part of the
+ * repositories (or nothing); letting it replace what a good plan run read would blank or falsify those rows. */
+export const weakerRunFirst = (a: Pick<SnapshotMeta, "ok" | "finishedAt">, b: Pick<SnapshotMeta, "ok" | "finishedAt">): number => Number(a.ok) - Number(b.ok) || a.finishedAt.getTime() - b.finishedAt.getTime();
+
+/** plan + source components by id; when both runs report one, the newer run wins (a failed run never over a successful one) */
 export function mergeComponents(plan: SnapshotRow | null, source: SnapshotRow | null): Array<LifecycleComponent & { snapshot: "plan" | "source" }> {
   const out = new Map<string, LifecycleComponent & { snapshot: "plan" | "source" }>();
   const ordered = [
@@ -481,8 +506,8 @@ export function mergeComponents(plan: SnapshotRow | null, source: SnapshotRow | 
     { row: source, snapshot: "source" as const },
   ]
     .filter((x): x is { row: SnapshotRow; snapshot: "plan" | "source" } => !!x.row)
-    // older first, so the newer run overwrites
-    .sort((a, b) => a.row.finishedAt.getTime() - b.row.finishedAt.getTime());
+    // weaker first, so the run that speaks for a row overwrites
+    .sort((a, b) => weakerRunFirst(a.row, b.row));
   for (const { row, snapshot } of ordered) {
     for (const c of row.data.components ?? []) {
       if (snapshot === "source" && !SOURCE_RUN_TIERS.includes(c.tier)) continue;
@@ -536,7 +561,10 @@ export type AdvisoriesView = {
   scan: { runId: string; finishedAt: string; ok: boolean } | null;
   /** the run "new" is measured against; null: nothing to compare with */
   comparedTo: { runId: string; finishedAt: string } | null;
+  /** WATCH also when a newer scan failed (`lastFailed`): the scan shown is then not the latest attempt */
   stale: Staleness;
+  /** a NEWER cve run that failed: the scan shown is from before it, and what changed since is not known */
+  lastFailed: { runId: string; finishedAt: string; error: string | null } | null;
   total: number;
   counts: Record<LifecycleSeverity, number>;
   kev: number;
@@ -579,10 +607,19 @@ export function buildAdvisories(sel: SnapshotSelection<SnapshotRow>, now: Date):
       }),
     };
   });
+  // A newer run that failed: yesterday's clean scan is not today's. The age of the data may still be within the
+  // limit, but "fresh" would be a claim about a scan that did not happen (the rule of `fixedEnvironment`).
+  const failedNewer = scan && sel.cve.last && sel.cve.last.id !== scan.id ? sel.cve.last : null;
+  const stale = staleness("cve", scan, now);
+  if (failedNewer && stale.word === "OK") {
+    stale.word = "WATCH";
+    stale.detail = `the latest cve run (${failedNewer.runId}) failed${failedNewer.data.error ? `: ${failedNewer.data.error}` : ""}; showing run ${scan!.runId} from before it`;
+  }
   return {
     scan: scan ? { runId: scan.runId, finishedAt: scan.finishedAt.toISOString(), ok: scan.ok } : null,
     comparedTo: prev ? { runId: prev.runId, finishedAt: prev.finishedAt.toISOString() } : null,
-    stale: staleness("cve", scan, now),
+    stale,
+    lastFailed: failedNewer ? { runId: failedNewer.runId, finishedAt: failedNewer.finishedAt.toISOString(), error: failedNewer.data.error ?? null } : null,
     total: advisories.length,
     counts,
     kev: advisories.filter((a) => a.kev).length,
@@ -758,6 +795,10 @@ export type PreviewEnvInput = {
   buildReason: string | null;
   /** Argo verdict of Application `env-<name>` (lib/nebula/status `argoWord`); null when not read */
   argo: StatusWord | null;
+  /** Argo was ASKED about this env and could not be read (unreachable, or its Application was not looked up).
+   * Never true for an env that is still building: it has no Application to read, so nothing went unread.
+   * `argo` alone cannot say this — an unreachable Argo is the word UNKNOWN, a building env is null. */
+  argoUnread: boolean;
   /** Argo reports the env's pods on exactly `imageTag` (`argoRunsImage`); false when it reports
    * another image, no image, or was not read. Synced + Healthy alone is NOT this: right after a
    * manifest changes, Argo still says Synced + Healthy about the image it deployed before. */
@@ -834,6 +875,33 @@ export function parseSignoffAudit(row: { action: string; actor: string; allowed:
   return { bundleKey: key, actor: row.actor, at: row.createdAt };
 }
 
+/** One audited write to a named env: which env, which gate action, when the row was written. */
+export type EnvChangeInput = { envName: string; action: string; at: Date };
+
+/** The gate tools that change what a named env IS or runs. Teardown and extend are not among them: an env that
+ * is gone is judged as gone, and a longer TTL changes nothing that runs. */
+export const ENV_CHANGE_TOOLS = ["create_named_env", "create_env_from_repo", "rebuild_env", "set_env_vars", "clone_staging_db", "lifecycle_create_preview"] as const;
+/** both gate prefixes: the dashboard's (`nebula.`) and the stdio MCP server's default (`mcp.`) */
+export const ENV_CHANGE_AUDIT_ACTIONS: readonly string[] = ENV_CHANGE_TOOLS.flatMap((t) => [`nebula.${t}`, `mcp.${t}`]);
+
+/** An AuditLog row of one of `ENV_CHANGE_AUDIT_ACTIONS` → the `plo-*` envs it touched. The gate writes its
+ * fields as JSON into `resource`: `name` for the named-env tools, `envs` (space-joined) for
+ * `lifecycle_create_preview`. A row whose action THREW counts too (allowed=true, detail.error): it may have
+ * changed the env before it failed. A denial (allowed=false) changed nothing. */
+export function parseEnvChangeAudit(row: { action: string; allowed: boolean; resource: string | null; createdAt: Date }): EnvChangeInput[] {
+  if (!row.allowed || !ENV_CHANGE_AUDIT_ACTIONS.includes(row.action) || !row.resource) return [];
+  let fields: unknown;
+  try {
+    fields = JSON.parse(row.resource);
+  } catch {
+    return [];
+  }
+  if (!fields || typeof fields !== "object") return [];
+  const f = fields as { name?: unknown; envs?: unknown };
+  const names = [...(typeof f.name === "string" ? [f.name] : []), ...(typeof f.envs === "string" ? f.envs.split(/\s+/) : [])];
+  return [...new Set(names)].filter((n) => n.startsWith(PLO_ENV_PREFIX)).map((envName) => ({ envName, action: row.action, at: row.createdAt }));
+}
+
 export type PreviewInput = {
   /** snapshots with payload: at least what `neededSnapshotIds` asks for */
   rows: readonly SnapshotRow[];
@@ -846,6 +914,10 @@ export type PreviewInput = {
   /** null: staging state could not be read */
   staging: readonly StagingTargetInput[] | null;
   signoffs: readonly SignoffInput[];
+  /** Audited Nebula writes that changed (or tried to change) a `plo-*` env since the latest preview smoke of the
+   * bundle was requested (`parseEnvChangeAudit`). null: the audit log could not be read — then no preview pass
+   * can be tied to its env (fail closed). */
+  envChanges: readonly EnvChangeInput[] | null;
   now: Date;
   /** sub-source failures, shown verbatim (`envs: …`, `promotions: …`) */
   sourceErrors?: readonly string[];
@@ -860,6 +932,13 @@ export type SmokeVerdict = {
   runId: string | null;
   finishedAt: string | null;
   results: Array<{ name: string; url: string; ok: boolean; status: number | null; ms: number; detail: string }>;
+  /** The result is the request's own: the one bound run, for this scope and bundle, received between claim and
+   * completion, every row is a check (or a refusal) of one of the request's targets, and the smoke job itself
+   * finished (`ok`). Only then is a single row of it worth reading on its own; false whenever there is no result. */
+  trusted: boolean;
+  /** Set by `buildPreview` on a PASS that is no longer evidence about what runs now (rolled out after the smoke
+   * was requested, or the rollout time is unknown). A stale pass opens no gate and must not be shown as a pass. */
+  stale: string | null;
 };
 
 /** The verdict for (scope, bundleKey) is that of the LATEST request for it:
@@ -876,7 +955,7 @@ export type SmokeVerdict = {
  * every check passed (at least one) and every check is one of the request's
  * own targets. A later snapshot can therefore never change this verdict. */
 export function smokeVerdict(scope: LifecycleSmokeScope, bundleKey: string, requests: readonly RequestRow[], smokeRows: readonly SnapshotRow[]): SmokeVerdict {
-  const none = { runId: null, finishedAt: null, results: [] };
+  const none = { runId: null, finishedAt: null, results: [], trusted: false, stale: null };
   const mine = requests
     .filter((r) => {
       if (r.kind !== "smoke") return false;
@@ -895,17 +974,24 @@ export function smokeVerdict(scope: LifecycleSmokeScope, bundleKey: string, requ
   const snap = smokeRows.find((s) => s.job === "smoke" && s.runId === req.runId && s.data.requestId === req.id && !!s.data.smoke);
   if (!snap || !snap.data.smoke) return { verdict: "fail", detail: "the request completed but no smoke result was received for it", request, ...none };
   const smoke = snap.data.smoke;
-  const got = { runId: snap.runId, finishedAt: snap.finishedAt.toISOString(), results: smoke.results };
-  if (smoke.scope !== scope || smoke.bundleKey !== bundleKey) return { verdict: "fail", detail: "the result received is for a different scope or bundle", request, ...got };
+  const unbound = { runId: snap.runId, finishedAt: snap.finishedAt.toISOString(), results: smoke.results, trusted: false, stale: null };
+  if (smoke.scope !== scope || smoke.bundleKey !== bundleKey) return { verdict: "fail", detail: "the result received is for a different scope or bundle", request, ...unbound };
   // received = the server's own clock at ingest (createdAt), never the run's self-reported times
   const received = snap.createdAt.getTime();
-  if (!req.claimedAt || received < req.claimedAt.getTime()) return { verdict: "fail", detail: "the result received predates the request it claims to answer", request, ...got };
-  if (!req.finishedAt || received > req.finishedAt.getTime()) return { verdict: "fail", detail: "the result was received after the request had been completed", request, ...got };
+  if (!req.claimedAt || received < req.claimedAt.getTime()) return { verdict: "fail", detail: "the result received predates the request it claims to answer", request, ...unbound };
+  if (!req.finishedAt || received > req.finishedAt.getTime()) return { verdict: "fail", detail: "the result was received after the request had been completed", request, ...unbound };
   const params = LifecycleSmokeParams.safeParse(req.params);
   const targets = params.success ? params.data.targets : [];
   const foreign = smoke.results.filter((r) => !targets.some((t) => r.name.startsWith(`${t.name}/`) && r.url.startsWith(`${t.baseUrl}/`)));
-  if (foreign.length && smoke.results.every((r) => r.ok)) return { verdict: "fail", detail: `${foreign.length} of ${smoke.results.length} checks are not checks of the requested targets`, request, ...got };
-  if (!snap.ok) return { verdict: "fail", detail: snap.data.error ? `the smoke run failed: ${snap.data.error}` : "the smoke run reported a failure", request, ...got };
+  if (foreign.length && smoke.results.every((r) => r.ok)) return { verdict: "fail", detail: `${foreign.length} of ${smoke.results.length} checks are not checks of the requested targets`, request, ...unbound };
+  // PLO reports a target it refused (or has no check for) as ONE failed row named after the target itself.
+  // Any other row that is not a check of a requested target makes the whole result one nobody asked for.
+  const stray = foreign.filter((r) => !(targets.some((t) => r.name === t.name) && !r.ok));
+  // `ok: false` is PLO saying the JOB failed (aborted, refused, nothing could be run) — not that a check failed, which
+  // it reports as a row of a run that is `ok`. Whatever rows a failed job got out, none is read on its own: no
+  // service gets a PASS from a run that did not finish.
+  if (!snap.ok) return { verdict: "fail", detail: snap.data.error ? `the smoke run failed: ${snap.data.error}` : "the smoke run reported a failure", request, ...unbound };
+  const got = { ...unbound, trusted: stray.length === 0 };
   if (smoke.results.length === 0) return { verdict: "fail", detail: "the smoke run checked nothing", request, ...got };
   const failed = smoke.results.filter((r) => !r.ok);
   if (failed.length) return { verdict: "fail", detail: `${failed.length} of ${smoke.results.length} checks failed`, request, ...got };
@@ -1020,7 +1106,10 @@ export function bundleTargets(bundles: readonly LifecycleBundle[], services: rea
  * Everything is keyed by the current `bundleKey` (a hash of every bundled
  * repo's head sha): a new bundle starts again from bundle-ready, and no
  * evidence carries over. The furthest state the EVIDENCE supports wins, so a
- * preview env that has since expired does not undo a recorded smoke pass.
+ * preview env that is GONE (torn down or reaped) does not undo a recorded smoke
+ * pass — unless Nebula's audit log shows the env was changed after that smoke
+ * was requested, or a manifest of its name is still there (expired but not
+ * reaped, or not the bundle's): then the pass cannot be tied to it.
  * Anything that could not be read is treated as "not there" (fail closed) and
  * listed in `blockers`. `smoke-stg-pass` is reported as `awaiting-signoff` —
  * a passed staging smoke is exactly what makes the sign-off available. */
@@ -1029,19 +1118,27 @@ export function buildPreview(input: PreviewInput): PreviewView {
   const src = sel.source.data;
   const key = src?.data.bundleKey ?? null;
   const blockers: string[] = [...(input.sourceErrors ?? [])];
-  const emptySmoke: SmokeVerdict = { verdict: "none", detail: "not requested yet", request: null, runId: null, finishedAt: null, results: [] };
+  const emptySmoke: SmokeVerdict = { verdict: "none", detail: "not requested yet", request: null, runId: null, finishedAt: null, results: [], trusted: false, stale: null };
   const sourceRun = src ? { runId: src.runId, finishedAt: src.finishedAt.toISOString(), ok: src.ok } : null;
   const nowMs = input.now.getTime();
 
   const targets = bundleTargets(src?.data.bundles ?? [], input.services);
   const notMine: string[] = [];
+  /** env name → why a manifest of that name exists but is NOT the bundle's preview env. Such an env is neither
+   * "the env" nor "gone": a recorded smoke pass cannot be tied to it, and it must never read as expired. */
+  const ghosts = new Map<string, string>();
   const bundles = targets.map((t): BundleView => {
     const { bundle, service } = t;
     // The bundle's preview env is ONE env, by its exact deterministic name. Whatever else carries
     // that name — built from another commit or branch, for another service, or created by someone
     // who is not an operator — is not adopted: it is named as a blocker and the flow stops there.
     let env: PreviewEnvInput | null = null;
-    for (const e of (input.envs ?? []).filter((x) => t.previewable && !!t.envName && x.name === t.envName && !(Date.parse(x.expiresAt) <= nowMs))) {
+    for (const e of (input.envs ?? []).filter((x) => t.previewable && !!t.envName && x.name === t.envName)) {
+      // past its TTL: not adopted, and — while the reaper has not removed it — not "gone" either (see `ghosts`)
+      if (Date.parse(e.expiresAt) <= nowMs) {
+        ghosts.set(e.name, `${e.name} has expired but is still there, so the preview smoke cannot be tied to what it runs — tear it down on /environments (or wait for the reaper)`);
+        continue;
+      }
       const why = !e.sourceRepo || !sameRepo(e.sourceRepo, bundle.github)
         ? "it is not built from this repository"
         : e.sourceSha !== bundle.headSha
@@ -1053,8 +1150,11 @@ export function buildPreview(input: PreviewInput): PreviewView {
               : !e.trusted
                 ? `it was created by ${e.owner}, who is not a Nebula operator`
                 : null;
-      if (why) notMine.push(`${e.name} exists but is not this bundle's preview (${why}) — tear it down on /environments, then create the preview`);
-      else env = e;
+      if (why) {
+        const said = `${e.name} exists but is not this bundle's preview (${why}) — tear it down on /environments, then create the preview`;
+        notMine.push(said);
+        ghosts.set(e.name, said);
+      } else env = e;
     }
     const expectedTag = t.envName && bundle.headSha ? bundleImageTag(t.envName, bundle.headSha) : null;
     const promotable = !!service?.promotable && t.previewable;
@@ -1117,7 +1217,10 @@ export function buildPreview(input: PreviewInput): PreviewView {
   const expected = bundles.filter((b) => b.previewable);
   const promotable = expected.filter((b) => b.promotable);
   const hasStagingRoute = promotable.length > 0;
-  const smoke = { preview: smokeVerdict("preview", key, input.requests, sel.smoke), stg: smokeVerdict("stg", key, input.requests, sel.smoke) };
+  // every smoke row the reader loaded, not the views' window (`SMOKE_LOOKBACK`): the result a request is bound to is
+  // looked up by that request's own run id, and must not vanish because thirty other smoke runs came after it
+  const smokeRows = input.rows.filter((r) => r.job === "smoke");
+  const smoke = { preview: smokeVerdict("preview", key, input.requests, smokeRows), stg: smokeVerdict("stg", key, input.requests, smokeRows) };
 
   const conflicts = bundles.reduce((n, b) => n + b.conflicts.length, 0);
   if (conflicts) blockers.push(`${conflicts} pull request${conflicts === 1 ? "" : "s"} could not be merged into the bundle (conflicts)`);
@@ -1153,18 +1256,42 @@ export function buildPreview(input: PreviewInput): PreviewView {
   const signoff = signed ? { by: signed.actor, at: signed.at.toISOString() } : null;
 
   // A pass is evidence about what runs NOW only when it was requested after that last rolled out.
-  // Unknown rollout time = not evidence (fail closed). A preview env that has since expired keeps
-  // its recorded pass: the request was made by Nebula for exactly this bundle key.
+  // Unknown rollout time = not evidence (fail closed).
   const requestedAt = (v: SmokeVerdict) => (v.request ? Date.parse(v.request.createdAt) : NaN);
   const after = (v: SmokeVerdict, rolledOutAt: string | null) => {
     const r = rolledOutAt ? Date.parse(rolledOutAt) : NaN;
     return Number.isFinite(r) && Number.isFinite(requestedAt(v)) && requestedAt(v) > r;
   };
-  const previewStale = smoke.preview.verdict === "pass" ? expected.filter((b) => b.env && !after(smoke.preview, b.env.rolledOutAt)) : [];
   const stgStale = smoke.stg.verdict === "pass" ? promotable.filter((b) => !after(smoke.stg, b.staging?.rolledOutAt ?? null)) : [];
   const stale = (label: string, env: string, at: string | null) => (at ? `${env} rolled out at ${at}, after the ${label} smoke was requested — run the ${label} smoke again` : `Argo does not say when ${env} rolled out, so the ${label} smoke cannot be tied to what runs now — run the ${label} smoke again`);
-  const previewStaleWhy = previewStale.length ? stale("preview", previewStale[0].env!.name, previewStale[0].env!.rolledOutAt) : null;
+  // The preview pass is evidence only while it can be TIED to each env it was run against. An env that is gone
+  // (torn down, or reaped after its TTL) keeps its recorded pass — but "gone" is a claim that must hold: the
+  // manifests were read, nothing of that name is left, and Nebula's own audit log shows no change to that env
+  // since the smoke was requested. Otherwise a pass refused as stale would become good again by removing the
+  // env it was stale against.
+  const previewStaleWhy = ((): string | null => {
+    if (smoke.preview.verdict !== "pass") return null;
+    if (input.envs === null) return "the named-env manifests could not be read, so the preview smoke cannot be tied to what the preview envs run — it opens no gate until they can be read";
+    const requested = requestedAt(smoke.preview);
+    for (const b of expected) {
+      const name = b.envName!;
+      if (b.env) {
+        if (!after(smoke.preview, b.env.rolledOutAt)) return stale("preview", b.env.name, b.env.rolledOutAt);
+      } else if (ghosts.has(name)) return ghosts.get(name)!;
+      if (input.envChanges === null) return `the audit log could not be read, so it is not known whether ${name} was changed after the preview smoke was requested — the smoke opens no gate until it can be read`;
+      // not "at or before the request" (a missing request time compares false: refused)
+      const later = input.envChanges.filter((c) => c.envName === name && !(c.at.getTime() <= requested)).sort((x, y) => x.at.getTime() - y.at.getTime())[0];
+      if (later) {
+        const what = `${name} was changed in Nebula (${later.action} at ${later.at.toISOString()}) after the preview smoke was requested`;
+        return b.env ? `${what} — run the preview smoke again` : `${what} and is gone now — create the preview and run the preview smoke again`;
+      }
+    }
+    return null;
+  })();
   const stgStaleWhy = stgStale.length ? stale("staging", `${stgStale[0].service} staging`, stgStale[0].staging?.rolledOutAt ?? null) : null;
+  // the views read the verdict too (Environments pane, lifecycle_overview): a stale pass travels with its reason
+  smoke.preview = { ...smoke.preview, stale: previewStaleWhy };
+  smoke.stg = { ...smoke.stg, stale: stgStaleWhy };
   if (previewStaleWhy) blockers.push(previewStaleWhy);
   if (stgStaleWhy && stgDeployed) blockers.push(stgStaleWhy);
 
@@ -1216,9 +1343,21 @@ export function buildPreview(input: PreviewInput): PreviewView {
   const nothing = expected.length === 0 ? no("no bundled repository maps to a Nebula service") : null;
   const noTagFor = promotable.filter((b) => !b.staging?.deployed && !b.staging?.promotion && !(b.env?.build === "ready" && b.env.imageTag));
   const toPromote = promotable.filter((b) => !b.staging?.deployed && !b.staging?.promotion);
+  const undated = expected.filter((b) => b.env && !Number.isFinite(Date.parse(b.env.rolledOutAt ?? "")));
   const actions: PreviewView["actions"] = {
     createPreview: closed ?? envsUnknown ?? nothing ?? (missing.length === 0 ? no("every bundled service already has a preview env for this bundle") : yes),
-    smokePreview: closed ?? envsUnknown ?? nothing ?? (!previewUp ? no("the preview envs are not all up yet") : smoke.preview.verdict === "running" ? no("a preview smoke run is already in flight") : yes),
+    smokePreview:
+      closed ??
+      envsUnknown ??
+      nothing ??
+      (!previewUp
+        ? no("the preview envs are not all up yet")
+        : smoke.preview.verdict === "running"
+          ? no("a preview smoke run is already in flight")
+          : // a smoke counts only when it was requested after the env's last rollout: without that time it could never count
+            undated.length
+            ? no(`Argo does not say when ${undated[0].env!.name} rolled out, so a smoke run now could not be tied to what it runs — wait for Argo to finish a sync of it`)
+            : yes),
     deployStg:
       closed ??
       (!hasStagingRoute

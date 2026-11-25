@@ -549,6 +549,32 @@ describe("lifecycle (docs/NEBULA.md §N9): two reads, no writes", () => {
     expect(bad.isError).toBe(true);
   });
 
+  it("lifecycle_overview carries the per-environment summary untouched, with or without a tier, and says so", async () => {
+    const environments = {
+      ok: {
+        observed: 2,
+        fixed: 3,
+        notes: [],
+        environments: [
+          { name: "nonprod", kind: "fixed", word: "OK", observation: { state: "observed", reasons: [], lastObserved: { at: "t", job: "plan", runId: "p1" } } },
+          { name: "staging", kind: "fixed", word: "PENDING", observation: { state: "observed", reasons: [], lastObserved: { at: "t", job: "plan", runId: "p1" } } },
+          { name: "prod", kind: "fixed", word: "UNKNOWN", observation: { state: "not-observed", reasons: ["EKS-Moly-Prod was not read"], lastObserved: null } },
+        ],
+      },
+    };
+    const { caller } = fakeCaller({ "lifecycle.overview": { at: "t", data: { ok: { header: {}, tiers: [{ tier: "helm", label: "Helm", total: 1, components: [{ id: "a" }] }] } }, bundle: { ok: { state: "no-bundle" } }, environments } });
+    const client = await connect({ caller });
+    const plain = JSON.parse(textOf(await client.callTool({ name: "lifecycle_overview", arguments: {} })));
+    expect(plain.environments).toEqual(environments);
+    const withTier = JSON.parse(textOf(await client.callTool({ name: "lifecycle_overview", arguments: { tier: "helm" } })));
+    expect(withTier.environments).toEqual(environments);
+    // an unread environment reaches the agent as UNKNOWN with its reason — never dropped, never defaulted
+    expect(withTier.environments.ok.environments.find((e: { name: string }) => e.name === "prod")).toMatchObject({ word: "UNKNOWN", observation: { state: "not-observed" } });
+    const tool = (await client.listTools()).tools.find((t) => t.name === "lifecycle_overview")!;
+    expect(tool.description).toMatch(/for EACH environment/);
+    expect(tool.description).toMatch(/not observed is UNKNOWN, never OK/);
+  });
+
   it("lifecycle_advisories is a CVE lookup: by id, alias or package, by severity, KEV, new, environment — totals stay whole-scan", async () => {
     const { caller, calls } = fakeCaller({ "lifecycle.advisories": advisories });
     const client = await connect({ caller });

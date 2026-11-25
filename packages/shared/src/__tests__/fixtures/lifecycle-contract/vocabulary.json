@@ -85,6 +85,7 @@
     "bundles",
     "changeSets",
     "components",
+    "coverage",
     "discoveryErrors",
     "error",
     "finishedAt",
@@ -116,5 +117,31 @@
     "status",
     "target",
     "tier"
+  ],
+  "coverageStates": [
+    "observed",
+    "partial",
+    "not-observed",
+    "not-applicable"
+  ],
+  "environments": [
+    {
+      "name": "nonprod",
+      "clusters": [
+        "EKS-Twizz-NonProd"
+      ]
+    },
+    {
+      "name": "staging",
+      "clusters": [
+        "EKS-Moly-staging"
+      ]
+    },
+    {
+      "name": "prod",
+      "clusters": [
+        "EKS-Moly-Prod"
+      ]
+    }
   ]
 }

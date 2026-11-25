@@ -3,10 +3,21 @@ import { Ext } from "@/components/lifecycle/parts";
 import { describe, expect, it } from "vitest";
 import { STATUS_WORDS, toneOf } from "../status";
 import { buildAdvisories, buildOverview, buildPreview, selectSnapshots, type LifecycleServiceInput, type PreviewInput, type StagingTargetInput } from "@/server/nebula/lifecycle-model";
+import { buildEnvironments } from "@/server/nebula/lifecycle-environments";
+import { LIFECYCLE_ENVIRONMENTS, LIFECYCLE_TIERS, type LifecycleEnvironmentCoverage } from "@twizz-idp/shared";
 import { DAY, HOUR, KEY, NOW, SHA_BACKEND, SHA_SENTINEL, advisory, affects, ago, bundle, component, env, pr, request, smokeRequest, smokeSnap, snap } from "@/server/nebula/__tests__/lifecycle-fixtures";
 import {
   DEFAULT_ADVISORY_FILTER,
   DEFAULT_COMPONENT_FILTER,
+  COVERAGE_TEXT,
+  OBSERVATION_TEXT,
+  defaultEnvironment,
+  envAdvisoriesLine,
+  envCountsLine,
+  envSeverityWord,
+  environmentFilterNames,
+  environmentsTile,
+  observationLine,
   LIFECYCLE_TABS,
   PREVIEW_STATE_LABEL,
   SEVERITIES,
@@ -30,6 +41,8 @@ import {
   fmtUtcStamp,
   hasAnySnapshot,
   headerTiles,
+  advisoriesEmptyLine,
+  smokePill,
   isProdEnv,
   needsAttention,
   nextAction,
@@ -88,7 +101,7 @@ const allRows = (o: ReturnType<typeof overviewOf>): ComponentRow[] => o.tiers.fl
 const source = () => snap("source", ago(DAY), { runId: "source-1", bundles: [bundle(SENTINEL, SHA_SENTINEL), bundle(BACKEND, SHA_BACKEND)], bundleKey: KEY });
 const stagingOn = (tag: string | null): StagingTargetInput[] => [{ service: "twizz-sentinel", host: "sentinel-stg.prv.twizz.com", currentTag: tag, argo: "PASS", runsImage: true, rolledOutAt: ago(3 * 3_600_000).toISOString(), error: null }];
 function previewOf(over: Partial<PreviewInput> = {}): LifecyclePreview {
-  return buildPreview({ rows: [source()], requests: [], services: SERVICES, envs: [], promotions: [], staging: stagingOn("main-" + "1".repeat(40)), signoffs: [], now: NOW, ...over });
+  return buildPreview({ rows: [source()], requests: [], services: SERVICES, envs: [], promotions: [], staging: stagingOn("main-" + "1".repeat(40)), signoffs: [], envChanges: [], now: NOW, ...over });
 }
 const envsUp = () => [env(ENV_S, SENTINEL, SHA_SENTINEL), env(ENV_B, BACKEND, SHA_BACKEND)];
 function smoked(scope: "preview" | "stg", ok: boolean, minutesAgo = 10) {
@@ -190,7 +203,7 @@ describe("words", () => {
     expect(currentStepWord({ key: "bundle-ready", label: "Bundle ready", status: "done" }, "awaiting-signoff")).toBe("PASS");
   });
   it("tabs", () => {
-    expect(LIFECYCLE_TABS.map((t) => TAB_LABEL[t])).toEqual(["Schedule", "Tiers", "Advisories", "Preview", "History"]);
+    expect(LIFECYCLE_TABS.map((t) => TAB_LABEL[t])).toEqual(["Schedule", "Environments", "Tiers", "Advisories", "Preview", "History"]);
   });
 });
 
@@ -521,5 +534,176 @@ describe("outbound links", () => {
       expect(out.props.href, String(bad)).toBeUndefined();
       expect(JSON.stringify(out.props.children), String(bad)).toBe('"#41"');
     }
+  });
+});
+
+describe("environments (the view model)", () => {
+  /** PLO's coverage for a full plan; `unread` names environments whose cluster did not answer. `components` claims no
+   * row: a count above the rows the snapshot carries reads as rows left out (lifecycle-environments.ts tierCoverage) */
+  const coverage = (unread: string[] = []): LifecycleEnvironmentCoverage[] =>
+    LIFECYCLE_ENVIRONMENTS.map((e) => ({
+      environment: e.name,
+      clusters: [...e.clusters],
+      tiers: LIFECYCLE_TIERS.map((tier) => {
+        const source = ["base-images", "npm-direct", "npm-transitive"].includes(tier);
+        if (source) return { tier, state: e.name === "nonprod" ? ("not-applicable" as const) : ("observed" as const), components: 0, gaps: [] };
+        return unread.includes(e.name) ? { tier, state: "not-observed" as const, components: 0, gaps: [`${e.clusters[0]}: cluster API not reachable`] } : { tier, state: "observed" as const, components: tier === "control-plane" ? e.clusters.length : 0, gaps: [] }; // a real plan counts one control plane per cluster
+      }),
+    }));
+  const nonprodCp = component("nonprod:eks:control-plane", { tier: "control-plane", name: "kubernetes", target: "EKS-Twizz-NonProd", environments: ["nonprod"], desired: null, bump: "none", status: "current" });
+  const envsOf = (unread: string[] = [], history: Parameters<typeof buildEnvironments>[0]["planHistory"] = []) =>
+    buildEnvironments({ rows: [snap("plan", ago(DAY), { runId: "plan-now", components: [...COMPONENTS, nonprodCp], coverage: coverage(unread) }), cveSnap()], now: NOW, planHistory: history });
+  const one = (view: ReturnType<typeof envsOf>, name: string) => view.environments.find((e) => e.name === name)!;
+
+  it("every state has words, and none of them reads as a status pill word", () => {
+    expect(Object.keys(OBSERVATION_TEXT).sort()).toEqual(["not-observed", "observed", "partial", "stale"]);
+    expect(Object.keys(COVERAGE_TEXT).sort()).toEqual(["not-applicable", "not-observed", "observed", "partial"]);
+    for (const text of [...Object.values(OBSERVATION_TEXT), ...Object.values(COVERAGE_TEXT)]) expect(STATUS_WORDS as readonly string[]).not.toContain(text.toUpperCase());
+  });
+
+  it("observationLine leads with the state, and says when an unread environment last WAS read", () => {
+    const view = envsOf(["prod"], [{ job: "plan", runId: "plan-old", ok: true, finishedAt: ago(9 * DAY), coverage: coverage() }]);
+    expect(observationLine(one(view, "staging"), now)).toBe("observed 1d 0h ago by the plan job");
+    expect(observationLine(one(view, "prod"), now)).toBe("not observed by the run shown · last observed 9d 0h ago by the plan job");
+    expect(observationLine(one(envsOf(["prod"]), "prod"), now)).toBe("not observed · never read by a run Nebula has");
+    expect(observationLine({ kind: "preview", observation: { state: "observed", word: "OK", reasons: [], lastObserved: { at: NOW.toISOString(), job: "live", runId: null } } }, now)).toBe("read live from twizz-gitops and Argo");
+  });
+
+  it("the count and advisory lines read the same way down a column, zeros dropped", () => {
+    const view = envsOf();
+    expect(envCountsLine(one(view, "prod").counts)).toBe("4 components · 1 current · 2 behind · 1 failed · 1 end of life");
+    expect(envCountsLine(one(view, "nonprod").counts)).toBe("1 component · 1 current");
+    expect(envCountsLine({ total: 0, current: 0, behind: 0, blocked: 0, escalated: 0, failed: 0, unknown: 0, awaitingApproval: 0, eol: 0 })).toBe("no components reported");
+    expect(envAdvisoriesLine(one(view, "prod").advisories)).toBe("1 critical · 1 high");
+    expect(envSeverityWord(one(view, "prod").advisories)).toBe("CRITICAL");
+    expect(envAdvisoriesLine(one(view, "nonprod").advisories)).toBe("none open");
+    expect(envSeverityWord(one(view, "nonprod").advisories)).toBeNull();
+    const noScan = { scanned: false, total: 0, kev: 0, counts: { critical: 0, high: 0, moderate: 0, low: 0, unknown: 0 }, gaps: [] };
+    // a scan that could not read all of the environment found none; it does not know there is none
+    expect(envAdvisoriesLine({ ...noScan, scanned: true, gaps: ["EKS-Moly-Prod: cluster API not reachable"] })).toBe("none found · the scan did not cover all of it");
+    expect(envAdvisoriesLine({ ...one(view, "prod").advisories, gaps: ["x"] })).toBe("1 critical · 1 high · the scan did not cover all of it");
+    expect(envAdvisoriesLine(noScan)).toBe("no CVE scan yet");
+    expect(envSeverityWord(noScan)).toBeNull();
+  });
+
+  // second review round 2026-11-25, #10.3: the banner said "OK — Nothing to do" over an unread prod
+  it("nextAction never says Nothing to do over an environment that was not read, read in part, or not OK", () => {
+    const clean = [component("eks-control-plane:EKS-Twizz-NonProd", { tier: "control-plane", domain: "eks-control-plane", name: "control-plane", target: "EKS-Twizz-NonProd", environments: ["nonprod"], status: "current", desired: null, bump: "none" }), component("eks-control-plane:EKS-Moly-staging", { tier: "control-plane", domain: "eks-control-plane", name: "control-plane", target: "EKS-Moly-staging", environments: ["staging"], status: "current", desired: null, bump: "none" })];
+    const prodCp = component("eks-control-plane:EKS-Moly-Prod", { tier: "control-plane", domain: "eks-control-plane", name: "control-plane", target: "EKS-Moly-Prod", environments: ["prod"], status: "current", desired: null, bump: "none" });
+    const rows = (unread: string[], components = [...clean, prodCp], cveDoc = {}) => [snap("plan", ago(DAY), { runId: "plan-now", components, coverage: coverage(unread) }), snap("cve", ago(2 * HOUR), { runId: "cve-now", advisories: [], ...cveDoc })];
+    const act = (r: ReturnType<typeof rows>, environments?: Parameters<typeof nextAction>[0]["environments"]) =>
+      nextAction({ overview: buildOverview({ rows: r, requests: [], now: NOW }), preview: null, environments: environments === undefined ? buildEnvironments({ rows: r, now: NOW, planHistory: [] }) : environments });
+    // control: everything read and current
+    expect(act(rows([]))).toMatchObject({ word: "OK", title: "Nothing to do" });
+    // prod's cluster did not answer: the overview alone has nothing to complain about
+    const blind = rows(["prod"], clean);
+    expect(nextAction({ overview: buildOverview({ rows: blind, requests: [], now: NOW }), preview: null })).toMatchObject({ word: "OK" });
+    expect(act(blind)).toMatchObject({ word: "UNKNOWN", title: "prod was not observed", tab: "environments" });
+    // the CVE scan missed prod: read, current, and still not "nothing to do"
+    const gap = act(rows([], undefined, { discoveryErrors: [{ domain: "helm-release", error: "EKS-Moly-Prod: cluster API not reachable" }] }));
+    expect(gap).toMatchObject({ word: "WATCH", title: "Look at prod", tab: "environments" });
+    // the environments part itself could not be read
+    expect(act(rows([]), { error: "database unreachable" })).toMatchObject({ word: "UNKNOWN", title: "The environments could not be read", tab: "environments" });
+  });
+
+  it("the detail opens on the environment that is least known or worst off, never on a healthy one", () => {
+    expect(defaultEnvironment(envsOf(["nonprod"]))).toBe("nonprod"); // not observed beats a failed upgrade elsewhere
+    expect(defaultEnvironment(envsOf())).toBe("prod"); // FAIL (the end-of-life base image) beats AWAITING HUMAN
+    expect(defaultEnvironment({ environments: [] })).toBeNull();
+  });
+
+  it("the environment filter always offers the fixed environments, plus what the data and the focus name", () => {
+    const view = envsOf();
+    expect(environmentFilterNames(view, ["prod", "staging"])).toEqual(["nonprod", "staging", "prod"]);
+    expect(environmentFilterNames(view, ["sandbox"], "plo-2611-x")).toEqual(["nonprod", "staging", "prod", "sandbox", "plo-2611-x"]);
+    expect(environmentFilterNames(null, ["staging"], "staging")).toEqual(["staging"]);
+  });
+
+  it("the header tile shows how many environments are covered, and its word is the worst observation", () => {
+    expect(environmentsTile(envsOf())).toMatchObject({ key: "environments", word: "OK", label: "environments", value: "3 of 3 read", tab: "environments" });
+    expect(environmentsTile(envsOf(["prod"]))).toMatchObject({ word: "UNKNOWN", value: "2 of 3 read", detail: "not observed: prod" });
+    expect(environmentsTile(null)).toMatchObject({ word: "PENDING", value: "…" });
+    expect(environmentsTile({ error: "db down" })).toMatchObject({ word: "UNKNOWN", value: "unreadable", detail: "db down" });
+    const tiles = headerTiles(overviewOf(), null, now, envsOf(["prod"]));
+    expect(tiles.map((t) => t.key)).toEqual(["outdated", "critical-high", "kev", "environments", "bundle", "plan-age", "cve-age"]);
+    for (const t of tiles) expect(toneOf(t.word), t.key).not.toBe("ember");
+  });
+});
+
+describe("pass 3 #8: no green word over something that was not checked", () => {
+  const tile = (tiles: ReturnType<typeof headerTiles>, key: string) => tiles.find((t) => t.key === key)!;
+  const current = [component("a:npm:ok", { status: "current", desired: null, bump: "none" })];
+  const yesterday = () => snap("cve", ago(25 * HOUR), { runId: "cve-yesterday", advisories: [] });
+  const today = () => snap("cve", ago(HOUR), { runId: "cve-today", ok: false, error: "OSV did not answer" });
+
+  it("#8.1 the Preview pane's smoke pill: a pass that is no longer evidence is WATCH with its reason, never PASS", () => {
+    const pass = smoked("preview", true);
+    const fresh = previewOf({ envs: envsUp(), requests: [pass.req], rows: [source(), pass.row] }).smoke.preview;
+    expect(smokePill(fresh)).toEqual({ word: "PASS", detail: "2 of 2 checks passed" });
+    // the sentinel env rolled out a minute ago; the smoke was requested fifteen minutes ago
+    const stale = previewOf({ envs: [env(ENV_S, SENTINEL, SHA_SENTINEL, { rolledOutAt: ago(60_000).toISOString() }), env(ENV_B, BACKEND, SHA_BACKEND)], requests: [pass.req], rows: [source(), pass.row] }).smoke.preview;
+    expect(stale.verdict).toBe("pass");
+    expect(smokePill(stale).word).toBe("WATCH");
+    expect(smokePill(stale).detail).toMatch(/^2 of 2 checks passed, but that is no longer evidence: plo-2611-twizz-sentinel rolled out at .* after the preview smoke was requested/);
+    const failed = smoked("preview", false);
+    expect(smokePill(previewOf({ envs: envsUp(), requests: [failed.req], rows: [source(), failed.row] }).smoke.preview)).toEqual({ word: "FAIL", detail: "1 of 2 checks failed" });
+    expect(smokePill(previewOf().smoke.preview).word).toBe("PLANNED");
+  });
+
+  it("#8.2 advisories: a newer scan that failed, a failed scan and unanswered sources are never 'OK — none'", () => {
+    const clean = buildAdvisories(selectSnapshots([planSnap(current), cveSnap([])]), NOW);
+    expect(clean).toMatchObject({ lastFailed: null, stale: { word: "OK" } });
+    expect(advisoriesEmptyLine(clean)).toEqual({ word: "OK", text: "No known advisory affects anything in the inventory." });
+    const newerFailed = buildAdvisories(selectSnapshots([planSnap(current), yesterday(), today()]), NOW);
+    expect(newerFailed.scan).toMatchObject({ runId: "cve-yesterday", ok: true });
+    expect(newerFailed.lastFailed).toMatchObject({ runId: "cve-today", error: "OSV did not answer" });
+    expect(newerFailed.stale).toMatchObject({ word: "WATCH", detail: "the latest cve run (cve-today) failed: OSV did not answer; showing run cve-yesterday from before it" });
+    expect(advisoriesEmptyLine(newerFailed)).toEqual({ word: "WATCH", text: "None found by the scan shown — but the latest scan (cve-today) failed, so what has changed since is not known." });
+    const failedScan = buildAdvisories(selectSnapshots([planSnap(current), snap("cve", ago(HOUR), { runId: "cve-bad", ok: false, error: "x", advisories: [] })]), NOW);
+    expect(advisoriesEmptyLine(failedScan)).toMatchObject({ word: "WATCH", text: expect.stringMatching(/the scan itself failed/) });
+    const gaps = buildAdvisories(selectSnapshots([planSnap(current), snap("cve", ago(HOUR), { advisories: [], discoveryErrors: [{ domain: "kev", error: "CISA KEV could not be fetched" }] })]), NOW);
+    expect(advisoriesEmptyLine(gaps)).toMatchObject({ word: "WATCH", text: expect.stringMatching(/1 source did not answer/) });
+    // the overview carries the same staleness: the header and the banner read it
+    expect(overviewOf([planSnap(current), yesterday(), today()]).stale.cve.word).toBe("WATCH");
+  });
+
+  it("#8.3 header tiles: zero is green only when the run behind it is good", () => {
+    const tilesOf = (rows: Parameters<typeof overviewOf>[0]) => headerTiles(overviewOf(rows), null, now);
+    const ok = tilesOf([planSnap(current), cveSnap([])]);
+    expect([tile(ok, "outdated").word, tile(ok, "critical-high").word, tile(ok, "kev").word]).toEqual(["OK", "OK", "OK"]);
+    for (const [name, cveRows] of [
+      ["a newer scan failed", [yesterday(), today()]],
+      ["the scan shown failed", [snap("cve", ago(HOUR), { ok: false, error: "x", advisories: [] })]],
+      ["a source did not answer", [snap("cve", ago(HOUR), { advisories: [], discoveryErrors: [{ domain: "kev", error: "CISA KEV could not be fetched" }] })]],
+      ["the scan is stale", [snap("cve", ago(3 * DAY), { advisories: [] })]],
+    ] as const) {
+      const t = tilesOf([planSnap(current), ...cveRows]);
+      expect(tile(t, "critical-high"), name).toMatchObject({ word: "WATCH", value: "0" });
+      expect(tile(t, "kev"), name).toMatchObject({ word: "WATCH", value: "0" });
+      expect(tile(t, "kev").detail, name).toMatch(/^none found — /);
+      expect(tile(t, "kev").detail, name).not.toMatch(/nothing here is in CISA/);
+    }
+    // a finding still leads: a count above zero keeps its own word
+    const hot = tilesOf([planSnap(), cveSnap(ADVISORIES, ago(3 * DAY))]);
+    expect([tile(hot, "critical-high").word, tile(hot, "kev").word]).toEqual(["HOT", "KEV"]);
+    // outdated: 0 outdated is not OK over a failed upgrade, an unassessed component or a failed plan
+    for (const status of ["failed", "blocked", "escalated", "unknown"] as const) expect(tile(tilesOf([planSnap([component("a:npm:x", { status })]), cveSnap([])]), "outdated"), status).toMatchObject({ word: "WATCH", value: "0" });
+    expect(tile(tilesOf([snap("plan", ago(DAY), { ok: false, error: "aws: expired token", components: current }), cveSnap([])]), "outdated")).toMatchObject({ word: "WATCH", value: "0" });
+    expect(tile(tilesOf([snap("plan", ago(2 * DAY), { runId: "plan-old", components: current }), snap("plan", ago(HOUR), { runId: "plan-new", ok: false, error: "x" }), cveSnap([])]), "outdated")).toMatchObject({ word: "WATCH", value: "0" });
+    for (const t of [...ok, ...hot]) expect(STATUS_WORDS).toContain(t.word);
+  });
+
+  it("#8.4 nextAction: a failed source run is not 'Nothing to do'", () => {
+    const next = (rows: Parameters<typeof overviewOf>[0]) => nextAction({ overview: overviewOf(rows), preview: null });
+    expect(next([planSnap(current), cveSnap([])])).toMatchObject({ word: "OK", title: "Nothing to do" });
+    const failedSource = snap("source", ago(HOUR), { runId: "source-bad", ok: false, error: "frontend: npm ci failed" });
+    expect(next([planSnap(current), cveSnap([]), failedSource])).toMatchObject({ word: "WATCH", title: "The last source run failed", detail: expect.stringContaining("source-bad"), tab: "schedule" });
+    // an older good run with a newer failed one: the bundle shown is last month's
+    const good = snap("source", ago(3 * DAY), { runId: "source-good" });
+    expect(next([planSnap(current), cveSnap([]), good, failedSource])).toMatchObject({ word: "WATCH", title: "The last source run failed", detail: expect.stringContaining("frontend: npm ci failed") });
+    expect(next([planSnap(current), cveSnap([]), good])).toMatchObject({ word: "OK" });
+    // the same with the bundle state read (a failed run has no bundle to act on)
+    const p = buildPreview({ rows: [failedSource], requests: [], services: SERVICES, envs: [], promotions: [], staging: stagingOn(null), signoffs: [], envChanges: [], now: NOW });
+    expect(nextAction({ overview: overviewOf([planSnap(current), cveSnap([]), failedSource]), preview: p })).toMatchObject({ word: "WATCH", title: "The last source run failed" });
   });
 });

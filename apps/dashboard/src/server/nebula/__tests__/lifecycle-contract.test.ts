@@ -13,12 +13,14 @@ import { buildAdvisories, buildOverview, selectSnapshots, type SnapshotRow } fro
 const DIR = resolve(__dirname, "../../../../../../packages/shared/src/__tests__/fixtures/lifecycle-contract");
 const read = (name: string) => readFileSync(join(DIR, name), "utf8");
 const TOKEN = "c0ntract-".repeat(5);
+// the dispatcher's own credential (Secret plo-dispatch-env): only it claims, completes and posts smoke results
+const DISPATCH = "d1spatch-".repeat(5);
 const NOW = new Date("2026-12-04T06:00:00.000Z");
-const post = (path: string, body?: string) =>
+const post = (path: string, body?: string, token = path.startsWith("requests/") || (body !== undefined && (JSON.parse(body) as { job?: string }).job === "smoke") ? DISPATCH : TOKEN) =>
   new Request(`http://dashboard.nebula.svc.cluster.local/api/lifecycle/${path}`, {
     method: "POST",
     // exactly the headers PLO's client sends (src/nebula/client.ts)
-    headers: { authorization: `Bearer ${TOKEN}`, accept: "application/json", ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+    headers: { authorization: `Bearer ${token}`, accept: "application/json", ...(body !== undefined ? { "content-type": "application/json" } : {}) },
     body,
   });
 
@@ -71,7 +73,7 @@ function memoryStore() {
 }
 
 /** what plo-dispatch does first: claim every pending request */
-async function claimAll(deps: { store: LifecycleIngestStore; token: string; now: () => Date }) {
+async function claimAll(deps: { store: LifecycleIngestStore; token: string; dispatchToken: string; now: () => Date }) {
   for (;;) {
     const r = (await (await handleClaim(post("requests/claim"), deps)).json()) as { request: unknown };
     if (!r.request) return;
@@ -81,7 +83,7 @@ async function claimAll(deps: { store: LifecycleIngestStore; token: string; now:
 describe("PLO contract fixtures through the ingest handler and the read model", () => {
   it("every snapshot is accepted and stored unchanged; re-ingesting the same run changes nothing", async () => {
     const m = memoryStore();
-    const deps = { store: m.store, token: TOKEN, now: () => NOW };
+    const deps = { store: m.store, token: TOKEN, dispatchToken: DISPATCH, now: () => NOW };
     // a smoke snapshot is the answer to a request plo-dispatch claimed: claim them first, as it does
     await claimAll(deps);
     for (const name of ["snapshot-plan.json", "snapshot-source.json", "snapshot-cve.json", "snapshot-smoke.json", "snapshot-failed.json"]) {
@@ -107,7 +109,7 @@ describe("PLO contract fixtures through the ingest handler and the read model", 
 
   it("the read model joins what PLO sent: tiers, schedule, advisories on their components, the failed run", async () => {
     const m = memoryStore();
-    const deps = { store: m.store, token: TOKEN, now: () => NOW };
+    const deps = { store: m.store, token: TOKEN, dispatchToken: DISPATCH, now: () => NOW };
     await claimAll(deps);
     // oldest first, as the jobs would have run
     for (const [i, name] of ["snapshot-plan.json", "snapshot-source.json", "snapshot-cve.json", "snapshot-smoke.json", "snapshot-failed.json"].entries()) {
@@ -139,7 +141,7 @@ describe("PLO contract fixtures through the ingest handler and the read model", 
   // so on PLO's own fixtures the npm-transitive tier read "0 advisories" with a CRITICAL KEV in it
   it("transitive npm advisories reach their tier and their lockfile component although the two jobs spell its id differently", async () => {
     const m = memoryStore();
-    const deps = { store: m.store, token: TOKEN, now: () => NOW };
+    const deps = { store: m.store, token: TOKEN, dispatchToken: DISPATCH, now: () => NOW };
     for (const [i, name] of ["snapshot-plan.json", "snapshot-source.json", "snapshot-cve.json"].entries()) {
       await handleIngest(post("ingest", read(name)), { ...deps, now: () => new Date(NOW.getTime() - (10 - i) * 60_000) });
     }
@@ -172,7 +174,7 @@ describe("PLO contract fixtures through the ingest handler and the read model", 
 
   it("requests: each fixture request is claimed as PLO expects it and completed with PLO's bodies", async () => {
     const m = memoryStore();
-    const deps = { store: m.store, token: TOKEN, now: () => NOW };
+    const deps = { store: m.store, token: TOKEN, dispatchToken: DISPATCH, now: () => NOW };
     const fixture = JSON.parse(read("requests.json")) as { claimed: Array<{ id: string; kind: string; params: unknown }>; complete: unknown[] };
     for (const expected of fixture.claimed) {
       const res = await handleClaim(post("requests/claim"), deps);
@@ -185,5 +187,7 @@ describe("PLO contract fixtures through the ingest handler and the read model", 
       expect(res.status, JSON.stringify(body)).toBe(200);
     }
     expect((await handleIngest(post("ingest", read("snapshot-plan.json")), { ...deps, token: "x".repeat(40) })).status).toBe(401);
+    // PLO's publisher pods (plo-plan, plo-cve, plo-source) hold TOKEN only: the queue is not theirs
+    expect((await handleClaim(post("requests/claim", undefined, TOKEN), deps)).status).toBe(403);
   });
 });

@@ -9,7 +9,7 @@
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { PrismaClient } from "@twizz-idp/db";
 import { LifecycleSnapshotDoc } from "@twizz-idp/shared";
-import { enqueueLifecycleRequest, lifecycleHistory, readRequests, readSignoffs, readSnapshots } from "../lifecycle";
+import { enqueueLifecycleRequest, lifecycleHistory, readEnvChanges, readPlanCoverage, readRequests, readSignoffs, readSmokeSnapshotsByRunId, readSnapshots } from "../lifecycle";
 import { SIGNOFF_AUDIT_ACTION } from "../lifecycle-model";
 import { CLAIM_TIMEOUT_MS, PENDING_EXPIRY_MS, handleClaim, handleIngest, prismaLifecycleStore } from "../lifecycle-ingest";
 import { KEY } from "./lifecycle-fixtures";
@@ -17,6 +17,8 @@ import { KEY } from "./lifecycle-fixtures";
 const url = process.env.LIFECYCLE_TEST_DATABASE_URL;
 const NOW = new Date("2026-11-25T12:00:00.123Z");
 const TOKEN = "pg-test-token-".repeat(4);
+/** the claim is the dispatcher's call (there is no shared-token mode): there TOKEN is the dispatcher's credential and this the publisher's */
+const PUBLISHER = "pg-publisher-token-".repeat(3);
 
 const doc = (runId: string, job: "plan" | "cve" | "smoke" = "plan", over: Record<string, unknown> = {}) =>
   LifecycleSnapshotDoc.parse({ schemaVersion: 1, job, runId, startedAt: "2026-11-25T11:50:00.000Z", finishedAt: "2026-11-25T11:55:00.000Z", ok: true, schedule: [], discoveryErrors: [], ...over });
@@ -37,7 +39,7 @@ describe.skipIf(!url)("prismaLifecycleStore on Postgres", () => {
   beforeEach(async () => {
     await prisma.lifecycleRequest.deleteMany();
     await prisma.lifecycleSnapshot.deleteMany();
-    await prisma.auditLog.deleteMany({ where: { OR: [{ action: { startsWith: "lifecycle." } }, { action: SIGNOFF_AUDIT_ACTION }] } });
+    await prisma.auditLog.deleteMany({ where: { OR: [{ action: { startsWith: "lifecycle." } }, { action: { startsWith: "nebula." } }, { action: SIGNOFF_AUDIT_ACTION }] } });
   });
 
   const pending = (n: number) =>
@@ -93,7 +95,7 @@ describe.skipIf(!url)("prismaLifecycleStore on Postgres", () => {
         { id: "cmfresh0001", kind: "smoke", params: { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] }, requestedBy: "igor", createdAt: new Date(NOW.getTime() - 60_000) },
       ],
     });
-    const res = await handleClaim(new Request("http://x/api/lifecycle/requests/claim", { method: "POST", headers: { authorization: `Bearer ${TOKEN}` } }), { store: prismaLifecycleStore(prisma), token: TOKEN, now: () => NOW });
+    const res = await handleClaim(new Request("http://x/api/lifecycle/requests/claim", { method: "POST", headers: { authorization: `Bearer ${TOKEN}` } }), { store: prismaLifecycleStore(prisma), token: PUBLISHER, dispatchToken: TOKEN, now: () => NOW });
     expect(await res.json()).toEqual({ request: { id: "cmfresh0001", kind: "smoke", params: { scope: "preview", bundleKey: KEY, targets: [{ name: "twizz-sentinel", baseUrl: "http://twizz-sentinel.env-plo-2611-twizz-sentinel.svc.cluster.local:8090" }] } } });
     const rows = Object.fromEntries((await prisma.lifecycleRequest.findMany()).map((r) => [r.id, r]));
     expect(rows.cmstale0001).toMatchObject({ status: "expired", error: "not claimed within 24 h" });
@@ -217,5 +219,65 @@ describe.skipIf(!url)("prismaLifecycleStore on Postgres", () => {
     // scoped to one bundle: the key is matched inside the gate's JSON `resource`
     expect((await readSignoffs(prisma, KEY)).map((s) => [s.actor, s.bundleKey])).toEqual([["nick", KEY]]);
     expect(await readSignoffs(prisma, "f".repeat(64))).toEqual([]);
+  });
+
+  // pass 3 #1: the real WHERE (action IN, allowed, createdAt >=, resource LIKE) against Postgres
+  it("readEnvChanges: audited writes to plo-* envs since the smoke request, not denials, not other envs", async () => {
+    const since = new Date(NOW.getTime() - 30 * 60_000);
+    const at = (min: number) => new Date(NOW.getTime() - min * 60_000);
+    await prisma.auditLog.createMany({
+      data: [
+        { actor: "nick", action: "nebula.rebuild_env", resource: JSON.stringify({ name: "plo-2611-moly-backend", sha: "a".repeat(40) }), allowed: true, detail: { result: "{}" }, createdAt: at(10) },
+        { actor: "nick", action: "nebula.set_env_vars", resource: JSON.stringify({ name: "plo-2611-moly-backend", varNames: "A", varsHash: "x" }), allowed: true, detail: { error: "Error: boom" }, createdAt: at(20) },
+        { actor: "nick", action: "nebula.lifecycle_create_preview", resource: JSON.stringify({ bundleKey: KEY, setHash: "h", envs: "plo-2611-moly-backend plo-2611-twizz-sentinel", ttlHours: "72" }), allowed: true, detail: { result: "{}" }, createdAt: at(5) },
+        // before the request, a denial, another env, and a tool that does not change what an env runs
+        { actor: "nick", action: "nebula.rebuild_env", resource: JSON.stringify({ name: "plo-2611-moly-backend" }), allowed: true, detail: { result: "{}" }, createdAt: at(45) },
+        { actor: "mallory", action: "nebula.rebuild_env", resource: JSON.stringify({ name: "plo-2611-moly-backend" }), allowed: false, detail: { reason: "not yours" }, createdAt: at(8) },
+        { actor: "nick", action: "nebula.rebuild_env", resource: JSON.stringify({ name: "my-env" }), allowed: true, detail: { result: "{}" }, createdAt: at(7) },
+        { actor: "nick", action: "nebula.teardown_named_env", resource: JSON.stringify({ name: "plo-2611-moly-backend" }), allowed: true, detail: { result: "{}" }, createdAt: at(3) },
+      ],
+    });
+    const got = await readEnvChanges(prisma, since);
+    expect(got?.map((c) => [c.envName, c.action, c.at.toISOString()]).sort()).toEqual(
+      [
+        ["plo-2611-moly-backend", "nebula.lifecycle_create_preview", at(5).toISOString()],
+        ["plo-2611-moly-backend", "nebula.rebuild_env", at(10).toISOString()],
+        ["plo-2611-moly-backend", "nebula.set_env_vars", at(20).toISOString()],
+        ["plo-2611-twizz-sentinel", "nebula.lifecycle_create_preview", at(5).toISOString()],
+      ].sort(),
+    );
+    expect(await readEnvChanges(prisma, null)).toEqual([]);
+  });
+
+  // pass 3 #10: a smoke result is found by the run id its request is bound to, wherever it is in the table
+  it("readSmokeSnapshotsByRunId: by run id, smoke rows only, parsed", async () => {
+    const store = prismaLifecycleStore(prisma);
+    const put = (runId: string, job: "plan" | "smoke", over: Record<string, unknown> = {}) => store.insertSnapshot({ job, runId, ok: true, startedAt: NOW, finishedAt: NOW, data: doc(runId, job, over) }, NOW);
+    await put("smoke-a", "smoke", { requestId: "cmreq0000", smoke: { scope: "preview", bundleKey: KEY, results: [] } });
+    await put("smoke-b", "smoke", { smoke: { scope: "stg", bundleKey: KEY, results: [] } });
+    await put("plan-a", "plan");
+    const got = await readSmokeSnapshotsByRunId(prisma, ["smoke-a", "plan-a", "nope"]);
+    expect(got.rows.map((r) => [r.job, r.runId, r.data.smoke?.scope])).toEqual([["smoke", "smoke-a", "preview"]]);
+    expect(got.unreadable).toEqual([]);
+  });
+
+  it("readPlanCoverage: only the coverage key of plan runs, newest first, with the UTC instant each finished", async () => {
+    const cov = [{ environment: "prod", clusters: ["EKS-Moly-Prod"], tiers: [{ tier: "control-plane", state: "observed", components: 1, gaps: [] }] }];
+    const store = prismaLifecycleStore(prisma);
+    const at = (min: number) => new Date(NOW.getTime() - min * 60_000);
+    const put = (runId: string, job: "plan" | "cve", min: number, over: Record<string, unknown> = {}, ok = true) => {
+      const d = doc(runId, job, { ok, ...over });
+      return store.insertSnapshot({ job, runId, ok, startedAt: at(min + 5), finishedAt: at(min), data: d }, at(min));
+    };
+    await put("plan-old", "plan", 300, { coverage: cov });
+    await put("plan-bare", "plan", 200);
+    await put("cve-1", "cve", 150, { advisories: [] });
+    await put("plan-failed", "plan", 100, { coverage: cov, error: "boom" }, false);
+    expect(await readPlanCoverage(prisma)).toEqual([
+      { job: "plan", runId: "plan-failed", ok: false, finishedAt: at(100), coverage: cov },
+      { job: "plan", runId: "plan-bare", ok: true, finishedAt: at(200), coverage: null },
+      { job: "plan", runId: "plan-old", ok: true, finishedAt: at(300), coverage: cov },
+    ]);
+    expect((await readPlanCoverage(prisma, 1)).map((r) => r.runId)).toEqual(["plan-failed"]);
   });
 });

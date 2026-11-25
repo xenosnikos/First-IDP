@@ -44,6 +44,25 @@ export type LifecycleSeverity = (typeof LIFECYCLE_SEVERITIES)[number];
 export const LIFECYCLE_SMOKE_SCOPES = ["preview", "stg"] as const;
 export type LifecycleSmokeScope = (typeof LIFECYCLE_SMOKE_SCOPES)[number];
 
+/** How well a run read one tier of one environment (PLO `COVERAGE_STATES`):
+ * observed — every target read, no gap; partial — rows were read but a gap was
+ * recorded too; not-observed — nothing was read; not-applicable — the
+ * environment has nothing in this tier. */
+export const LIFECYCLE_COVERAGE_STATES = ["observed", "partial", "not-observed", "not-applicable"] as const;
+export type LifecycleCoverageState = (typeof LIFECYCLE_COVERAGE_STATES)[number];
+/** environments one snapshot may list (PLO: MAX_COVERAGE_ENVIRONMENTS) */
+export const LIFECYCLE_MAX_COVERAGE_ENVIRONMENTS = 50;
+
+/** The environments of PLO's inventory (`config/inventory.yaml`), in promotion
+ * order, with the cluster each owns. /lifecycle ALWAYS shows exactly these —
+ * a snapshot that says nothing about one makes it "not observed", never
+ * absent. Pinned against PLO by the contract fixture `vocabulary.json`. */
+export const LIFECYCLE_ENVIRONMENTS = [
+  { name: "nonprod", clusters: ["EKS-Twizz-NonProd"] },
+  { name: "staging", clusters: ["EKS-Moly-staging"] },
+  { name: "prod", clusters: ["EKS-Moly-Prod"] },
+] as const;
+
 export const LIFECYCLE_RUN_ID_RE = /^[A-Za-z0-9._-]{1,120}$/;
 /** sha256 hex. Hex cannot spell "prod"/"staging", so a bundle key is always a safe gate field. */
 export const LIFECYCLE_BUNDLE_KEY_RE = /^[0-9a-f]{64}$/;
@@ -162,6 +181,25 @@ export const LifecycleChangeSet = z.object({
 });
 export type LifecycleChangeSet = z.infer<typeof LifecycleChangeSet>;
 
+/** What a plan or source run really read of one environment. A tier that is
+ * absent from `tiers` was not surveyed by that run. */
+export const LifecycleEnvironmentCoverage = z.object({
+  /** inventory environment name, e.g. "staging" */
+  environment: str,
+  clusters: z.array(str),
+  tiers: z.array(
+    z.object({
+      tier,
+      state: z.enum(LIFECYCLE_COVERAGE_STATES),
+      /** components of this tier read for this environment */
+      components: z.number().int().min(0),
+      /** why the state is not "observed" */
+      gaps: z.array(str),
+    }),
+  ),
+});
+export type LifecycleEnvironmentCoverage = z.infer<typeof LifecycleEnvironmentCoverage>;
+
 export const LifecycleBundle = z.object({
   /** inventory name of the repository */
   repo: str,
@@ -242,6 +280,9 @@ export const LifecycleSnapshotDoc = z.object({
   // job plan | source
   components: z.array(LifecycleComponent).max(LIFECYCLE_LIMITS.components).optional(),
   changeSets: z.array(LifecycleChangeSet).optional(),
+  /** what the run really read, per environment and tier. Additive and optional:
+   * without it the tab claims an environment observed only where rows exist. */
+  coverage: z.array(LifecycleEnvironmentCoverage).max(LIFECYCLE_MAX_COVERAGE_ENVIRONMENTS).optional(),
   // job source
   bundles: z.array(LifecycleBundle).optional(),
   /** sha256 hex over sorted `${github}@${headSha}` of all bundles with a headSha */

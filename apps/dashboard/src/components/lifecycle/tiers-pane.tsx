@@ -14,6 +14,7 @@ import {
   STATUS_URGENCY,
   advisoriesForComponent,
   advisoryWord,
+  environmentFilterNames,
   eolNote,
   epssPct,
   filterComponents,
@@ -26,6 +27,7 @@ import {
   type ComponentFilter,
   type ComponentRow,
   type LifecycleAdvisories,
+  type LifecycleEnvironments,
   type LifecycleOverview,
   type TierView,
 } from "@/lib/nebula/lifecycle";
@@ -243,10 +245,28 @@ function ComponentDrawer({ c, advisories, advisoriesError, now, onClose, goTo }:
 // first). The default view keeps only what needs attention — outdated, an open
 // PR, a failure, or any advisory — and each plate's summary line still counts
 // everything, so nothing is silently missing.
-export function TiersPane({ overview, advisories, advisoriesError, now, goTo }: { overview: LifecycleOverview; advisories: LifecycleAdvisories | null; advisoriesError: string | null; now: number } & PaneNav) {
-  const [filter, setFilter] = useState<ComponentFilter>(DEFAULT_COMPONENT_FILTER);
+//
+// The environment filter is owned by the view (`environment` / `onEnvironment`):
+// the Environments pane sets it, and it stays put while the reader moves
+// between Tiers and Advisories.
+export function TiersPane({
+  overview,
+  environments,
+  advisories,
+  advisoriesError,
+  now,
+  goTo,
+  environment,
+  onEnvironment,
+}: { overview: LifecycleOverview; environments: LifecycleEnvironments | null; advisories: LifecycleAdvisories | null; advisoriesError: string | null; now: number; environment: string | null; onEnvironment: (env: string | null) => void } & PaneNav) {
+  const [rest, setRest] = useState<Omit<ComponentFilter, "environment">>(DEFAULT_COMPONENT_FILTER);
+  const filter = useMemo<ComponentFilter>(() => ({ ...rest, environment }), [rest, environment]);
   const [open, setOpen] = useState<ComponentRow | null>(null);
-  const set = (patch: Partial<ComponentFilter>) => setFilter((f) => ({ ...f, ...patch }));
+  const set = ({ environment: env, ...patch }: Partial<ComponentFilter>) => {
+    if (env !== undefined) onEnvironment(env);
+    if (Object.keys(patch).length) setRest((f) => ({ ...f, ...patch }));
+  };
+  const envNames = environmentFilterNames(environments, overview.environments, environment);
 
   const perTier = useMemo(() => overview.tiers.map((t) => ({ tier: t, rows: sortByRisk(filterComponents(t.components, filter)) })), [overview.tiers, filter]);
   const total = overview.header.components;
@@ -288,7 +308,7 @@ export function TiersPane({ overview, advisories, advisoriesError, now, goTo }: 
         </Toggle>
         <FilterGroup name="environment">
           <Toggle on={!filter.environment} onClick={() => set({ environment: null })}>all</Toggle>
-          {overview.environments.map((e) => (
+          {envNames.map((e) => (
             <Toggle key={e} on={filter.environment === e} onClick={() => set({ environment: filter.environment === e ? null : e })}>{e}</Toggle>
           ))}
         </FilterGroup>

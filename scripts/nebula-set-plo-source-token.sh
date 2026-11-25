@@ -75,8 +75,10 @@ for repo in $MUST_NOT_SEE; do
   case "$code" in
     404 | 403) echo "  cannot see $repo: ok" ;;
     200)
-      # a public repository answers 200 to anyone; what matters is that the token cannot write
-      if [ "$(jq -r '.private // true' "$D/body")" != false ] || [ "$(jq -r '.permissions.push // false' "$D/body")" != false ]; then
+      # a public repository answers 200 to anyone; what matters is that the token cannot write.
+      # (`.private == false`, not `.private // true`: jq's `//` also replaces false, which made
+      # every public repository look private and refused every token.)
+      if [ "$(jq -r '.private == false' "$D/body")" != true ] || [ "$(jq -r '.permissions.push == true or .permissions.admin == true or .permissions.maintain == true' "$D/body")" != false ]; then
         refuse "the token has access to $repo; the plo-source token must have none"
       fi
       echo "  $repo is public and the token cannot push to it: ok" ;;
@@ -91,8 +93,28 @@ for repo in $REPOS; do
   echo "  can push to $repo, is not an admin: ok"
 done
 
+# secret_state <id> → present | deleting | missing.
+# `describe-secret` still answers for a secret that is scheduled for deletion (with DeletedDate) while nobody can
+# read or write it any more, so "it describes" is not "it exists". And only ResourceNotFoundException is "missing":
+# any other failure (access denied, the network) stops the script — "could not check" is never "not there".
+secret_state() {
+  local out
+  if out=$(aws secretsmanager describe-secret --region "$REGION" --secret-id "$1" --output json 2>"$D/describe.err"); then
+    if jq -e '(.DeletedDate // null) != null' >/dev/null 2>&1 <<<"$out"; then echo deleting; else echo present; fi
+  elif grep -q 'ResourceNotFoundException' "$D/describe.err"; then
+    echo missing
+  else
+    echo "could not check whether $1 exists (describe-secret failed: $(tr '\n' ' ' < "$D/describe.err" | head -c 300)). Nothing written." >&2
+    return 1
+  fi
+}
+
+# before anything is written: is the secret there, gone, or on its way out
+SECRET_STATE=$(secret_state "$SECRET")
+[ "$SECRET_STATE" != deleting ] || refuse "$SECRET is scheduled for deletion and can be neither read nor written; restore it first (aws secretsmanager restore-secret --region $REGION --secret-id $SECRET)"
+
 jq -n --rawfile t "$D/token" '{token: $t}' > "$D/secret.json"
-if aws secretsmanager describe-secret --region "$REGION" --secret-id "$SECRET" >/dev/null 2>&1; then
+if [ "$SECRET_STATE" = present ]; then
   aws secretsmanager put-secret-value --region "$REGION" --secret-id "$SECRET" --secret-string "file://$D/secret.json" --query VersionId --output text | xargs echo "$SECRET new version:"
 else
   aws secretsmanager create-secret --region "$REGION" --name "$SECRET" --secret-string "file://$D/secret.json" \

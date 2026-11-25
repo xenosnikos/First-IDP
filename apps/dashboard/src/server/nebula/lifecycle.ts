@@ -11,25 +11,32 @@
 import { createHash } from "node:crypto";
 import { PROMOTABLE, REGISTRY, envEcrRepo, lifecycleBundleKey, listNamedEnvs, listPromotions, readTargetState, releaseTarget, type NamedEnvManifest } from "@twizz-idp/actions";
 import type { Prisma, PrismaClient } from "@twizz-idp/db";
-import { LifecycleSnapshotDoc, parseLifecycleRequestParams, type LifecycleBundle, type LifecycleRequestKind, type LifecycleRequestParams } from "@twizz-idp/shared";
+import { z } from "zod";
+import { LifecycleEnvironmentCoverage, LifecycleSmokeParams, LifecycleSnapshotDoc, parseLifecycleRequestParams, type LifecycleBundle, type LifecycleRequestKind, type LifecycleRequestParams } from "@twizz-idp/shared";
 import { isOperator } from "@/lib/nebula/operators";
 import { argoWord, type ArgoStatus } from "@/lib/nebula/status";
 import { STAGING_LABEL, argoStatusFor, readArgoApplications } from "./argo";
 import { namedEnvDeps } from "./deps";
 import { dispatchTokenConfigured } from "./lifecycle-ingest";
+import { buildEnvironments, type CoverageHistoryRow, type EnvironmentsView } from "./lifecycle-environments";
 import {
+  ENV_CHANGE_AUDIT_ACTIONS,
+  PLO_ENV_PREFIX,
   SIGNOFF_AUDIT_ACTION,
   argoRunsImage,
+  boundSmokeRunIds,
   buildAdvisories,
   buildOverview,
   buildPreview,
   bundleTargets,
   isActiveRequest,
   neededSnapshotIds,
+  parseEnvChangeAudit,
   parseSignoffAudit,
   requestView,
   selectSnapshots,
   type AdvisoriesView,
+  type EnvChangeInput,
   type HistoryRow,
   type LifecycleServiceInput,
   type OverviewView,
@@ -67,6 +74,8 @@ export function lifecycleServices(): LifecycleServiceInput[] {
  * it last finished syncing (absent: not read, so the env is not "up"). */
 export function toPreviewEnv(m: NamedEnvManifest, pending: boolean, argo: PreviewEnvInput["argo"], app?: ArgoStatus | null): PreviewEnvInput {
   return {
+    // a deployable env's Application was asked for; not handed over, or Argo unreachable = not read
+    argoUnread: !pending && (!app || app.unreachable === true),
     runsImage: !pending && !!app && argoRunsImage(app.images, envEcrRepo(m), m.imageTag ?? null),
     rolledOutAt: !pending && app ? (app.operationFinishedAt ?? null) : null,
     port: typeof m.config?.port === "number" ? m.config.port : null,
@@ -145,6 +154,24 @@ export async function readSnapshots(prisma: PrismaClient): Promise<SnapshotRead>
   return { rows: needed.flatMap((m) => next.get(keyOf(m)) ?? []), metas, unreadable };
 }
 
+/** Smoke snapshots by run id, for the ones a gate rests on that fell out of the views' window (`readSnapshots`
+ * loads the newest `SMOKE_LOOKBACK` only). A row that does not parse is reported, never guessed at. */
+export async function readSmokeSnapshotsByRunId(prisma: PrismaClient, runIds: readonly string[]): Promise<{ rows: SnapshotRow[]; unreadable: SnapshotRead["unreadable"] }> {
+  if (runIds.length === 0) return { rows: [], unreadable: [] };
+  const found = await prisma.lifecycleSnapshot.findMany({
+    where: { job: "smoke", runId: { in: [...runIds] } },
+    select: { id: true, job: true, runId: true, ok: true, startedAt: true, finishedAt: true, createdAt: true, data: true },
+  });
+  const rows: SnapshotRow[] = [];
+  const unreadable: SnapshotRead["unreadable"] = [];
+  for (const { data, ...meta } of found) {
+    const parsed = LifecycleSnapshotDoc.safeParse(data);
+    if (parsed.success) rows.push({ ...meta, data: parsed.data });
+    else unreadable.push({ runId: meta.runId, job: meta.job });
+  }
+  return { rows, unreadable };
+}
+
 export async function readRequests(prisma: PrismaClient, take = REQUEST_LOOKBACK): Promise<RequestRow[]> {
   return prisma.lifecycleRequest.findMany({ orderBy: [{ createdAt: "desc" }, { id: "desc" }], take });
 }
@@ -163,6 +190,26 @@ export async function readRequestsForPreview(prisma: PrismaClient): Promise<Requ
   return [...byId.values()];
 }
 
+/** how many plan runs "last observed" looks back over */
+const COVERAGE_LOOKBACK = 30;
+const CoverageList = z.array(LifecycleEnvironmentCoverage);
+
+/** The recent plan runs with ONLY their `coverage` (a plan payload is megabytes;
+ * the per-environment coverage is a few hundred bytes). Newest first. A row whose
+ * coverage is missing or does not parse vouches for nothing (`coverage: null`). */
+export async function readPlanCoverage(prisma: PrismaClient, take = COVERAGE_LOOKBACK): Promise<CoverageHistoryRow[]> {
+  const rows = await prisma.$queryRaw<Array<{ runId: string; ok: boolean; finishedAt: Date; coverage: unknown }>>`
+    SELECT "runId", "ok", "finishedAt", "data"->'coverage' AS "coverage"
+      FROM "LifecycleSnapshot"
+     WHERE "job" = 'plan'
+     ORDER BY "createdAt" DESC, "id" DESC
+     LIMIT ${take}`;
+  return rows.map((r) => {
+    const parsed = CoverageList.safeParse(r.coverage);
+    return { job: "plan", runId: r.runId, ok: r.ok, finishedAt: new Date(r.finishedAt), coverage: parsed.success ? parsed.data : null };
+  });
+}
+
 /** Sign-offs are AuditLog rows written by the gate (`nebula.lifecycle_signoff`).
  * With a `bundleKey` only that bundle's rows are read (the key is in the
  * row's `resource`, the gate fields as JSON) — so neither other bundles'
@@ -178,13 +225,43 @@ export async function readSignoffs(prisma: PrismaClient, bundleKey?: string | nu
   return rows.flatMap((r) => parseSignoffAudit(r) ?? []).filter((s) => !bundleKey || s.bundleKey === bundleKey);
 }
 
+const ENV_CHANGE_LOOKBACK = 500;
+
+/** Nebula's own record of writes to `plo-*` envs since `since` (the moment the bundle's latest preview smoke was
+ * requested): the gate audits every confirmed named-env write, whoever made it and whether it threw. With no
+ * `since` there is no pass to tie to anything and nothing is read. null: the window is full, so an older change
+ * could be missing — the caller treats that as "not known" (fail closed). */
+export async function readEnvChanges(prisma: PrismaClient, since: Date | null): Promise<EnvChangeInput[] | null> {
+  if (!since) return [];
+  const rows = await prisma.auditLog.findMany({
+    where: { action: { in: [...ENV_CHANGE_AUDIT_ACTIONS] }, allowed: true, createdAt: { gte: since }, resource: { contains: PLO_ENV_PREFIX } },
+    orderBy: { createdAt: "desc" },
+    take: ENV_CHANGE_LOOKBACK,
+    select: { action: true, allowed: true, resource: true, createdAt: true },
+  });
+  if (rows.length >= ENV_CHANGE_LOOKBACK) return null;
+  return rows.flatMap((r) => parseEnvChangeAudit(r));
+}
+
+/** When the latest preview smoke for `bundleKey` was requested; null: never. */
+export function latestPreviewSmokeRequestedAt(requests: readonly RequestRow[], bundleKey: string | null): Date | null {
+  if (!bundleKey) return null;
+  const mine = requests.filter((r) => {
+    if (r.kind !== "smoke") return false;
+    const p = LifecycleSmokeParams.safeParse(r.params);
+    return p.success && p.data.scope === "preview" && p.data.bundleKey === bundleKey;
+  });
+  return mine.reduce<Date | null>((latest, r) => (!latest || r.createdAt.getTime() > latest.getTime() ? r.createdAt : latest), null);
+}
+
 /** Said on the page until it is fixed: a smoke verdict is the word of whoever
- * holds the credential that may post it. With one shared ingest token that is
- * every PLO pod (and anything else that can read the token). */
-export const SHARED_SMOKE_TOKEN_NOTICE =
-  "smoke results are accepted on the shared ingest token (LIFECYCLE_DISPATCH_TOKEN is not set): every holder of LIFECYCLE_INGEST_TOKEN can answer a smoke request — give plo-dispatch its own token (docs/NEBULA.md §N9, \"Who is trusted for what\")";
+ * holds the dispatcher's credential, and ingest gives that role to nobody
+ * while the credential is not configured (`identifyIngestCaller` fails closed:
+ * the publisher token never answers a smoke request). */
+export const DISPATCH_TOKEN_MISSING_NOTICE =
+  "the dispatcher's credential (LIFECYCLE_DISPATCH_TOKEN) is not configured on this dashboard: no request can be claimed and no smoke result is accepted from anyone until it is — restart the dashboard once Secret plo-dispatch-env has synced (docs/NEBULA.md §N9, \"Who is trusted for what\")";
 function smokeTrustNotice(): string[] {
-  return dispatchTokenConfigured() ? [] : [SHARED_SMOKE_TOKEN_NOTICE];
+  return dispatchTokenConfigured() ? [] : [DISPATCH_TOKEN_MISSING_NOTICE];
 }
 
 /** A source snapshot is only as good as its key: `bundleKey` must be the
@@ -284,7 +361,15 @@ export async function readPreviewInput(prisma: PrismaClient, opts: { fresh?: boo
   const keyProblems = snaps.rows.flatMap((r) => sourceKeyProblem(r) ?? []);
   const rows = snaps.rows.filter((r) => !sourceKeyProblem(r));
   const key = selectSnapshots(rows).source.data?.data.bundleKey ?? null;
+  // the results the open bundle's latest smoke requests were answered with, when later smoke runs pushed them out of the window
+  const bound = await readSmokeSnapshotsByRunId(prisma, boundSmokeRunIds(requests, key).filter((runId) => !rows.some((r) => r.job === "smoke" && r.runId === runId)));
+  rows.push(...bound.rows);
+  snaps.unreadable.push(...bound.unreadable);
   const signoffs = await readSignoffs(prisma, key);
+  // a failed read is data, not a thrown page: the model then refuses to tie any preview pass to its env
+  const envChanges = await part(readEnvChanges(prisma, latestPreviewSmokeRequestedAt(requests, key)));
+  const changes = "ok" in envChanges ? envChanges.ok : null;
+  const changesProblem = "ok" in envChanges ? (changes === null ? [`more than ${ENV_CHANGE_LOOKBACK} audited named-env writes since the preview smoke was requested: the list is cut, so the smoke cannot be tied to the preview envs — run the preview smoke again`] : []) : [`the audit log (named-env writes) could not be read: ${envChanges.error}`];
   return {
     rows,
     requests,
@@ -293,8 +378,9 @@ export async function readPreviewInput(prisma: PrismaClient, opts: { fresh?: boo
     promotions: sources.promotions,
     staging: sources.staging,
     signoffs,
+    envChanges: changes,
     now: opts.now ?? new Date(),
-    sourceErrors: [...sources.sourceErrors, ...keyProblems, ...smokeTrustNotice(), ...snaps.unreadable.map((u) => `${u.job} snapshot ${u.runId} is unreadable (stored by another schema version)`)],
+    sourceErrors: [...sources.sourceErrors, ...changesProblem, ...keyProblems, ...smokeTrustNotice(), ...snaps.unreadable.map((u) => `${u.job} snapshot ${u.runId} is unreadable (stored by another schema version)`)],
   };
 }
 
@@ -313,21 +399,40 @@ export type LifecycleOverview = {
   data: Part<OverviewView>;
   /** the bundle pill; its own part because it also reads GitHub and Argo */
   bundle: Part<{ state: PreviewState; detail: string; bundleKey: string | null; key12: string | null }>;
+  /** how each environment stands and whether that is known (lifecycle-environments.ts) */
+  environments: Part<EnvironmentsView>;
 };
 
 export async function lifecycleOverview(prisma: PrismaClient, opts: { components?: boolean } = {}): Promise<LifecycleOverview> {
   const now = new Date();
-  const [data, bundle] = await Promise.all([
+  const snapsP = Promise.all([readSnapshots(prisma), readRequests(prisma)]);
+  const previewP = part(lifecyclePreviewState(prisma).then(({ view, input }) => ({ view, envsRead: input.envs !== null })));
+  const [data, preview, environments] = await Promise.all([
     part(
-      Promise.all([readSnapshots(prisma), readRequests(prisma)]).then(([snaps, requests]) => {
+      snapsP.then(([snaps, requests]) => {
         const view = buildOverview({ rows: snaps.rows, requests, now, components: opts.components });
         for (const u of snaps.unreadable) view.discoveryErrors.push({ job: u.job, domain: "nebula", error: `snapshot ${u.runId} is unreadable (stored by another schema version)` });
         return view;
       }),
     ),
-    part(lifecyclePreviewState(prisma).then(({ view }) => ({ state: view.state, detail: view.detail, bundleKey: view.bundleKey, key12: view.key12 }))),
+    previewP,
+    part(
+      Promise.all([snapsP, previewP, part(readPlanCoverage(prisma))]).then(([[snaps], pv, history]) => {
+        const view = buildEnvironments({
+          rows: snaps.rows,
+          now,
+          planHistory: "ok" in history ? history.ok : undefined,
+          preview: "ok" in pv ? pv.ok.view : null,
+          previewError: "ok" in pv ? null : pv.error,
+          previewEnvsRead: "ok" in pv ? pv.ok.envsRead : true,
+        });
+        for (const u of snaps.unreadable) view.notes.push(`${u.job} snapshot ${u.runId} is unreadable (stored by another schema version)`);
+        return view;
+      }),
+    ),
   ]);
-  return { at: now.toISOString(), data, bundle };
+  const bundle: LifecycleOverview["bundle"] = "ok" in preview ? { ok: { state: preview.ok.view.state, detail: preview.ok.view.detail, bundleKey: preview.ok.view.bundleKey, key12: preview.ok.view.key12 } } : preview;
+  return { at: now.toISOString(), data, bundle, environments };
 }
 
 export type LifecycleAdvisories = { at: string; data: Part<AdvisoriesView> };
